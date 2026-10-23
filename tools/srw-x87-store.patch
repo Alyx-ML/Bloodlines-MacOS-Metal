@@ -1,0 +1,69 @@
+--- a/SRW/SR_full_llasm_instr.c	2026-10-23 04:55:00
++++ b/SRW/SR_full_llasm_instr.c	2026-10-23 04:55:01
+@@ -7608,10 +7608,12 @@
+                         if (ud_obj.operand[0].size == 32)
+                         {
+                             OUTPUT_STRING("FIST_INT32\n");
++                            // The address calculation may use tmp0 (scaled index), so move the value out first.
++                            OUTPUT_STRING("mov tmp1, tmp0\n");
+ 
+                             SR_disassemble_get_madr(cOutput, &(ud_obj.operand[0]), fixup[0], extrn[0], UD_NONE, MADR_WRITE, ZERO_EXTEND, &memadr);
+ 
+-                            SR_disassemble_write_mem_word(cOutput, &memadr, LR_TMP0);
++                            SR_disassemble_write_mem_word(cOutput, &memadr, LR_TMP1);
+                         }
+                     }
+                 }
+@@ -7649,18 +7651,22 @@
+                         else if (ud_obj.operand[0].size == 32)
+                         {
+                             OUTPUT_STRING("FISTP_INT32\n");
++                            // The address calculation may use tmp0 (scaled index), so move the value out first.
++                            OUTPUT_STRING("mov tmp1, tmp0\n");
+ 
+                             SR_disassemble_get_madr(cOutput, &(ud_obj.operand[0]), fixup[0], extrn[0], UD_NONE, MADR_WRITE, ZERO_EXTEND, &memadr);
+ 
+-                            SR_disassemble_write_mem_word(cOutput, &memadr, LR_TMP0);
++                            SR_disassemble_write_mem_word(cOutput, &memadr, LR_TMP1);
+                         }
+                         else if (ud_obj.operand[0].size == 16)
+                         {
+                             OUTPUT_STRING("FISTP_INT16\n");
++                            // The address calculation may use tmp0 (scaled index), so move the value out first.
++                            OUTPUT_STRING("mov tmp1, tmp0\n");
+ 
+                             SR_disassemble_get_madr(cOutput, &(ud_obj.operand[0]), fixup[0], extrn[0], UD_NONE, MADR_WRITE, ZERO_EXTEND, &memadr);
+ 
+-                            SR_disassemble_write_mem_halfword(cOutput, &memadr, LR_TMP0);
++                            SR_disassemble_write_mem_halfword(cOutput, &memadr, LR_TMP1);
+                         }
+                     }
+                 }
+@@ -7787,10 +7793,12 @@
+                     if (ud_obj.operand[0].size == 16)
+                     {
+                         OUTPUT_PARAMSTRING("%s_VOID\n", instr);
++                        // The address calculation may use tmp0 (scaled index), so move the value out first.
++                        OUTPUT_STRING("mov tmp1, tmp0\n");
+ 
+                         SR_disassemble_get_madr(cOutput, &(ud_obj.operand[0]), fixup[0], extrn[0], UD_NONE, MADR_WRITE, ZERO_EXTEND, &memadr);
+ 
+-                        SR_disassemble_write_mem_halfword(cOutput, &memadr, LR_TMP0);
++                        SR_disassemble_write_mem_halfword(cOutput, &memadr, LR_TMP1);
+                     }
+                 }
+             }
+@@ -7836,10 +7844,12 @@
+                         else if (ud_obj.operand[0].size == 32)
+                         {
+                             OUTPUT_PARAMSTRING("%s_FLOAT\n", instr);
++                            // The address calculation may use tmp0 (scaled index), so move the value out first.
++                            OUTPUT_STRING("mov tmp1, tmp0\n");
+ 
+                             SR_disassemble_get_madr(cOutput, &(ud_obj.operand[0]), fixup[0], extrn[0], UD_NONE, MADR_WRITE, ZERO_EXTEND, &memadr);
+ 
+-                            SR_disassemble_write_mem_word(cOutput, &memadr, LR_TMP0);
++                            SR_disassemble_write_mem_word(cOutput, &memadr, LR_TMP1);
+                         }
+                     }
+                 }

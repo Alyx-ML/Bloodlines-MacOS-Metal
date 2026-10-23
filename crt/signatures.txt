@@ -1,0 +1,3 @@
+sqrt 186 f76b521a29ac6ac3c892ae8929567fbfd1fa621ebd4ac5f395fdb4be182c20e4 0=bl_crt_CIsqrt,0x14=bl_crt_sqrt
+log 204 d3532ae0e953f541d4b49af06de8b35fdc50530e3a399c9a8edf625ec0140a3e 0=bl_crt_CIlog,0x14=bl_crt_log
+memcpy 821 cc63405c18904d97c30f25487bdc788db8038e0ad706f205949e727f152c0e54 0=bl_crt_memcpy

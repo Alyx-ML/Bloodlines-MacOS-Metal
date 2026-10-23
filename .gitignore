@@ -1,0 +1,20 @@
+# Build output contains translated game code: never commit or upload it.
+build/
+# Game files must never be committed.
+*.pe
+*.dll
+*.exe
+*.asi
+*.vpk
+*.bsp
+# Translated code, disassembly, frame dumps and logs.
+*.ll
+*.bc
+*.o
+*.a
+*.dis
+*.png
+*.log
+*.ips
+.DS_Store
+.claude/

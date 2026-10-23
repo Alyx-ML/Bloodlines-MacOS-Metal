@@ -1,0 +1,3 @@
+[submodule "third_party/SR"]
+	path = third_party/SR
+	url = https://github.com/M-HT/SR

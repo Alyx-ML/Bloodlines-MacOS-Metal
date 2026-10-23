@@ -1,0 +1,41 @@
+;; Entry points for native C-runtime replacements (runtime/bl_crt.c).
+include llasm.llinc
+include asm-calls.llinc
+
+funcv bl_crt_sqrt_c $
+funcv bl_crt_CIsqrt_c $
+funcv bl_crt_log_c $
+funcv bl_crt_CIlog_c $
+funcv bl_crt_memcpy_c $
+
+proc bl_crt_sqrt public
+        call bl_crt_sqrt_c $
+        Call_Asm_Return 0
+endp
+
+proc bl_crt_CIsqrt public
+        call bl_crt_CIsqrt_c $
+        Call_Asm_Return 0
+endp
+
+proc bl_crt_log public
+        call bl_crt_log_c $
+        Call_Asm_Return 0
+endp
+
+proc bl_crt_CIlog public
+        call bl_crt_CIlog_c $
+        Call_Asm_Return 0
+endp
+
+proc bl_crt_memcpy public
+        call bl_crt_memcpy_c $
+        Call_Asm_Return 0
+endp
+
+funcv bl_simd_unreachable_c $
+
+proc bl_simd_unreachable public
+        call bl_simd_unreachable_c $
+        Call_Asm_Return 0
+endp

@@ -1,0 +1,14 @@
+--- a/llasm_float.c	2026-10-23 06:40:33
++++ b/llasm_float.c	2026-10-23 06:40:33
+@@ -136,7 +136,10 @@
+ 
+ #define CLEAR_X87_FLAG(x) { st_sw_cond &= (~(x)) & X87_CX; }
+ 
+-#define CLEAR_X87_FLAGS { st_sw_cond = 0; }
++// x87 hardware leaves C0-C3 alone on loads, stores, exchanges and arithmetic, and MSVC
++// relies on it: it schedules fst/fxch between fcom and fnstsw. Clearing them here made
++// every such comparison read "greater".
++#define CLEAR_X87_FLAGS { }
+ 
+ #define X87_CMP(x, y)  { \
+     if ( (x) < (y) ) { \

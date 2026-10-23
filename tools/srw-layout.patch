@@ -1,0 +1,53 @@
+--- a/SRW/SR_output.c	2026-10-23 02:54:20
++++ b/SRW/SR_output.c	2026-10-23 02:55:18
+@@ -71,13 +71,49 @@
+         if (item->type == OT_INSTRUCTION)
+         {
+             return;
++        }
++
++        // Instructions are left out of the data, so data regions of a code section
++        // would end up packed together. Tables indexed off a label then read the
++        // wrong bytes (msvcrt's memmove uses negative indices). Fill the gaps with
++        // the original bytes so every item keeps its offset in the section.
++        {
++            static int layout_entry = -1;
++            static uint32_t layout_next;
++
++            if (DATA->Entry != layout_entry)
++            {
++                layout_entry = DATA->Entry;
++                layout_next = 0;
++            }
++            if (section[DATA->Entry].type == ST_CODE)
++            {
++                while (layout_next < item->ofs)
++                {
++                    fprintf(DATA->fout, "db %i\n", section[DATA->Entry].adr[layout_next]);
++                    layout_next++;
++                }
++            }
++            if (item->str != NULL && strncmp(item->str, "daddr", 5) == 0)
++            {
++                layout_next = item->ofs + 4;
++            }
++            else if (item->str == NULL || strncmp(item->str, "db", 2) == 0)
++            {
++                layout_next = item->ofs + 1;
++            }
++            else
++            {
++                layout_next = item->ofs;  // unknown size: leave the layout as SRW had it
++            }
+         }
+ #endif
+ 
+         if ( item->align != 0 )
+         {
+ #if (OUTPUT_TYPE == OUT_LLASM)
+-            fprintf(DATA->fout, "dalign %i\n", item->align);
++            // Code-section data already sits at its original offset (above).
++            if (section[DATA->Entry].type != ST_CODE) fprintf(DATA->fout, "dalign %i\n", item->align);
+ #else
+             fprintf(DATA->fout, "align %i%s\n", item->align, ((section[DATA->Entry].type == ST_CODE)?"":", db 0"));
+ #endif

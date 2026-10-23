@@ -1,0 +1,308 @@
+# COM interfaces the runtime implements for guest code, in vtable order (d3d9.h).
+#
+#   interface <Name> [: <Base>]     methods of Base come first and keep Base's handler
+#   <Method> <args>                 args = stack arguments after `this` (all stdcall)
+#
+# tools/gen_com.py turns this into llasm thunks (com_<Iface>_<Method>), weak trapping
+# C handlers bl_<Iface>_<Method>_c(this, ...) and bl_vtbl_<Iface>() vtable builders.
+
+interface IUnknown
+QueryInterface 2
+AddRef 0
+Release 0
+
+interface IDirect3D9 : IUnknown
+RegisterSoftwareDevice 1
+GetAdapterCount 0
+GetAdapterIdentifier 3
+GetAdapterModeCount 2
+EnumAdapterModes 4
+GetAdapterDisplayMode 2
+CheckDeviceType 5
+CheckDeviceFormat 6
+CheckDeviceMultiSampleType 6
+CheckDepthStencilMatch 5
+CheckDeviceFormatConversion 4
+GetDeviceCaps 3
+GetAdapterMonitor 1
+CreateDevice 6
+
+interface IDirect3DDevice9 : IUnknown
+TestCooperativeLevel 0
+GetAvailableTextureMem 0
+EvictManagedResources 0
+GetDirect3D 1
+GetDeviceCaps 1
+GetDisplayMode 2
+GetCreationParameters 1
+SetCursorProperties 3
+SetCursorPosition 3
+ShowCursor 1
+CreateAdditionalSwapChain 2
+GetSwapChain 2
+GetNumberOfSwapChains 0
+Reset 1
+Present 4
+GetBackBuffer 4
+GetRasterStatus 2
+SetDialogBoxMode 1
+SetGammaRamp 3
+GetGammaRamp 2
+CreateTexture 8
+CreateVolumeTexture 9
+CreateCubeTexture 7
+CreateVertexBuffer 6
+CreateIndexBuffer 6
+CreateRenderTarget 8
+CreateDepthStencilSurface 8
+UpdateSurface 4
+UpdateTexture 2
+GetRenderTargetData 2
+GetFrontBufferData 2
+StretchRect 5
+ColorFill 3
+CreateOffscreenPlainSurface 6
+SetRenderTarget 2
+GetRenderTarget 2
+SetDepthStencilSurface 1
+GetDepthStencilSurface 1
+BeginScene 0
+EndScene 0
+Clear 6
+SetTransform 2
+GetTransform 2
+MultiplyTransform 2
+SetViewport 1
+GetViewport 1
+SetMaterial 1
+GetMaterial 1
+SetLight 2
+GetLight 2
+LightEnable 2
+GetLightEnable 2
+SetClipPlane 2
+GetClipPlane 2
+SetRenderState 2
+GetRenderState 2
+CreateStateBlock 2
+BeginStateBlock 0
+EndStateBlock 1
+SetClipStatus 1
+GetClipStatus 1
+GetTexture 2
+SetTexture 2
+GetTextureStageState 3
+SetTextureStageState 3
+GetSamplerState 3
+SetSamplerState 3
+ValidateDevice 1
+SetPaletteEntries 2
+GetPaletteEntries 2
+SetCurrentTexturePalette 1
+GetCurrentTexturePalette 1
+SetScissorRect 1
+GetScissorRect 1
+SetSoftwareVertexProcessing 1
+GetSoftwareVertexProcessing 0
+SetNPatchMode 1
+GetNPatchMode 0
+DrawPrimitive 3
+DrawIndexedPrimitive 6
+DrawPrimitiveUP 4
+DrawIndexedPrimitiveUP 8
+ProcessVertices 6
+CreateVertexDeclaration 2
+SetVertexDeclaration 1
+GetVertexDeclaration 1
+SetFVF 1
+GetFVF 1
+CreateVertexShader 2
+SetVertexShader 1
+GetVertexShader 1
+SetVertexShaderConstantF 3
+GetVertexShaderConstantF 3
+SetVertexShaderConstantI 3
+GetVertexShaderConstantI 3
+SetVertexShaderConstantB 3
+GetVertexShaderConstantB 3
+SetStreamSource 4
+GetStreamSource 4
+SetStreamSourceFreq 2
+GetStreamSourceFreq 2
+SetIndices 1
+GetIndices 1
+CreatePixelShader 2
+SetPixelShader 1
+GetPixelShader 1
+SetPixelShaderConstantF 3
+GetPixelShaderConstantF 3
+SetPixelShaderConstantI 3
+GetPixelShaderConstantI 3
+SetPixelShaderConstantB 3
+GetPixelShaderConstantB 3
+DrawRectPatch 3
+DrawTriPatch 3
+DeletePatch 1
+CreateQuery 2
+
+interface IDirect3DSwapChain9 : IUnknown
+Present 5
+GetFrontBufferData 1
+GetBackBuffer 3
+GetRasterStatus 1
+GetDisplayMode 1
+GetDevice 1
+GetPresentParameters 1
+
+interface IDirect3DResource9 : IUnknown
+GetDevice 1
+SetPrivateData 4
+GetPrivateData 3
+FreePrivateData 1
+SetPriority 1
+GetPriority 0
+PreLoad 0
+GetType 0
+
+interface IDirect3DBaseTexture9 : IDirect3DResource9
+SetLOD 1
+GetLOD 0
+GetLevelCount 0
+SetAutoGenFilterType 1
+GetAutoGenFilterType 0
+GenerateMipSubLevels 0
+
+interface IDirect3DTexture9 : IDirect3DBaseTexture9
+GetLevelDesc 2
+GetSurfaceLevel 2
+LockRect 4
+UnlockRect 1
+AddDirtyRect 1
+
+interface IDirect3DCubeTexture9 : IDirect3DBaseTexture9
+GetLevelDesc 2
+GetCubeMapSurface 3
+LockRect 5
+UnlockRect 2
+AddDirtyRect 2
+
+interface IDirect3DVolumeTexture9 : IDirect3DBaseTexture9
+GetLevelDesc 2
+GetVolumeLevel 2
+LockBox 4
+UnlockBox 1
+AddDirtyBox 1
+
+interface IDirect3DSurface9 : IDirect3DResource9
+GetContainer 2
+GetDesc 1
+LockRect 3
+UnlockRect 0
+GetDC 1
+ReleaseDC 1
+
+interface IDirect3DVertexBuffer9 : IDirect3DResource9
+Lock 4
+Unlock 0
+GetDesc 1
+
+interface IDirect3DIndexBuffer9 : IDirect3DResource9
+Lock 4
+Unlock 0
+GetDesc 1
+
+interface IDirect3DVertexDeclaration9 : IUnknown
+GetDevice 1
+GetDeclaration 2
+
+interface IDirect3DVertexShader9 : IUnknown
+GetDevice 1
+GetFunction 2
+
+interface IDirect3DPixelShader9 : IUnknown
+GetDevice 1
+GetFunction 2
+
+interface IDirect3DStateBlock9 : IUnknown
+GetDevice 1
+Capture 0
+Apply 0
+
+interface IDirect3DQuery9 : IUnknown
+GetDevice 1
+GetType 0
+GetDataSize 0
+Issue 1
+GetData 3
+
+# DirectInput 8 (dinput.h), ANSI interfaces.
+interface IDirectInput8A : IUnknown
+CreateDevice 3
+EnumDevices 4
+GetDeviceStatus 1
+RunControlPanel 2
+Initialize 2
+FindDevice 3
+EnumDevicesBySemantics 5
+ConfigureDevices 4
+
+interface IDirectInputDevice8A : IUnknown
+GetCapabilities 1
+EnumObjects 3
+GetProperty 2
+SetProperty 2
+Acquire 0
+Unacquire 0
+GetDeviceState 2
+GetDeviceData 4
+SetDataFormat 1
+SetEventNotification 1
+SetCooperativeLevel 2
+GetObjectInfo 3
+GetDeviceInfo 1
+RunControlPanel 2
+Initialize 3
+CreateEffect 4
+EnumEffects 3
+GetEffectInfo 2
+GetForceFeedbackState 1
+SendForceFeedbackCommand 1
+EnumCreatedEffectObjects 3
+Escape 1
+Poll 0
+SendDeviceData 4
+EnumEffectsInFile 4
+WriteEffectToFile 4
+BuildActionMap 3
+SetActionMap 3
+GetImageInfo 1
+
+interface IDirectSound : IUnknown
+CreateSoundBuffer 3
+GetCaps 1
+DuplicateSoundBuffer 2
+SetCooperativeLevel 2
+Compact 0
+GetSpeakerConfig 1
+SetSpeakerConfig 1
+Initialize 1
+
+interface IDirectSoundBuffer : IUnknown
+GetCaps 1
+GetCurrentPosition 2
+GetFormat 3
+GetVolume 1
+GetPan 1
+GetFrequency 1
+GetStatus 1
+Initialize 2
+Lock 7
+Play 3
+SetCurrentPosition 1
+SetFormat 1
+SetVolume 1
+SetPan 1
+SetFrequency 1
+Stop 0
+Unlock 4
+Restore 0

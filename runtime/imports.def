@@ -1,0 +1,467 @@
+# Windows imports provided by the runtime.
+#
+# <dll>!<name>  <stack args>  <cdecl|stdcall>  <C handler or -> [ret]
+#
+# The handler receives the stack arguments as uint32_t (guest addresses stay guest
+# addresses) and returns eax when `ret` is given. `-` means not implemented yet:
+# the import traps with its name, so missing pieces show up at run time.
+# gen_imports.py turns this file into build/runtime/imports.llasm.
+
+msvcrt!malloc        1 cdecl  bl_msvcrt_malloc  ret
+msvcrt!free          1 cdecl  bl_msvcrt_free
+msvcrt!_errno        0 cdecl  bl_msvcrt_errno   ret
+msvcrt!_initterm     2 cdecl  bl_msvcrt_initterm
+msvcrt!_vsnprintf    4 cdecl  bl_msvcrt_vsnprintf ret
+msvcrt!sprintf       2 cdecl  bl_msvcrt_sprintf ret
+msvcrt!fprintf       2 cdecl  -
+msvcrt!fopen         2 cdecl  -
+msvcrt!_fdopen       2 cdecl  -
+msvcrt!fclose        1 cdecl  -
+msvcrt!fflush        1 cdecl  -
+msvcrt!fseek         3 cdecl  -
+msvcrt!ftell         1 cdecl  -
+msvcrt!fread         4 cdecl  -
+msvcrt!fwrite        4 cdecl  -
+msvcrt!fputc         2 cdecl  -
+msvcrt!clearerr      1 cdecl  -
+kernel32!DisableThreadLibraryCalls  1 stdcall bl_k32_DisableThreadLibraryCalls ret
+kernel32!CloseHandle                      1 stdcall bl_k32_CloseHandle ret
+kernel32!CompareStringA                   6 stdcall bl_k32_CompareStringA ret
+kernel32!CompareStringW                   6 stdcall bl_k32_CompareStringW ret
+kernel32!CreateDirectoryA                 2 stdcall bl_k32_CreateDirectoryA ret
+kernel32!CreateEventA                     4 stdcall bl_k32_CreateEventA ret
+kernel32!CreateFileA                      7 stdcall bl_k32_CreateFileA ret
+kernel32!CreateThread                     6 stdcall bl_k32_CreateThread ret
+kernel32!DeleteCriticalSection            1 stdcall bl_k32_DeleteCriticalSection ret
+kernel32!DeleteFileA                      1 stdcall bl_k32_DeleteFileA ret
+kernel32!EnterCriticalSection             1 stdcall bl_k32_EnterCriticalSection ret
+kernel32!EnumSystemLocalesA               2 stdcall bl_k32_EnumSystemLocalesA ret
+kernel32!ExitProcess                      1 stdcall bl_k32_ExitProcess ret
+kernel32!ExitThread                       1 stdcall bl_k32_ExitThread ret
+kernel32!FatalAppExitA                    2 stdcall bl_k32_FatalAppExitA ret
+kernel32!FileTimeToLocalFileTime          2 stdcall bl_k32_FileTimeToLocalFileTime ret
+kernel32!FileTimeToSystemTime             2 stdcall bl_k32_FileTimeToSystemTime ret
+kernel32!FindClose                        1 stdcall bl_k32_FindClose ret
+kernel32!FindFirstFileA                   2 stdcall bl_k32_FindFirstFileA ret
+kernel32!FindNextFileA                    2 stdcall bl_k32_FindNextFileA ret
+kernel32!FlushFileBuffers                 1 stdcall bl_k32_FlushFileBuffers ret
+kernel32!FreeEnvironmentStringsA          1 stdcall bl_k32_FreeEnvironmentStringsA ret
+kernel32!FreeEnvironmentStringsW          1 stdcall bl_k32_FreeEnvironmentStringsW ret
+kernel32!FreeLibrary                      1 stdcall bl_k32_FreeLibrary ret
+kernel32!GetACP                           0 stdcall bl_k32_GetACP ret
+kernel32!GetCPInfo                        2 stdcall bl_k32_GetCPInfo ret
+kernel32!GetCommandLineA                  0 stdcall bl_k32_GetCommandLineA ret
+kernel32!GetCurrentDirectoryA             2 stdcall bl_k32_GetCurrentDirectoryA ret
+kernel32!GetCurrentProcess                0 stdcall bl_k32_GetCurrentProcess ret
+kernel32!GetCurrentProcessId              0 stdcall bl_k32_GetCurrentProcessId ret
+kernel32!GetCurrentThread                 0 stdcall bl_k32_GetCurrentThread ret
+kernel32!GetCurrentThreadId               0 stdcall bl_k32_GetCurrentThreadId ret
+kernel32!GetDriveTypeA                    1 stdcall bl_k32_GetDriveTypeA ret
+kernel32!GetEnvironmentStrings            0 stdcall bl_k32_GetEnvironmentStrings ret
+kernel32!GetEnvironmentStringsW           0 stdcall bl_k32_GetEnvironmentStringsW ret
+kernel32!GetEnvironmentVariableA          3 stdcall bl_k32_GetEnvironmentVariableA ret
+kernel32!GetFileType                      1 stdcall bl_k32_GetFileType ret
+kernel32!GetFullPathNameA                 4 stdcall bl_k32_GetFullPathNameA ret
+kernel32!GetLastError                     0 stdcall bl_k32_GetLastError ret
+kernel32!GetLocalTime                     1 stdcall bl_k32_GetLocalTime ret
+kernel32!GetLocaleInfoA                   4 stdcall bl_k32_GetLocaleInfoA ret
+kernel32!GetLocaleInfoW                   4 stdcall bl_k32_GetLocaleInfoW ret
+kernel32!GetModuleFileNameA               3 stdcall bl_k32_GetModuleFileNameA ret
+kernel32!GetModuleHandleA                 1 stdcall bl_k32_GetModuleHandleA ret
+kernel32!GetNumberOfConsoleInputEvents    2 stdcall bl_k32_GetNumberOfConsoleInputEvents ret
+kernel32!GetOEMCP                         0 stdcall bl_k32_GetOEMCP ret
+kernel32!GetProcAddress                   2 stdcall bl_k32_GetProcAddress ret
+kernel32!GetStartupInfoA                  1 stdcall bl_k32_GetStartupInfoA ret
+kernel32!GetStdHandle                     1 stdcall bl_k32_GetStdHandle ret
+kernel32!GetStringTypeA                   5 stdcall bl_k32_GetStringTypeA ret
+kernel32!GetStringTypeW                   4 stdcall bl_k32_GetStringTypeW ret
+kernel32!GetSystemInfo                    1 stdcall bl_k32_GetSystemInfo ret
+kernel32!GetSystemTime                    1 stdcall bl_k32_GetSystemTime ret
+kernel32!GetTimeZoneInformation           1 stdcall bl_k32_GetTimeZoneInformation ret
+kernel32!GetUserDefaultLCID               0 stdcall bl_k32_GetUserDefaultLCID ret
+kernel32!GetVersion                       0 stdcall bl_k32_GetVersion ret
+kernel32!GetVersionExA                    1 stdcall bl_k32_GetVersionExA ret
+kernel32!HeapAlloc                        3 stdcall bl_k32_HeapAlloc ret
+kernel32!HeapCreate                       3 stdcall bl_k32_HeapCreate ret
+kernel32!HeapDestroy                      1 stdcall bl_k32_HeapDestroy ret
+kernel32!HeapFree                         3 stdcall bl_k32_HeapFree ret
+kernel32!HeapReAlloc                      4 stdcall bl_k32_HeapReAlloc ret
+kernel32!HeapSize                         3 stdcall bl_k32_HeapSize ret
+kernel32!InitializeCriticalSection        1 stdcall bl_k32_InitializeCriticalSection ret
+kernel32!InterlockedDecrement             1 stdcall bl_k32_InterlockedDecrement ret
+kernel32!InterlockedExchange              2 stdcall bl_k32_InterlockedExchange ret
+kernel32!InterlockedIncrement             1 stdcall bl_k32_InterlockedIncrement ret
+kernel32!IsBadWritePtr                    2 stdcall bl_k32_IsBadWritePtr ret
+kernel32!IsValidCodePage                  1 stdcall bl_k32_IsValidCodePage ret
+kernel32!IsValidLocale                    2 stdcall bl_k32_IsValidLocale ret
+kernel32!LCMapStringA                     6 stdcall bl_k32_LCMapStringA ret
+kernel32!LCMapStringW                     6 stdcall bl_k32_LCMapStringW ret
+kernel32!LeaveCriticalSection             1 stdcall bl_k32_LeaveCriticalSection ret
+kernel32!LoadLibraryA                     1 stdcall bl_k32_LoadLibraryA ret
+kernel32!MoveFileA                        2 stdcall bl_k32_MoveFileA ret
+kernel32!MultiByteToWideChar              6 stdcall bl_k32_MultiByteToWideChar ret
+kernel32!OutputDebugStringA               1 stdcall bl_k32_OutputDebugStringA ret
+kernel32!QueryPerformanceCounter          1 stdcall bl_k32_QueryPerformanceCounter ret
+kernel32!QueryPerformanceFrequency        1 stdcall bl_k32_QueryPerformanceFrequency ret
+kernel32!RaiseException                   4 stdcall bl_k32_RaiseException
+kernel32!ReadConsoleInputA                4 stdcall bl_k32_ReadConsoleInputA ret
+kernel32!ReadFile                         5 stdcall bl_k32_ReadFile ret
+kernel32!ResumeThread                     1 stdcall bl_k32_ResumeThread ret
+kernel32!RtlUnwind                        4 stdcall bl_k32_RtlUnwind ret
+kernel32!SetConsoleCtrlHandler            2 stdcall bl_k32_SetConsoleCtrlHandler ret
+kernel32!SetCurrentDirectoryA             1 stdcall bl_k32_SetCurrentDirectoryA ret
+kernel32!SetEndOfFile                     1 stdcall bl_k32_SetEndOfFile ret
+kernel32!SetEnvironmentVariableA          2 stdcall bl_k32_SetEnvironmentVariableA ret
+kernel32!SetEvent                         1 stdcall bl_k32_SetEvent ret
+kernel32!SetFilePointer                   4 stdcall bl_k32_SetFilePointer ret
+kernel32!SetHandleCount                   1 stdcall bl_k32_SetHandleCount ret
+kernel32!SetLastError                     1 stdcall bl_k32_SetLastError ret
+kernel32!SetStdHandle                     2 stdcall bl_k32_SetStdHandle ret
+kernel32!Sleep                            1 stdcall bl_k32_Sleep ret
+kernel32!TerminateProcess                 2 stdcall bl_k32_TerminateProcess ret
+kernel32!TlsAlloc                         0 stdcall bl_k32_TlsAlloc ret
+kernel32!TlsFree                          1 stdcall bl_k32_TlsFree ret
+kernel32!TlsGetValue                      1 stdcall bl_k32_TlsGetValue ret
+kernel32!TlsSetValue                      2 stdcall bl_k32_TlsSetValue ret
+kernel32!UnhandledExceptionFilter         1 stdcall bl_k32_UnhandledExceptionFilter ret
+kernel32!VirtualAlloc                     4 stdcall bl_k32_VirtualAlloc ret
+kernel32!VirtualFree                      3 stdcall bl_k32_VirtualFree ret
+kernel32!WaitForSingleObject              2 stdcall bl_k32_WaitForSingleObject ret
+kernel32!WideCharToMultiByte              8 stdcall bl_k32_WideCharToMultiByte ret
+kernel32!WriteFile                        5 stdcall bl_k32_WriteFile ret
+kernel32!lstrlenA                         1 stdcall bl_k32_lstrlenA ret
+
+user32!DialogBoxParamA                  5 stdcall -
+user32!EndDialog                        2 stdcall bl_u32_EndDialog ret
+user32!EnumWindows                      2 stdcall bl_u32_EnumWindows ret
+user32!GetCursorPos                     1 stdcall bl_u32_GetCursorPos ret
+user32!GetDesktopWindow                 0 stdcall bl_u32_GetDesktopWindow ret
+user32!GetDlgItemInt                    4 stdcall bl_u32_GetDlgItemInt ret
+user32!GetKeyState                      1 stdcall bl_u32_GetKeyState ret
+user32!GetWindowRect                    2 stdcall bl_u32_GetWindowRect ret
+user32!GetWindowThreadProcessId         2 stdcall bl_u32_GetWindowThreadProcessId ret
+user32!IsWindowVisible                  1 stdcall bl_u32_IsWindowVisible ret
+user32!PeekMessageA                     5 stdcall bl_u32_PeekMessageA ret
+user32!ScreenToClient                   2 stdcall bl_u32_ScreenToClient ret
+user32!SetDlgItemInt                    4 stdcall bl_u32_SetDlgItemInt ret
+user32!SetDlgItemTextA                  3 stdcall bl_u32_SetDlgItemTextA ret
+user32!SetWindowPos                     7 stdcall bl_u32_SetWindowPos ret
+user32!wvsprintfA                       3 stdcall bl_u32_wvsprintfA ret
+
+advapi32!RegCloseKey                      1 stdcall bl_adv_RegCloseKey ret
+advapi32!RegCreateKeyExA                  9 stdcall bl_adv_RegCreateKeyExA ret
+advapi32!RegOpenKeyExA                    5 stdcall bl_adv_RegOpenKeyExA ret
+advapi32!RegQueryValueExA                 6 stdcall bl_adv_RegQueryValueExA ret
+advapi32!RegSetValueExA                   6 stdcall bl_adv_RegSetValueExA ret
+
+ws2_32!ws2_32_ord16                     4 stdcall -
+ws2_32!ws2_32_ord17                     6 stdcall -
+ws2_32!ws2_32_ord19                     4 stdcall -
+ws2_32!ws2_32_ord111                    0 stdcall bl_ws2_ws2_32_ord111 ret
+ws2_32!ws2_32_ord112                    1 stdcall bl_ws2_ws2_32_ord112 ret
+
+# Milestone 3 modules. Entries with handler `-` trap with their name; arg counts of
+# traps are not used.
+advapi32!RegEnumKeyExA                    8 stdcall bl_adv_RegEnumKeyExA ret
+advapi32!RegOpenKeyA                      3 stdcall bl_adv_RegOpenKeyA ret
+advapi32!RegQueryInfoKeyA                 0 stdcall -
+advapi32!RegQueryValueA                   4 stdcall bl_adv_RegQueryValueA ret
+d3d9!Direct3DCreate9                  1 stdcall bl_d3d9_Direct3DCreate9 ret
+dinput8!DirectInput8Create               5 stdcall bl_dinput_DirectInput8Create ret
+gdi32!BitBlt                           9 stdcall bl_gdi_BitBlt ret
+gdi32!CreateBitmap                     0 stdcall -
+gdi32!CreateCompatibleBitmap           0 stdcall -
+gdi32!CreateCompatibleDC              1 stdcall bl_gdi_CreateCompatibleDC ret
+gdi32!CreateDIBSection                6 stdcall bl_gdi_CreateDIBSection ret
+gdi32!CreateFontA                        14 stdcall bl_gdi_CreateFontA ret
+gdi32!CreatePen                        0 stdcall -
+gdi32!CreateRectRgn                    0 stdcall -
+gdi32!DPtoLP                           0 stdcall -
+gdi32!DeleteDC                        1 stdcall bl_gdi_DeleteDC ret
+gdi32!DeleteObject                       1 stdcall bl_gdi_DeleteObject ret
+gdi32!ExtTextOutA                     8 stdcall bl_gdi_ExtTextOutA ret
+gdi32!ExtTextOutW                     8 stdcall bl_gdi_ExtTextOutW ret
+gdi32!GetCharABCWidthsA               4 stdcall bl_gdi_GetCharABCWidthsA ret
+gdi32!GetCharABCWidthsW               4 stdcall bl_gdi_GetCharABCWidthsW ret
+gdi32!GetDIBits                        0 stdcall -
+gdi32!GetDeviceCaps                    2 stdcall bl_gdi_GetDeviceCaps ret
+gdi32!GetGlyphOutlineA                7 stdcall bl_gdi_GetGlyphOutlineA ret
+gdi32!GetPixel                         0 stdcall -
+gdi32!GetStockObject                   1 stdcall bl_gdi_GetStockObject ret
+gdi32!GetTextMetricsA                 2 stdcall bl_gdi_GetTextMetricsA ret
+gdi32!LPtoDP                           0 stdcall -
+gdi32!MoveToEx                        4 stdcall bl_gdi_MoveToEx ret
+gdi32!Polyline                         0 stdcall -
+gdi32!SelectObject                       2 stdcall bl_gdi_SelectObject ret
+gdi32!SetBkColor                      2 stdcall bl_gdi_SetBkColor ret
+gdi32!SetBkMode                          2 stdcall bl_gdi_SetBkMode ret
+gdi32!SetMapMode                       0 stdcall -
+gdi32!SetPixel                         0 stdcall -
+gdi32!SetRectRgn                       0 stdcall -
+gdi32!SetStretchBltMode                2 stdcall bl_gdi_SetStretchBltMode ret
+gdi32!SetTextAlign                    2 stdcall bl_gdi_SetTextAlign ret
+gdi32!SetTextColor                       2 stdcall bl_gdi_SetTextColor ret
+gdi32!SetViewportOrgEx                 0 stdcall -
+gdi32!StretchBlt                       11 stdcall bl_gdi_StretchBlt ret
+kernel32!Beep                             0 stdcall -
+kernel32!CreateDirectoryW                2 stdcall bl_k32_CreateDirectoryW ret
+kernel32!CreateFileW                     7 stdcall bl_k32_CreateFileW ret
+kernel32!CreateMutexA                     3 stdcall bl_k32_CreateMutexA ret
+kernel32!CreatePipe                       4 stdcall bl_k32_CreatePipe ret
+kernel32!CreateProcessA                   0 stdcall -
+kernel32!CreateProcessW                  10 stdcall bl_k32_CreateProcessW ret
+kernel32!CreateSemaphoreA                 4 stdcall bl_k32_CreateSemaphoreA ret
+kernel32!DeleteFileW                     1 stdcall bl_k32_DeleteFileW ret
+kernel32!DuplicateHandle                  7 stdcall bl_k32_DuplicateHandle ret
+kernel32!FileTimeToDosDateTime            3 stdcall bl_k32_FileTimeToDosDateTime ret
+kernel32!FindFirstFileW                  2 stdcall bl_k32_FindFirstFileW ret
+kernel32!FindNextFileW                   2 stdcall bl_k32_FindNextFileW ret
+kernel32!FormatMessageA                   7 stdcall bl_k32_FormatMessageA ret
+kernel32!FreeConsole                     0 stdcall bl_k32_FreeConsole ret
+kernel32!GetCommandLineW                 0 stdcall bl_k32_GetCommandLineW ret
+kernel32!GetConsoleMode                   0 stdcall -
+kernel32!GetConsoleScreenBufferInfo      2 stdcall bl_k32_GetConsoleScreenBufferInfo ret
+kernel32!GetCurrentDirectoryW            2 stdcall bl_k32_GetCurrentDirectoryW ret
+kernel32!GetDiskFreeSpaceA                5 stdcall bl_k32_GetDiskFreeSpaceA ret
+kernel32!GetDriveTypeW                   1 stdcall bl_k32_GetDriveTypeW ret
+kernel32!GetExitCodeProcess               0 stdcall -
+kernel32!GetFileAttributesA               1 stdcall bl_k32_GetFileAttributesA ret
+kernel32!GetFileAttributesW              1 stdcall bl_k32_GetFileAttributesW ret
+kernel32!GetFileInformationByHandle       2 stdcall bl_k32_GetFileInformationByHandle ret
+kernel32!GetFileSize                      2 stdcall bl_k32_GetFileSize ret
+kernel32!GetFileTime                      4 stdcall bl_k32_GetFileTime ret
+kernel32!GetFullPathNameW                4 stdcall bl_k32_GetFullPathNameW ret
+kernel32!GetLargestConsoleWindowSize     1 stdcall bl_k32_GetLargestConsoleWindowSize ret
+kernel32!GetLogicalDriveStringsA          0 stdcall -
+kernel32!GetLogicalDrives                 0 stdcall bl_k32_GetLogicalDrives ret
+kernel32!GetModuleFileNameW              3 stdcall bl_k32_GetModuleFileNameW ret
+kernel32!GetProcessTimes                  5 stdcall bl_k32_GetProcessTimes ret
+kernel32!GetProfileStringA                5 stdcall bl_k32_GetProfileStringA ret
+kernel32!GetSystemDirectoryA              2 stdcall bl_k32_GetSystemDirectoryA ret
+kernel32!GetSystemTimeAsFileTime          1 stdcall bl_k32_GetSystemTimeAsFileTime ret
+kernel32!GetTempPathA                     2 stdcall bl_k32_GetTempPathA ret
+kernel32!GetThreadContext                 0 stdcall -
+kernel32!GetTickCount                     0 stdcall bl_k32_GetTickCount ret
+kernel32!GetWindowsDirectoryA             2 stdcall bl_k32_GetWindowsDirectoryA ret
+kernel32!GlobalAlloc                      2 stdcall bl_k32_GlobalAlloc ret
+kernel32!GlobalFree                       1 stdcall bl_k32_GlobalFree ret
+kernel32!GlobalLock                       1 stdcall bl_k32_GlobalLock ret
+kernel32!GlobalMemoryStatus               1 stdcall bl_k32_GlobalMemoryStatus ret
+kernel32!GlobalSize                       1 stdcall bl_k32_GlobalSize ret
+kernel32!GlobalUnlock                     1 stdcall bl_k32_GlobalUnlock ret
+kernel32!HeapCompact                      2 stdcall bl_k32_HeapCompact ret
+kernel32!HeapValidate                     3 stdcall bl_k32_HeapValidate ret
+kernel32!HeapWalk                         0 stdcall -
+kernel32!IsBadCodePtr                     1 stdcall bl_k32_IsBadCodePtr ret
+kernel32!IsBadReadPtr                     2 stdcall bl_k32_IsBadReadPtr ret
+kernel32!IsProcessorFeaturePresent        1 stdcall bl_k32_IsProcessorFeaturePresent ret
+kernel32!LoadLibraryExA                   3 stdcall bl_k32_LoadLibraryExA ret
+kernel32!LocalAlloc                       2 stdcall bl_k32_LocalAlloc ret
+kernel32!LocalFileTimeToFileTime          2 stdcall bl_k32_LocalFileTimeToFileTime ret
+kernel32!LocalFree                        1 stdcall bl_k32_LocalFree ret
+kernel32!LockFile                         0 stdcall -
+kernel32!MapViewOfFile                   5 stdcall bl_k32_MapViewOfFile ret
+kernel32!MoveFileW                       2 stdcall bl_k32_MoveFileW ret
+kernel32!OpenFile                         0 stdcall -
+kernel32!PeekConsoleInputA                0 stdcall -
+kernel32!PeekNamedPipe                    6 stdcall bl_k32_PeekNamedPipe ret
+kernel32!ReadConsoleA                     0 stdcall -
+kernel32!ReadConsoleOutputCharacterA     5 stdcall bl_k32_ReadConsoleOutputCharacterA ret
+kernel32!ReleaseMutex                     1 stdcall bl_k32_ReleaseMutex ret
+kernel32!ReleaseSemaphore                 3 stdcall bl_k32_ReleaseSemaphore ret
+kernel32!RemoveDirectoryA                 1 stdcall bl_k32_RemoveDirectoryA ret
+kernel32!RemoveDirectoryW                1 stdcall bl_k32_RemoveDirectoryW ret
+kernel32!ResetEvent                       1 stdcall bl_k32_ResetEvent ret
+kernel32!SetConsoleMode                   0 stdcall -
+kernel32!SetConsoleScreenBufferSize      2 stdcall bl_k32_SetConsoleScreenBufferSize ret
+kernel32!SetConsoleWindowInfo            3 stdcall bl_k32_SetConsoleWindowInfo ret
+kernel32!SetCurrentDirectoryW            1 stdcall bl_k32_SetCurrentDirectoryW ret
+kernel32!SetEnvironmentVariableW         2 stdcall bl_k32_SetEnvironmentVariableW ret
+kernel32!SetErrorMode                     1 stdcall bl_k32_SetErrorMode ret
+kernel32!SetFileAttributesA               2 stdcall bl_k32_SetFileAttributesA ret
+kernel32!SetFileAttributesW              2 stdcall bl_k32_SetFileAttributesW ret
+kernel32!SetFileTime                      0 stdcall -
+kernel32!SetLocalTime                     0 stdcall -
+kernel32!SetThreadPriority                2 stdcall bl_k32_SetThreadPriority ret
+kernel32!SetUnhandledExceptionFilter      1 stdcall bl_k32_SetUnhandledExceptionFilter ret
+kernel32!SuspendThread                    0 stdcall -
+kernel32!SystemTimeToFileTime             2 stdcall bl_k32_SystemTimeToFileTime ret
+kernel32!TerminateThread                 2 stdcall bl_k32_TerminateThread ret
+kernel32!UnlockFile                       0 stdcall -
+kernel32!UnmapViewOfFile                 1 stdcall bl_k32_UnmapViewOfFile ret
+kernel32!VirtualProtect                   4 stdcall bl_k32_VirtualProtect ret
+kernel32!VirtualQuery                     3 stdcall bl_k32_VirtualQuery ret
+kernel32!WaitForMultipleObjects           4 stdcall bl_k32_WaitForMultipleObjects ret
+kernel32!WriteConsoleA                    0 stdcall -
+kernel32!WriteConsoleInputA              4 stdcall bl_k32_WriteConsoleInputA ret
+kernel32!lstrcatA                         2 stdcall bl_k32_lstrcatA ret
+kernel32!lstrcpyA                         2 stdcall bl_k32_lstrcpyA ret
+kernel32!lstrlenW                         1 stdcall bl_k32_lstrlenW ret
+loader!StackWalk64                      0 stdcall -
+loader!SymFromAddr                      0 stdcall -
+loader!SymFunctionTableAccess64         0 stdcall -
+loader!SymGetLineFromAddr64             0 stdcall -
+loader!SymGetModuleBase64               0 stdcall -
+loader!SymGetModuleInfo64               0 stdcall -
+loader!SymGetSearchPath                 3 stdcall bl_dbg_SymGetSearchPath ret
+loader!SymInitialize                    3 stdcall bl_dbg_SymInitialize ret
+loader!SymSetOptions                    1 stdcall bl_dbg_SymSetOptions ret
+loader!SymSetSearchPath                 2 stdcall bl_dbg_SymSetSearchPath ret
+ole32!CoCreateInstance                 0 stdcall -
+ole32!CoInitialize                     1 stdcall bl_ole_CoInitialize ret
+ole32!OleInitialize                    1 stdcall bl_ole_OleInitialize ret
+ole32!RegisterDragDrop                 0 stdcall -
+ole32!ReleaseStgMedium                 0 stdcall -
+ole32!RevokeDragDrop                   0 stdcall -
+oleaut32!oleaut32_ord12                   0 stdcall -
+oleaut32!oleaut32_ord2                    0 stdcall -
+oleaut32!oleaut32_ord200                  0 stdcall -
+oleaut32!oleaut32_ord201                  0 stdcall -
+oleaut32!oleaut32_ord202                  0 stdcall -
+oleaut32!oleaut32_ord6                    0 stdcall -
+oleaut32!oleaut32_ord8                    0 stdcall -
+oleaut32!oleaut32_ord9                    0 stdcall -
+shell32!DragQueryFileA                   0 stdcall -
+shell32!ShellExecuteA                    0 stdcall -
+shell32!Shell_NotifyIconA                0 stdcall -
+shlwapi!PathRemoveFileSpecA              1 stdcall bl_shlw_PathRemoveFileSpecA ret
+user32!AdjustWindowRectEx               4 stdcall bl_u32_AdjustWindowRectEx ret
+user32!BeginPaint                       2 stdcall bl_u32_BeginPaint ret
+user32!CallWindowProcA                  5 stdcall bl_u32_CallWindowProcA ret
+user32!ChangeDisplaySettingsA           2 stdcall bl_u32_ChangeDisplaySettingsA ret
+user32!ClientToScreen                   2 stdcall bl_u32_ClientToScreen ret
+user32!CloseClipboard                   0 stdcall bl_u32_CloseClipboard ret
+user32!CreateIconIndirect               1 stdcall bl_u32_CreateIconIndirect ret
+user32!CreateWindowExA                  12 stdcall bl_u32_CreateWindowExA ret
+user32!DefWindowProcA                   4 stdcall bl_u32_DefWindowProcA ret
+user32!DestroyWindow                    1 stdcall bl_u32_DestroyWindow ret
+user32!DispatchMessageA                 1 stdcall bl_u32_DispatchMessageA ret
+user32!DrawTextA                        5 stdcall bl_u32_DrawTextA ret
+user32!EmptyClipboard                   0 stdcall bl_u32_EmptyClipboard ret
+user32!EndPaint                         2 stdcall bl_u32_EndPaint ret
+user32!EnumChildWindows                 3 stdcall bl_u32_EnumChildWindows ret
+user32!FillRect                         3 stdcall bl_u32_FillRect ret
+user32!FindWindowA                      2 stdcall bl_u32_FindWindowA ret
+user32!FlashWindow                      2 stdcall bl_u32_FlashWindow ret
+user32!GetActiveWindow                  0 stdcall bl_u32_GetActiveWindow ret
+user32!GetClassLongA                    2 stdcall bl_u32_GetClassLongA ret
+user32!GetClassNameA                    3 stdcall bl_u32_GetClassNameA ret
+user32!GetClientRect                    2 stdcall bl_u32_GetClientRect ret
+user32!GetClipboardData                 1 stdcall bl_u32_GetClipboardData ret
+user32!GetDC                            1 stdcall bl_u32_GetDC ret
+user32!GetFocus                         0 stdcall bl_u32_GetFocus ret
+user32!GetForegroundWindow              0 stdcall bl_u32_GetForegroundWindow ret
+user32!GetMessageA                      4 stdcall bl_u32_GetMessageA ret
+user32!GetParent                        1 stdcall bl_u32_GetParent ret
+user32!GetSysColor                      1 stdcall bl_u32_GetSysColor ret
+user32!GetSystemMetrics                 1 stdcall bl_u32_GetSystemMetrics ret
+user32!GetTopWindow                     1 stdcall bl_u32_GetTopWindow ret
+user32!GetWindow                        2 stdcall bl_u32_GetWindow ret
+user32!GetWindowLongA                   2 stdcall bl_u32_GetWindowLongA ret
+user32!GetWindowTextA                   3 stdcall bl_u32_GetWindowTextA ret
+user32!IntersectRect                    3 stdcall bl_u32_IntersectRect ret
+user32!InvalidateRect                   3 stdcall bl_u32_InvalidateRect ret
+user32!IsIconic                         1 stdcall bl_u32_IsIconic ret
+user32!IsWindow                         1 stdcall bl_u32_IsWindow ret
+user32!KillTimer                        2 stdcall bl_u32_KillTimer ret
+user32!LoadCursorA                      2 stdcall bl_u32_LoadCursorA ret
+user32!LoadIconA                        2 stdcall bl_u32_LoadIconA ret
+user32!LoadImageA                       6 stdcall bl_u32_LoadImageA ret
+user32!LoadStringA                      4 stdcall bl_u32_LoadStringA ret
+user32!MessageBoxA                      4 stdcall bl_u32_MessageBoxA ret
+user32!MoveWindow                       6 stdcall bl_u32_MoveWindow ret
+user32!MsgWaitForMultipleObjects        5 stdcall bl_u32_MsgWaitForMultipleObjects ret
+user32!OpenClipboard                    1 stdcall bl_u32_OpenClipboard ret
+user32!PostMessageA                     4 stdcall bl_u32_PostMessageA ret
+user32!RedrawWindow                     4 stdcall bl_u32_RedrawWindow ret
+user32!RegisterClassA                   1 stdcall bl_u32_RegisterClassA ret
+user32!RegisterWindowMessageA           1 stdcall bl_u32_RegisterWindowMessageA ret
+user32!ReleaseCapture                   0 stdcall bl_u32_ReleaseCapture ret
+user32!ReleaseDC                        2 stdcall bl_u32_ReleaseDC ret
+user32!SendMessageA                     4 stdcall bl_u32_SendMessageA ret
+user32!SetActiveWindow                  1 stdcall bl_u32_SetActiveWindow ret
+user32!SetCapture                       1 stdcall bl_u32_SetCapture ret
+user32!SetClipboardData                 2 stdcall bl_u32_SetClipboardData ret
+user32!SetCursor                        1 stdcall bl_u32_SetCursor ret
+user32!SetCursorPos                     2 stdcall bl_u32_SetCursorPos ret
+user32!SetFocus                         1 stdcall bl_u32_SetFocus ret
+user32!SetForegroundWindow              1 stdcall bl_u32_SetForegroundWindow ret
+user32!SetParent                        2 stdcall bl_u32_SetParent ret
+user32!SetTimer                         4 stdcall bl_u32_SetTimer ret
+user32!SetWindowLongA                   3 stdcall bl_u32_SetWindowLongA ret
+user32!SetWindowTextA                   2 stdcall bl_u32_SetWindowTextA ret
+user32!ShowCursor                       1 stdcall bl_u32_ShowCursor ret
+user32!ShowWindow                       2 stdcall bl_u32_ShowWindow ret
+user32!SystemParametersInfoA            4 stdcall bl_u32_SystemParametersInfoA ret
+user32!TranslateMessage                 1 stdcall bl_u32_TranslateMessage ret
+user32!UnregisterClassA                 2 stdcall bl_u32_UnregisterClassA ret
+user32!ValidateRect                     2 stdcall bl_u32_ValidateRect ret
+user32!WindowFromPoint                  2 stdcall bl_u32_WindowFromPoint ret
+user32!wsprintfA                        2 cdecl bl_u32_wsprintfA ret
+winmm!PlaySoundA                       3 stdcall bl_mm_PlaySoundA ret
+winmm!auxGetDevCapsA                   3 stdcall bl_mm_auxGetDevCapsA ret
+winmm!auxGetNumDevs                    0 stdcall bl_mm_auxGetNumDevs ret
+winmm!auxGetVolume                     2 stdcall bl_mm_auxGetVolume ret
+winmm!auxSetVolume                     2 stdcall bl_mm_auxSetVolume ret
+winmm!joyGetDevCapsA                   3 stdcall bl_mm_joyGetDevCapsA ret
+winmm!joyGetNumDevs                    0 stdcall bl_mm_joyGetNumDevs ret
+winmm!joyGetPosEx                      2 stdcall bl_mm_joyGetPosEx ret
+winmm!mciSendCommandA                  0 stdcall -
+winmm!midiOutClose                     1 stdcall bl_mm_midiOutClose ret
+winmm!midiOutLongMsg                   3 stdcall bl_mm_midiOutLongMsg ret
+winmm!midiOutOpen                      5 stdcall bl_mm_midiOutOpen ret
+winmm!midiOutPrepareHeader             3 stdcall bl_mm_midiOutPrepareHeader ret
+winmm!midiOutReset                     1 stdcall bl_mm_midiOutReset ret
+winmm!midiOutShortMsg                  2 stdcall bl_mm_midiOutShortMsg ret
+winmm!midiOutUnprepareHeader           3 stdcall bl_mm_midiOutUnprepareHeader ret
+winmm!mixerClose                       1 stdcall bl_mm_mixerClose ret
+winmm!mixerGetControlDetailsA          3 stdcall bl_mm_mixerGetControlDetailsA ret
+winmm!mixerGetDevCapsA                 3 stdcall bl_mm_mixerGetDevCapsA ret
+winmm!mixerGetLineControlsA            3 stdcall bl_mm_mixerGetLineControlsA ret
+winmm!mixerGetLineInfoA                3 stdcall bl_mm_mixerGetLineInfoA ret
+winmm!mixerGetNumDevs                  0 stdcall bl_mm_mixerGetNumDevs ret
+winmm!mixerOpen                        5 stdcall bl_mm_mixerOpen ret
+winmm!mixerSetControlDetails           3 stdcall bl_mm_mixerSetControlDetails ret
+winmm!timeBeginPeriod                  1 stdcall bl_mm_timeBeginPeriod ret
+winmm!timeEndPeriod                    1 stdcall bl_mm_timeEndPeriod ret
+winmm!timeGetTime                      0 stdcall bl_mm_timeGetTime ret
+winmm!waveInAddBuffer                  3 stdcall bl_mm_waveInAddBuffer ret
+winmm!waveInClose                      1 stdcall bl_mm_waveInClose ret
+winmm!waveInOpen                       6 stdcall bl_mm_waveInOpen ret
+winmm!waveInPrepareHeader              3 stdcall bl_mm_waveInPrepareHeader ret
+winmm!waveInReset                      1 stdcall bl_mm_waveInReset ret
+winmm!waveInStart                      1 stdcall bl_mm_waveInStart ret
+winmm!waveInUnprepareHeader            3 stdcall bl_mm_waveInUnprepareHeader ret
+winmm!waveOutClose                     1 stdcall bl_mm_waveOutClose ret
+winmm!waveOutGetDevCapsA               3 stdcall bl_mm_waveOutGetDevCapsA ret
+winmm!waveOutGetID                     2 stdcall bl_mm_waveOutGetID ret
+winmm!waveOutOpen                      6 stdcall bl_mm_waveOutOpen ret
+winmm!waveOutPause                     1 stdcall bl_mm_waveOutPause ret
+winmm!waveOutPrepareHeader             3 stdcall bl_mm_waveOutPrepareHeader ret
+winmm!waveOutReset                     1 stdcall bl_mm_waveOutReset ret
+winmm!waveOutRestart                   1 stdcall bl_mm_waveOutRestart ret
+winmm!waveOutSetVolume                 2 stdcall bl_mm_waveOutSetVolume ret
+winmm!waveOutUnprepareHeader           3 stdcall bl_mm_waveOutUnprepareHeader ret
+winmm!waveOutWrite                     3 stdcall bl_mm_waveOutWrite ret
+wsock32!ws2_32.inet_addr                 1 stdcall bl_wsock_inet_addr ret
+wsock32!ws2_32.WSAGetLastError           0 stdcall bl_wsock_wsock32_ord111 ret
+wsock32!ws2_32.WSAStartup                2 stdcall bl_wsock_wsock32_ord115 ret
+wsock32!wsock32_ord116                   0 stdcall bl_wsock_wsock32_ord116 ret
+wsock32!ws2_32.ioctlsocket               3 stdcall bl_wsock_fail3 ret
+wsock32!ws2_32.ntohs                     1 stdcall bl_wsock_htons ret
+wsock32!ws2_32.select                    5 stdcall bl_wsock_fail5 ret
+wsock32!ws2_32.bind                      3 stdcall bl_wsock_fail3 ret
+wsock32!ws2_32.sendto                    6 stdcall bl_wsock_fail6 ret
+wsock32!setsockopt                       5 stdcall bl_wsock_fail5 ret
+wsock32!ws2_32.socket                    3 stdcall bl_wsock_socket ret
+wsock32!ws2_32.closesocket               1 stdcall bl_wsock_closesocket ret
+wsock32!ws2_32.gethostbyname             1 stdcall bl_wsock_gethostbyname ret
+wsock32!ws2_32.gethostname               2 stdcall bl_wsock_gethostname ret
+wsock32!ws2_32.getsockname               3 stdcall bl_wsock_fail3 ret
+wsock32!ws2_32.htons                     1 stdcall bl_wsock_htons ret
+
+# dsound.dll is loaded with LoadLibrary (engine, Miles); dsound.c registers it as a module
+# whose exports are these thunks.
+dsound!DirectSoundCreate                3 stdcall bl_ds_DirectSoundCreate ret
+dsound!DirectSoundEnumerateA            2 stdcall bl_ds_DirectSoundEnumerateA ret
+dsound!DirectSoundCaptureCreate         3 stdcall bl_ds_DirectSoundCaptureCreate ret

@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Give one module's SRW output link-safe symbol names and write its extern.llinc.
+
+All recompiled modules link into one macOS executable, so names must not clash with
+libc or with each other (every Source DLL exports CreateInterface), and MSVC C++
+names (`?DevMsg@@YAXPBDZZ`) are not valid LLVM identifiers. Names are encoded with
+`encode()` (injective) and prefixed:
+
+  export X of this module          -> <module>_<enc X>     (C entry: c_<module>_<enc X>)
+  import X from a recompiled module -> <dll module>_<enc X>  (resolved at link time)
+  import X from a system DLL        -> imp_<enc X>          (runtime/imports.def)
+
+Recompiled modules are listed in native/modules/modules.txt. Data imports from a
+recompiled module resolve to the exporter's global data label; data imports from
+system DLLs listed in IMPORTED_DATA become zero-filled blocks here.
+
+Usage: gen_extern.py [--exports-only] <srw-output-dir> <main.llasm> <module> <pe>
+"""
+import glob
+import os
+import re
+import struct
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MODULES_FILE = os.path.join(HERE, "..", "modules", "modules.txt")
+
+# Imported variables of system DLLs (not functions): name -> size in bytes.
+IMPORTED_DATA = {
+    "_adjust_fdiv": 4,  # msvcrt: Pentium FDIV workaround flag
+}
+
+TOKEN_SEP = r"[\s,\[\]+()]"
+
+
+def encode(name):
+    """Injective map of a PE symbol name to [A-Za-z0-9_]+."""
+    out = []
+    for ch in name:
+        if ch.isascii() and ch.isalnum():
+            out.append(ch)
+        elif ch == "_":
+            out.append("__")
+        else:
+            out.append({"?": "_q", "@": "_a", "$": "_d"}.get(ch, f"_x{ord(ch):02X}"))
+    return "".join(out)
+
+
+# Ordinal imports SRW names itself (SRW_loader.c); all others become <dll>_ord<N>.
+SRW_ORDINAL_NAMES = {
+    "wsock32": {1: "ws2_32.accept", 2: "ws2_32.bind", 3: "ws2_32.closesocket", 4: "ws2_32.connect",
+                6: "ws2_32.getsockname", 7: "getsockopt", 8: "ws2_32.htonl", 9: "ws2_32.htons",
+                10: "ws2_32.inet_addr", 12: "ws2_32.ioctlsocket", 13: "ws2_32.listen", 14: "ws2_32.ntohl",
+                15: "ws2_32.ntohs", 16: "recv", 17: "recvfrom", 18: "ws2_32.select", 19: "ws2_32.send",
+                20: "ws2_32.sendto", 21: "setsockopt", 22: "ws2_32.shutdown", 23: "ws2_32.socket",
+                52: "ws2_32.gethostbyname", 57: "ws2_32.gethostname", 111: "ws2_32.WSAGetLastError",
+                115: "ws2_32.WSAStartup"},
+    "dsound": {1: "DirectSoundCreate", 2: "DirectSoundEnumerateA"},
+    "comctl32": {17: "InitCommonControls"},
+}
+
+
+def pe_tables(path):
+    """(exports, imports): export names; [(dll, name)] with SRW's ordinal names."""
+    d = open(path, "rb").read()
+    pe = struct.unpack_from("<I", d, 0x3C)[0]
+    opt = pe + 24
+    nsec = struct.unpack_from("<H", d, pe + 6)[0]
+    o = opt + struct.unpack_from("<H", d, pe + 20)[0]
+    secs = []
+    for _ in range(nsec):
+        vsize, va, rsize, raw = struct.unpack_from("<IIII", d, o + 8)
+        secs.append((va, max(vsize, rsize), raw))
+        o += 40
+
+    def off(rva):
+        for va, size, raw in secs:
+            if va <= rva < va + size:
+                return raw + rva - va
+        raise ValueError(hex(rva))
+
+    def cstr(p):
+        return d[p:d.index(b"\0", p)].decode("latin1")
+
+    exports = []
+    erva = struct.unpack_from("<I", d, opt + 96)[0]
+    if erva:
+        e = off(erva)
+        nn, _, an = struct.unpack_from("<III", d, e + 24)
+        exports = [cstr(off(struct.unpack_from("<I", d, off(an) + 4 * i)[0])) for i in range(nn)]
+
+    imports = []
+    irva = struct.unpack_from("<I", d, opt + 104)[0]
+    p = off(irva)
+    while True:
+        ilt, _, _, nm, iat = struct.unpack_from("<IIIII", d, p)
+        if nm == 0:
+            break
+        dll = cstr(off(nm))
+        t = off(ilt or iat)
+        while True:
+            v = struct.unpack_from("<I", d, t)[0]
+            if v == 0:
+                break
+            if v & 0x80000000:  # named by SRW or by srw-macos.patch (<dll>_ord<N>)
+                base = dll.split(".")[0].lower()
+                name = SRW_ORDINAL_NAMES.get(base, {}).get(v & 0xFFFF, f"{base}_ord{v & 0xFFFF}")
+            else:
+                name = cstr(off(v) + 2)
+            imports.append((dll, name))
+            t += 4
+        p += 20
+    return exports, imports
+
+
+def write_export_table(outdir, module, exports, rename, text, deps):
+    """<module>_exports.c: registers the module's exports and DllMain with the
+    runtime loader (runtime/bl_loader.c)."""
+    entry = f"{module}_DllEntry" if re.search(rf"^proc {module}_DllEntry\b", text, re.M) else None
+    # Exports at the same address as another are `define` aliases, not symbols.
+    aliases = dict(re.findall(r"^define (\S+) (\S+)\s*$", text, re.M))
+
+    def resolve(sym):
+        while sym in aliases:
+            sym = aliases[sym]
+        return sym
+
+    rename = {n: resolve(rename[n]) for n in exports}
+    syms = [rename[n] for n in exports]
+    lines = ["// Generated by gen_extern.py. Contains symbol names of a game module: do not distribute.",
+             '#include "bl_win32.h"', ""]
+    lines += [f"extern char {s}[];" for s in sorted(set(syms) | ({entry} if entry else set()))]
+    lines += ["", "static const struct bl_export exports[] = {"]
+    lines += [f'    {{ "{n.encode("unicode_escape").decode()}", {rename[n]} }},' for n in exports]
+    lines += ["    { 0, 0 },", "};", ""]
+    lines += ["static const char *const deps[] = { " + "".join(f'"{d}.dll", ' for d in deps) + "0 };", "",
+              f'static struct bl_module module = {{ "{module}.dll", {entry or "0"}, exports, {len(exports)}, 0, 0, deps }};',
+              "", "__attribute__((constructor)) static void register_module(void) { bl_register_module(&module); }", ""]
+    with open(os.path.join(outdir, f"{module}_exports.c"), "w") as f:
+        f.write("\n".join(lines))
+    # Other modules import aliased exports by their own names: ld64 alias list
+    # (`-Wl,-alias_list,<file>`), Mach-O names with the leading underscore.
+    with open(os.path.join(outdir, f"{module}_aliases.txt"), "w") as f:
+        f.writelines(f"_{resolve(a)} _{a}\n" for a in sorted(aliases) if a.startswith((f"{module}_", f"c_{module}_")))
+
+
+def import_owners(imports, recompiled):
+    """Recompiled modules imported from, in import-table order."""
+    owners = []
+    for dll, _ in imports:
+        owner = recompiled.get(dll.split(".")[0].lower())
+        if owner and owner not in owners:
+            owners.append(owner)
+    return owners
+
+
+def main():
+    exports_only = sys.argv[1] == "--exports-only"
+    if exports_only:
+        del sys.argv[1]
+    outdir, main_llasm, module, pe = sys.argv[1:5]
+    recompiled = {m.strip().lower(): m.strip() for m in open(MODULES_FILE) if m.strip() and not m.startswith("#")}
+    exports, imports = pe_tables(os.path.join(outdir, pe))
+    if exports_only:  # regenerate <module>_exports.c of an already renamed module
+        rename = {name: f"{module}_{encode(name)}" for name in exports}
+        files = [os.path.join(outdir, main_llasm)] + sorted(glob.glob(os.path.join(outdir, "seg*_*.llinc")))
+        text = "\n".join(open(f).read() for f in files)
+        write_export_table(outdir, module, exports, rename, text, import_owners(imports, recompiled))
+        return 0
+
+    rename = {}
+    for name in exports:
+        sym = f"{module}_{encode(name)}"
+        rename[name] = sym
+        if "_" + name not in exports:     # msvcrt exports both exit and _exit
+            rename.setdefault("_" + name, sym + "_")  # SRW's underscore alias of data exports
+        rename["c_" + name] = "c_" + sym   # C-callable entry
+        if (m := re.fullmatch(r"_(\w+)@\d+", name)) and m.group(1) not in exports:
+            rename[m.group(1)] = sym          # SRW strips stdcall decoration (Mss32)
+            rename["c_" + m.group(1)] = "c_" + sym
+    imported_data = set()
+    for dll, name in imports:
+        owner = recompiled.get(dll.split(".")[0].lower())
+        if owner:
+            rename[name] = f"{owner}_{encode(name)}"
+        elif name in IMPORTED_DATA:
+            rename[name] = f"imp_{encode(name)}"
+            imported_data.add(rename[name])
+        else:
+            rename[name] = f"imp_{encode(name)}"
+
+    files = [os.path.join(outdir, main_llasm)] + sorted(glob.glob(os.path.join(outdir, "seg*_*.llinc")))
+    if rename:
+        word = re.compile(f"(?:(?<={TOKEN_SEP})|^)(" + "|".join(map(re.escape, sorted(rename, key=len, reverse=True)))
+                          + f")(?={TOKEN_SEP}|$)", re.M)
+        for f in files:
+            src = open(f).read()
+            # ';' comments keep the original text.
+            out = "\n".join(line if line.lstrip().startswith(";") else word.sub(lambda m: rename[m.group(1)], line)
+                            for line in src.split("\n"))
+            # SRW declares every import as a proc; imported variables get data blocks below.
+            out = re.sub(r"^proc (\S+) external\n", lambda m: "" if m.group(1) in imported_data else m.group(0),
+                         out, flags=re.M)
+            if out != src:
+                open(f, "w").write(out)
+
+    # llasm does not expand `define` aliases in daddr (exported procs held in vtables).
+    defines = dict(re.findall(r"^define (\S+) (\S+)\s*$", open(files[0]).read(), re.M))
+    if defines:
+        for f in files:
+            src = open(f).read()
+            out = re.sub(r"^(daddr )(\S+)", lambda m: m.group(1) + defines.get(m.group(2), m.group(2)), src, flags=re.M)
+            if out != src:
+                open(f, "w").write(out)
+
+    # SRW writes an address inside a data label as `label[offset]` (jump tables at an
+    # unaligned address), which llasm does not parse.
+    for f in files:
+        src = open(f).read()
+        out = re.sub(r"^mov (\w+), (loc_[0-9A-F]+)\[(\d+)\]$", r"mov \1, \2\nadd \1, \1, \3", src, flags=re.M)
+        if out != src:
+            open(f, "w").write(out)
+
+    # A replaced instruction (instruction_replacements.sci) can fall through into the
+    # next region start without SRW closing the procedure; close it with a tail call.
+    for f in files:
+        src = open(f).read().split("\n")
+        out, open_proc = [], False
+        for line in src:
+            m = re.match(r"proc (\S+)(?: global \S+)?\s*(?:;.*)?$", line)
+            if m and open_proc:
+                out += [f"tcall {m.group(1)} ; fall through", "endp", ""]
+            if m:
+                open_proc = True
+            elif line.startswith("endp"):
+                open_proc = False
+            out.append(line)
+        if len(out) != len(src):
+            open(f, "w").write("\n".join(out))
+
+    text = "\n".join(open(f).read() for f in files)
+    declared = set(re.findall(r"^proc (\S+) external", text, re.M))
+    # C helpers declared with func/funcv in the runtime's include files.
+    for inc in glob.glob(os.path.join(HERE, "..", "runtime", "llasm", "*.llinc")):
+        declared |= set(re.findall(r"^funcv? (\S+)", open(inc).read(), re.M))
+    defined = set(re.findall(r"^proc (\S+)", text, re.M)) | set(re.findall(r"^dlabel (\S+)", text, re.M))
+    defined |= set(re.findall(r"^define (\S+) ", text, re.M))
+    referenced = set(re.findall(r"^daddr (\S+)", text, re.M))
+    referenced |= set(re.findall(r"\b((?:imp|bl)_\w+)", text))
+    for owner in set(recompiled.values()):
+        referenced |= set(re.findall(rf"\b({re.escape(owner)}_\w+)", text))
+    ext = os.path.join(outdir, "external_procedures.sci")
+    if os.path.exists(ext):
+        referenced |= set(re.findall(r",(bl_\w+)", open(ext).read()))
+    missing = sorted(n for n in referenced if n not in declared and n not in defined and not n.startswith("loc_"))
+
+    lines = [";; Generated by gen_extern.py: external symbols of this module.", "include bl_special.llinc"]
+    lines += [f"proc {n} external" for n in missing if n not in imported_data]
+    for name, size in sorted(IMPORTED_DATA.items()):
+        n = f"imp_{encode(name)}"
+        if n in imported_data:
+            lines += ["", f"datasegment import_{n}", f"dlabel {n}"] + ["db 0"] * size + ["endd"]
+    with open(os.path.join(outdir, "extern.llinc"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    write_export_table(outdir, module, exports, rename, text, import_owners(imports, recompiled))
+
+    cross = sum(1 for dll, _ in imports if dll.split(".")[0].lower() in recompiled)
+    print(f"names: {len(exports)} exports, {len(imports)} imports ({cross} from recompiled modules); "
+          f"extern.llinc: {len(missing)} symbols")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

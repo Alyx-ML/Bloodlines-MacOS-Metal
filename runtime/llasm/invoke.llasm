@@ -1,0 +1,10 @@
+;; Native code calling translated code by guest address (vtable slots, callbacks,
+;; DLL entry points). The C side puts the target in eax and the arguments on the
+;; guest stack, then calls c_bl_guest_invoke (runtime/bl_vm.c: bl_call_guest).
+include llasm.llinc
+include asm-calls.llinc
+
+proc bl_guest_invoke global c_bl_guest_invoke
+        mov tmp0, eax
+        tcall tmp0
+endp

@@ -1,0 +1,29 @@
+;; Runtime helpers that replace x86 instructions SRW cannot translate (runtime/bl_special.c).
+funcv bl_cpuid $
+funcv bl_rdtsc $
+funcv bl_x87_fld80 $, addr
+funcv bl_x87_fstp80 $, addr
+funcv bl_x87_fldl2e $
+funcv bl_x87_fldl2t $
+funcv bl_x87_fldpi $
+funcv bl_x87_f2xm1 $
+funcv bl_x87_fscale $
+funcv bl_x87_frndint $
+funcv bl_x87_fxtract $
+funcv bl_x87_fprem $
+funcv bl_x87_fprem1 $
+funcv bl_x87_fpatan $
+funcv bl_x87_fxam $
+funcv bl_x87_ftst $
+funcv bl_x87_fincstp $
+funcv bl_x87_fdecstp $
+funcv bl_x87_fsincos $
+funcv bl_repe_cmpsd $
+funcv bl_repne_cmpsd $
+funcv bl_x87_arith $, code
+funcv bl_simd_trap $, addr
+funcv bl_x87_fnstenv $, addr
+funcv bl_x87_fldenv $, addr
+funcv bl_x87_fnsave $, addr
+funcv bl_x87_frstor $, addr
+funcv bl_mmx $, op, operands, arg
