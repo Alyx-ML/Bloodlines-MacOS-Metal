@@ -22,6 +22,7 @@
 //   BL_TEX_STATS=1           with BL_DRAW_STATS, log the mean brightness of each 32-bit texture drawn
 //   BL_SHADOW_SHOW=1         draw shadow receivers opaque instead of darkening
 //   BL_FPS_MAX=n             with a window, present at most n frames a second (default 60, 0 = no cap)
+//   BL_MOVIE_DUMP=1          write frame 60 of each GDI-drawn movie to BL_DUMP_DIR
 //   BL_DEEP_COLOR=0          8-bit back buffer and window (default: 16-bit back buffer, 10-bit window)
 //   BL_PACING=0              plain presents, even on screens whose refresh is a multiple of the cap
 //   BL_PACING_STATS=1        log how many refreshes apart frames reach the screen
@@ -1966,6 +1967,16 @@ void d3d_render_present_pixels(const void *pixels, uint32_t w, uint32_t h, int b
                  withBytes:(const uint8_t *)pixels + (size_t)(bottom_up ? h - 1 - y : y) * w * 4 bytesPerRow:w * 4];
     // Clip both rectangles to their images, scaling the source with the destination.
     int32_t s0[4] = {sr[0], sr[1], sr[2], sr[3]}, d0[4] = {dr[0], dr[1], dr[2], dr[3]};
+    // A movie stretched over a whole window wider than 4:3 is shown at 4:3 with black
+    // bars instead, which is how it looked on the 4:3 screens it was made for. That
+    // includes the 720x480 one: DV-sized frames are 4:3 pictures with narrow pixels.
+    // Centred movies drawn at their own size are left alone. BL_WIDESCREEN=stretch
+    // keeps the game's stretch.
+    if (env_widescreen && d0[0] <= 0 && d0[1] <= 0 && d0[2] >= (int32_t)sw && d0[3] >= (int32_t)sh &&
+        (d0[2] - d0[0] != s0[2] - s0[0] || d0[3] - d0[1] != s0[3] - s0[1]) && sw * 3 > sh * 4 + sh / 25) {
+        int32_t fit = (int32_t)(sh * 4 / 3), x0 = ((int32_t)sw - fit) / 2;
+        d0[0] = x0, d0[1] = 0, d0[2] = x0 + fit, d0[3] = (int32_t)sh;
+    }
     if (d0[2] <= d0[0] || d0[3] <= d0[1] || s0[2] <= s0[0] || s0[3] <= s0[1]) return;
     float kx = (float)(s0[2] - s0[0]) / (d0[2] - d0[0]), ky = (float)(s0[3] - s0[1]) / (d0[3] - d0[1]);
     if (d0[0] < 0) s0[0] -= (int32_t)(d0[0] * kx), d0[0] = 0;
@@ -1980,6 +1991,13 @@ void d3d_render_present_pixels(const void *pixels, uint32_t w, uint32_t h, int b
     uint32_t su[4] = {(uint32_t)s0[0], (uint32_t)s0[1], (uint32_t)s0[2], (uint32_t)s0[3]};
     uint32_t du[4] = {(uint32_t)d0[0], (uint32_t)d0[1], (uint32_t)d0[2], (uint32_t)d0[3]};
     stretch_draw(src, su, screen, du, 1);
+    static int movie, movie_frame;  // BL_MOVIE_DUMP=1: frame 60 of each movie as a PNG
+    if (fresh) movie++, movie_frame = 0;
+    if (++movie_frame == 60 && getenv("BL_MOVIE_DUMP")) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/movie_%d.png", env_dump_dir ? env_dump_dir : ".", movie);
+        write_png(read_target(screen), screen.width, screen.height, path);
+    }
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [layer nextDrawable];
         if (drawable && drawable.texture.width == sw && drawable.texture.height == sh) {

@@ -906,5 +906,25 @@ Verified: in the window, all four movies play with no errors, and the trace show
 geometry above. Not verified by me on screen: that the surround is now black (the
 user's check).
 
-Not changed: the first two movies are 4:3 and 3:2 but are stretched to fill a 16:9
-window. The game asks for that stretch; Windows would do the same.
+Not changed here: the first two movies are 4:3 and 3:2 but are stretched to fill a
+16:9 window. The game asks for that stretch; Windows would do the same. (Since
+changed; see the next section.)
+
+## 2026-10-23 — Intro movies at 4:3
+
+A movie the game stretches over the whole window, on a window wider than 4:3, is now
+drawn as a centred 4:3 picture with black bars. That is how it looked on the 4:3
+screens of the time. The 720x480 White Wolf movie is included: DV-sized frames are
+4:3 pictures with narrow pixels. Centred movies drawn at their own size (nVidia,
+Troika) are left alone. `BL_WIDESCREEN=stretch` restores the stretch, as it does for
+the 3D projection.
+
+`BL_MOVIE_DUMP=1` with `BL_DUMP_DIR` writes frame 60 of each GDI-drawn movie, taken
+from the window image.
+
+Verified in the window at 1920x1080, from those dumps:
+- Activision and White Wolf fill a 1440x1080 area with black bars on both sides.
+- nVidia and Troika sit centred on black, with no white left from the movie before.
+
+Not verified: other window sizes, and movies played later in the game, if any use
+this path.
