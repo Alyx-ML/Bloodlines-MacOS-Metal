@@ -2,6 +2,7 @@
 // Radeon 9800 the game was tuned on), its display modes, formats and caps.
 #include <string.h>
 
+#include "bl_win32.h"
 #include "com_gen.h"
 #include "d3d9_objects.h"
 
@@ -20,11 +21,8 @@ uint32_t bl_d3d9_Direct3DCreate9_c(uint32_t sdk_version)
 
 uint32_t d3d_guest(void) { return d3d->guest; }
 
-static const struct { uint32_t w, h; } modes[] = {
-    { 640, 480 }, { 800, 600 }, { 1024, 768 }, { 1152, 864 }, { 1280, 720 }, { 1280, 960 },
-    { 1280, 1024 }, { 1600, 900 }, { 1600, 1200 }, { 1920, 1080 },
-};
-#define NMODES (sizeof modes / sizeof modes[0])
+// Display modes: the Mac display's own sizes plus the common ones that fit
+// (bl_display.c); the desktop mode is the display's current size in pixels.
 
 uint32_t bl_IDirect3D9_RegisterSoftwareDevice_c(uint32_t self, uint32_t f) { (void)self, (void)f; return D3D_OK; }
 uint32_t bl_IDirect3D9_GetAdapterCount_c(uint32_t self) { (void)self; return 1; }
@@ -51,7 +49,7 @@ uint32_t bl_IDirect3D9_GetAdapterIdentifier_c(uint32_t self, uint32_t adapter, u
 uint32_t bl_IDirect3D9_GetAdapterModeCount_c(uint32_t self, uint32_t adapter, uint32_t format)
 {
     (void)self;
-    return adapter == 0 && format == D3DFMT_X8R8G8B8 ? NMODES : 0;
+    return adapter == 0 && format == D3DFMT_X8R8G8B8 ? (uint32_t)bl_display_mode_count() : 0;
 }
 
 static void put_mode(uint32_t m, uint32_t w, uint32_t h)
@@ -65,8 +63,9 @@ static void put_mode(uint32_t m, uint32_t w, uint32_t h)
 uint32_t bl_IDirect3D9_EnumAdapterModes_c(uint32_t self, uint32_t adapter, uint32_t format, uint32_t i, uint32_t mode)
 {
     (void)self;
-    if (adapter || format != D3DFMT_X8R8G8B8 || i >= NMODES) return D3DERR_INVALIDCALL;
-    put_mode(mode, modes[i].w, modes[i].h);
+    uint32_t w, h;
+    if (adapter || format != D3DFMT_X8R8G8B8 || !bl_display_mode((int)i, &w, &h)) return D3DERR_INVALIDCALL;
+    put_mode(mode, w, h);
     return D3D_OK;
 }
 
@@ -74,7 +73,9 @@ uint32_t bl_IDirect3D9_GetAdapterDisplayMode_c(uint32_t self, uint32_t adapter, 
 {
     (void)self;
     if (adapter) return D3DERR_INVALIDCALL;
-    put_mode(mode, 1024, 768);
+    uint32_t w, h;
+    bl_screen_size(&w, &h);
+    put_mode(mode, w, h);
     return D3D_OK;
 }
 

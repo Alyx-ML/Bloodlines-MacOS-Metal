@@ -50,7 +50,8 @@ struct d3d_vs_params {
     int32_t i[16][4];
     uint32_t b[16];
     float inv_viewport[2];  // 1/width, 1/height: D3D9's half-pixel offset
-    float pad[2];
+    float clip_y;           // scale of the output y (widescreen correction; 1 = none)
+    float pad;
 };
 
 struct d3d_ps_params {

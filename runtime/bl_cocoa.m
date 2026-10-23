@@ -107,6 +107,15 @@ static int captured, mouse_buttons;
 
 static BLWindowDelegate *delegate;
 
+// Window content size for a game resolution: one point per pixel, shrunk to fit the
+// screen for modes bigger than it (a Retina display's native size, say).
+static NSSize fit_size(uint32_t width, uint32_t height)
+{
+    NSRect avail = NSScreen.mainScreen.visibleFrame;
+    double k = fmin(1.0, fmin((avail.size.width - 16) / width, (avail.size.height - 48) / height));
+    return NSMakeSize(floor(width * k), floor(height * k));
+}
+
 CAMetalLayer *bl_cocoa_open_window(uint32_t width, uint32_t height, const char *title, uint32_t hwnd)
 {
     if (!pthread_main_np()) {
@@ -123,7 +132,8 @@ CAMetalLayer *bl_cocoa_open_window(uint32_t width, uint32_t height, const char *
     // it up with black bars instead of stretching it.
     metal_layer.contentsGravity = kCAGravityResizeAspect;
     metal_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
-    NSRect frame = NSMakeRect(0, 0, width, height);
+    NSSize size = fit_size(width, height);
+    NSRect frame = NSMakeRect(0, 0, size.width, size.height);
     window = [[NSWindow alloc] initWithContentRect:frame
                                          styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                                    NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
@@ -138,6 +148,7 @@ CAMetalLayer *bl_cocoa_open_window(uint32_t width, uint32_t height, const char *
     window.acceptsMouseMovedEvents = YES;
     window.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
     window.contentAspectRatio = NSMakeSize(width, height);
+    metal_layer.contentsScale = window.backingScaleFactor;
     [window center];
     [window makeKeyAndOrderFront:nil];
     [window makeFirstResponder:view];
@@ -153,7 +164,10 @@ void bl_cocoa_set_content_size(uint32_t width, uint32_t height)
     client_w = width, client_h = height;
     if (!window) return;
     window.contentAspectRatio = NSMakeSize(width, height);
-    if (!fullscreen()) [window setContentSize:NSMakeSize(width, height)];
+    if (!fullscreen()) {
+        [window setContentSize:fit_size(width, height)];
+        [window center];
+    }
 }
 
 // Cmd+Ctrl+F, Cmd+Return or the green button. A game started without -window asks

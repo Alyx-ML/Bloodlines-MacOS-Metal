@@ -411,7 +411,7 @@ static void ps1_coord(struct gen *g, uint32_t n, char *buf, size_t len)
 static const char *const header =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
-    "struct BLVSParams { int4 i[16]; uint b[16]; float2 inv_viewport; float2 pad; };\n"
+    "struct BLVSParams { int4 i[16]; uint b[16]; float2 inv_viewport; float clip_y; float pad; };\n"
     "struct BLPSParams { int4 i[16]; uint b[16]; float4 bumpenv[8]; float4 bumpenv_l[8]; float4 fog_color;\n"
     "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float2 pad; };\n"
     "struct BLVSOut {\n"
@@ -765,6 +765,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         line(o, "BLVSOut out;");
         // D3D9 samples pixel centers at integer window coordinates, Metal at +0.5.
         line(o, "out.pos = opos;");
+        line(o, "out.pos.y *= p.clip_y;");
         line(o, "out.pos.xy += float2(p.inv_viewport.x, -p.inv_viewport.y) * opos.w;");
         line(o, "out.psize = opts.x;");
         line(o, "out.d0 = saturate(od0); out.d1 = saturate(od1);");
@@ -969,6 +970,7 @@ char *d3d_ff_vs_msl(const struct d3d_ff_vs *k, char *err, int errlen)
         line(o, "float4 P = float4(in.v0.xyz, 1.0);");
         line(o, "float4 opos = float4(dot(P, c[0]), dot(P, c[1]), dot(P, c[2]), dot(P, c[3]));");
         line(o, "out.pos = opos;");
+        line(o, "out.pos.y *= p.clip_y;");
         line(o, "out.pos.xy += float2(p.inv_viewport.x, -p.inv_viewport.y) * opos.w;");
     }
     line(o, "out.psize = 1.0;");

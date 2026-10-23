@@ -22,8 +22,15 @@ enum {
     WM_ERASEBKGND = 0x14, WM_NCCREATE = 0x81, WM_NCDESTROY = 0x82,
 };
 
-#define SCREEN_W 1024
-#define SCREEN_H 768
+// The desktop: the Mac display's size in pixels.
+static uint32_t screen_dim(int which)
+{
+    uint32_t w, h;
+    bl_screen_size(&w, &h);
+    return which ? h : w;
+}
+#define SCREEN_W ((int32_t)screen_dim(0))
+#define SCREEN_H ((int32_t)screen_dim(1))
 #define DESKTOP_WINDOW 0x10010u
 #define CW_USEDEFAULT 0x80000000u
 #define WS_VISIBLE 0x10000000u
@@ -52,7 +59,7 @@ static struct window windows[MAX_WINDOWS];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t focus, active, capture, cursor;
-static int32_t cursor_x = SCREEN_W / 2, cursor_y = SCREEN_H / 2;
+static int32_t cursor_x = 512, cursor_y = 384;
 
 static struct window *get(uint32_t h)
 {

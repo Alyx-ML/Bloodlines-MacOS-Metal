@@ -47,6 +47,12 @@ int bl_sync_close(uint32_t h);
 // Windows path (relative to the current directory or absolute) to a host path.
 // Returns 0 when it does not fit.
 int bl_path_to_host(const char *win, char *host, size_t cap);
+// Where saves, settings and the registry are kept; "" when they stay in the game folder.
+const char *bl_data_dir(void);
+// The main display (bl_display.c): desktop size in pixels, and the video modes offered.
+void bl_screen_size(uint32_t *w, uint32_t *h);
+int bl_display_mode_count(void);
+int bl_display_mode(int i, uint32_t *w, uint32_t *h);  // 0 past the end
 // Absolute Windows form of a Windows path (GetFullPathNameA).
 void bl_path_full(const char *win, char *out, size_t cap);
 

@@ -51,33 +51,15 @@ uint32_t bl_shlw_PathRemoveFileSpecA_c(uint32_t path)
     return changed;
 }
 
-// advapi32: the registry stays empty.
-uint32_t bl_adv_RegOpenKeyA_c(uint32_t key, uint32_t sub, uint32_t out)
-{
-    (void)key, (void)sub;
-    if (out) U32(out) = 0;
-    return BL_ERROR_FILE_NOT_FOUND;
-}
-
-uint32_t bl_adv_RegQueryValueA_c(uint32_t key, uint32_t sub, uint32_t data, uint32_t size)
-{
-    (void)key, (void)sub, (void)data, (void)size;
-    return BL_ERROR_FILE_NOT_FOUND;
-}
-
-uint32_t bl_adv_RegEnumKeyExA_c(uint32_t key, uint32_t i, uint32_t name, uint32_t nlen, uint32_t r, uint32_t cls,
-                                uint32_t clen, uint32_t ft)
-{
-    (void)key, (void)i, (void)name, (void)nlen, (void)r, (void)cls, (void)clen, (void)ft;
-    return 259;  // ERROR_NO_MORE_ITEMS
-}
-
 // user32 queries
 uint32_t bl_u32_GetSystemMetrics_c(uint32_t i)
 {
     switch (i) {
-    case 0: return 1024;  // SM_CXSCREEN
-    case 1: return 768;   // SM_CYSCREEN
+    case 0: case 1: {  // SM_CXSCREEN, SM_CYSCREEN
+        uint32_t w, h;
+        bl_screen_size(&w, &h);
+        return i ? h : w;
+    }
     case 43: return 3;    // SM_CMOUSEBUTTONS
     default: return 0;
     }
@@ -105,13 +87,16 @@ uint32_t bl_u32_wsprintfA_c(uint32_t buf, uint32_t fmt)
     return (uint32_t)(n > 1023 ? 1023 : n);
 }
 
-// gdi32 device queries for a 1024x768, 32-bit, 96 dpi screen.
+// gdi32 device queries for the desktop: the display's size, 32-bit, 96 dpi.
 uint32_t bl_gdi_GetDeviceCaps_c(uint32_t dc, uint32_t i)
 {
     (void)dc;
     switch (i) {
-    case 8: return 1024;   // HORZRES
-    case 10: return 768;   // VERTRES
+    case 8: case 10: {     // HORZRES, VERTRES
+        uint32_t w, h;
+        bl_screen_size(&w, &h);
+        return i == 8 ? w : h;
+    }
     case 12: return 32;    // BITSPIXEL
     case 14: return 1;     // PLANES
     case 88: return 96;    // LOGPIXELSX

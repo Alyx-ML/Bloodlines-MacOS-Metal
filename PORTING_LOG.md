@@ -748,3 +748,44 @@ Verified headless:
   text).
 
 Not verified: the cost in the window, and the alpha-to-coverage edges up close.
+
+## 2026-10-23 — Mac resolutions, a persistent registry, widescreen correction
+
+- **Registry** (`runtime/bl_registry.c`). Reads used to find nothing and writes were
+  dropped, so a resolution picked in Options was lost on restart. Keys and values now
+  live in memory and are saved to `<data dir>/registry.txt` after every change.
+  `BL_REG_TRACE=1` logs each call. The game keeps its video mode in
+  `HKCU\Software\Troika\Vampire\ResPatch` (ScreenWidth, ScreenHeight, ScreenBPP,
+  ScreenWindowed: the Unofficial Patch's resolution patch), plus Python's
+  `...\Vampire\Settings\User Token n`.
+- **Display modes** (`runtime/bl_display.c`). Direct3D's mode list, the desktop
+  size (`GetAdapterDisplayMode`, `GetSystemMetrics`, `GetDeviceCaps`) and the
+  virtual screen now come from the main display.
+  - The list holds every pixel size and "looks like" size the display offers, plus
+    the common 4:3, 16:10 and 16:9 sizes that fit, from 640x480 up.
+  - On this Mac: desktop 3600x2250, 38 modes, logged at start-up as `[display]`.
+  - Windows for modes bigger than the screen are shrunk to fit; the drawable keeps
+    the game's resolution.
+- **Widescreen.** At 1680x1050 the 3D view came out stretched sideways: a window arch
+  was 1.18x wider relative to its height than at 800x600, which is 16:10 over 4:3.
+  The game's view-projection always has a y/x scale ratio of 4:3. The Unofficial
+  Patch adds the resolutions but not this correction.
+  - The vertex output's y is now scaled by viewport aspect over projection aspect.
+    The projection aspect is measured from the c8/c9 row lengths, or PROJECTION
+    _22/_11 for fixed-function draws, so a correct projection is left alone.
+  - Only perspective draws on a viewport wider than their projection are scaled; 2D
+    draws are left alone. This crops the top and bottom (vert-) rather than widening
+    the view, so the game's culling still matches what is drawn.
+  - `BL_WIDESCREEN=stretch` turns it off.
+
+Verified headless at 1680x1050 (seeded through registry.txt):
+- sp_theatre: the arch proportions match the 4:3 frame, and the HUD gauges sit at the
+  screen edges unstretched.
+- sm_hub_1 dialogue: the face has natural proportions and the dialogue box is right.
+- The main menu draws. Its 2D art is the game's own 4:3 layout spread across the
+  width, which this does not change.
+
+Not verified:
+- Picking a mode in Options in the window, and the mode surviving a restart.
+- Native Retina sizes such as 3024x1964.
+- Screen-space effects (water refraction, discipline overlays) at 16:10.

@@ -54,38 +54,6 @@ uint32_t bl_u32_SetDlgItemTextA_c(uint32_t dlg, uint32_t id, uint32_t text)
     return 1;
 }
 
-// Registry: reads find nothing (callers fall back to defaults), writes are dropped.
-uint32_t bl_adv_RegOpenKeyExA_c(uint32_t key, uint32_t sub, uint32_t opts, uint32_t sam, uint32_t out)
-{
-    (void)key, (void)sub, (void)opts, (void)sam;
-    if (out) U32(out) = 0;
-    return BL_ERROR_FILE_NOT_FOUND;
-}
-
-uint32_t bl_adv_RegCreateKeyExA_c(uint32_t key, uint32_t sub, uint32_t res, uint32_t cls, uint32_t opts,
-                                  uint32_t sam, uint32_t sec, uint32_t out, uint32_t disp)
-{
-    (void)key, (void)sub, (void)res, (void)cls, (void)opts, (void)sam, (void)sec, (void)disp;
-    if (out) U32(out) = 0;
-    return BL_ERROR_ACCESS_DENIED;
-}
-
-uint32_t bl_adv_RegQueryValueExA_c(uint32_t key, uint32_t name, uint32_t res, uint32_t type, uint32_t data,
-                                   uint32_t size)
-{
-    (void)key, (void)name, (void)res, (void)type, (void)data, (void)size;
-    return BL_ERROR_FILE_NOT_FOUND;
-}
-
-uint32_t bl_adv_RegSetValueExA_c(uint32_t key, uint32_t name, uint32_t res, uint32_t type, uint32_t data,
-                                 uint32_t size)
-{
-    (void)key, (void)name, (void)res, (void)type, (void)data, (void)size;
-    return BL_ERROR_INVALID_HANDLE;
-}
-
-uint32_t bl_adv_RegCloseKey_c(uint32_t key) { (void)key; return 0; }
-
 // ws2_32 by ordinal: 111 WSAGetLastError, 112 WSASetLastError.
 static uint32_t wsa_error;
 uint32_t bl_ws2_ws2_32_ord111_c(void) { return wsa_error; }

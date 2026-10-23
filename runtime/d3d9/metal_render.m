@@ -23,6 +23,7 @@
 //   BL_SHADOW_SHOW=1         draw shadow receivers opaque instead of darkening
 //   BL_FPS_MAX=n             with a window, present at most n frames a second (default 60, 0 = no cap)
 //   BL_FULLSCREEN=0|1        start in a window or full screen (default: what the game asks for)
+//   BL_WIDESCREEN=stretch    keep the game's 4:3 projection on wider modes (default: corrected)
 //   BL_MSAA=n                multisampling of the back buffer and its depth buffer (default 2, 1 = off)
 //   BL_ANISO=n               anisotropic filtering for filtered mipmapped textures (default 16, 1 = off)
 #import <CoreGraphics/CoreGraphics.h>
@@ -63,6 +64,7 @@ static const char *env_draw_dump, *env_dump_dir;
 static int env_tex_stats, env_shadow_show;
 static double fps_max;  // frame cap with a window (BL_FPS_MAX, default 60; 0 = none)
 static int env_aniso;   // forced anisotropy (BL_ANISO, default 16)
+static int env_widescreen;  // correct the 4:3 projection on wider modes (BL_WIDESCREEN, default on)
 static int msaa;        // samples for the back buffer and its depth (BL_MSAA, default 2; 1 = off)
 
 #define LOG_ONCE(...) do { static int once_; if (!once_++) fprintf(stderr, __VA_ARGS__); } while (0)
@@ -806,6 +808,7 @@ static void ensure_device(void)
     env_aniso = getenv("BL_ANISO") ? atoi(getenv("BL_ANISO")) : 16;
     env_aniso = env_aniso < 1 ? 1 : env_aniso > 16 ? 16 : env_aniso;
     msaa = getenv("BL_MSAA") ? atoi(getenv("BL_MSAA")) : 2;
+    env_widescreen = !(getenv("BL_WIDESCREEN") && !strcmp(getenv("BL_WIDESCREEN"), "stretch"));
     if (msaa < 1 || ![mtl supportsTextureSampleCount:(NSUInteger)msaa]) msaa = 1;
 }
 
@@ -1376,6 +1379,30 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         if (vs->info.defbs[i].reg < 16) vp.b[vs->info.defbs[i].reg] = vs->info.defbs[i].value;
     vp.inv_viewport[0] = s->viewport[2] ? 1.0f / s->viewport[2] : 0;
     vp.inv_viewport[1] = s->viewport[3] ? 1.0f / s->viewport[3] : 0;
+    // The game projects 3D views for a 4:3 screen whatever the resolution, so wider
+    // modes come out stretched sideways. Perspective draws whose projection aspect is
+    // narrower than the viewport are scaled up vertically to undo it (the view keeps
+    // its width and loses some height), so the game's culling, made for that width,
+    // still matches. The projection aspect is the ratio of the y and x scales: rows
+    // c9 and c8 of the view-projection (Source's cViewProj), or PROJECTION _22/_11 for
+    // fixed-function draws. 2D draws (last row 0 0 0 1) are left alone.
+    // BL_WIDESCREEN=stretch keeps the game's own picture.
+    vp.clip_y = 1;
+    float aspect = s->viewport[3] ? (float)s->viewport[2] / (float)s->viewport[3] : 0;
+    if (env_widescreen && aspect > 4.0f / 3.0f + 0.01f && !(vs->ff_vertex && vs->ffv.positiont)) {
+        const float *w_row = vs->ff_vertex ? vc[3] : vc[11];
+        float proj = 0;
+        if (vs->ff_vertex) {
+            const float *p = (const float *)s->transform[3];
+            if (p[0] != 0) proj = p[5] / p[0];
+        } else {
+            float lx = sqrtf(vc[8][0] * vc[8][0] + vc[8][1] * vc[8][1] + vc[8][2] * vc[8][2]);
+            float ly = sqrtf(vc[9][0] * vc[9][0] + vc[9][1] * vc[9][1] + vc[9][2] * vc[9][2]);
+            if (lx != 0) proj = ly / lx;
+        }
+        int perspective = w_row[0] != 0 || w_row[1] != 0 || w_row[2] != 0 || w_row[3] != 1;
+        if (perspective && proj > 0 && aspect > proj * 1.01f) vp.clip_y = aspect / proj;
+    }
     [e setVertexBytes:&vp length:sizeof vp atIndex:21];
 
     float pc[224][4];

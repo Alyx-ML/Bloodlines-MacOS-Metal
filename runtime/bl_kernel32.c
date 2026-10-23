@@ -123,6 +123,8 @@ void bl_path_full(const char *win, char *out, size_t cap)
 // Existing saves and config.cfg are copied there on the first start.
 static char data_dir[1024];
 
+const char *bl_data_dir(void) { return data_dir; }
+
 static void make_data_dirs(const char *mod)
 {
     static char last[256];
