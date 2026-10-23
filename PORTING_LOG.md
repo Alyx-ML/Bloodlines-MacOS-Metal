@@ -849,3 +849,36 @@ Verified headless:
 
 Not verified:
 - Opening the console in the window and scrolling it.
+
+## 2026-10-23 — sRGB colour and deep colour
+
+The game has no HDR rendering: the 2003 Source branch draws 8-bit standard-range
+colour (HDR came with Source 2005). Two smaller display fixes instead:
+
+- **sRGB tag.** The CAMetalLayer had no colour space. The compositor then shows the
+  values unconverted, so the game's sRGB colours looked too saturated on a P3 screen
+  such as the MacBook Pro's XDR display. The layer is now tagged sRGB and macOS
+  colour-matches it.
+- **Deep colour** (`BL_DEEP_COLOR`, default on). The back buffer is `RGBA16Unorm`
+  instead of `BGRA8Unorm`, and the window's drawable is `BGR10A2Unorm`. The game's
+  blended passes (lightmaps, fog, decals) now keep 16 bits between passes, which
+  reduces banding in dark gradients. A unorm format still clamps to 0..1 like the
+  8-bit format, so blending results do not change otherwise. A float format would not
+  clamp.
+  - Places that assumed 8 bits now convert with a draw instead of a blit: the present,
+    StretchRect from the back buffer to an 8-bit surface, GetRenderTargetData, and
+    the frame dumps (`as_bgra8`, `copy_to_drawable`).
+  - Only the device's own colour surface changes. The game's render-target textures
+    stay 8-bit.
+
+Verified:
+- Headless `-dev +map sp_theatre` at 1920x1080: frame 1150 matches the 8-bit run
+  within 6/255 per channel, which is rounding. No StretchRect warnings.
+- In the window: the intro movies (GDI path) and 900 frames of the main menu present
+  through the 10-bit drawable, with no Metal errors.
+
+Not verified:
+- That the colours look right on screen: this needs the user's eye.
+- Whether banding is visibly less in-game.
+- The cost at high resolutions: the back buffer is twice the size, and twice again
+  with 2x MSAA.

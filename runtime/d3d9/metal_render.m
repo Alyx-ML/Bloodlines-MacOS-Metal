@@ -22,6 +22,7 @@
 //   BL_TEX_STATS=1           with BL_DRAW_STATS, log the mean brightness of each 32-bit texture drawn
 //   BL_SHADOW_SHOW=1         draw shadow receivers opaque instead of darkening
 //   BL_FPS_MAX=n             with a window, present at most n frames a second (default 60, 0 = no cap)
+//   BL_DEEP_COLOR=0          8-bit back buffer and window (default: 16-bit back buffer, 10-bit window)
 //   BL_PACING=0              plain presents, even on screens whose refresh is a multiple of the cap
 //   BL_PACING_STATS=1        log how many refreshes apart frames reach the screen
 //   BL_FULLSCREEN=0|1        start in a window or full screen (default: what the game asks for)
@@ -71,6 +72,7 @@ static int env_pacing, env_pacing_stats;  // BL_PACING (default on), BL_PACING_S
 static int env_aniso;   // forced anisotropy (BL_ANISO, default 16)
 static int env_widescreen;  // correct the 4:3 projection on wider modes (BL_WIDESCREEN, default on)
 static int msaa;        // samples for the back buffer and its depth (BL_MSAA, default 2; 1 = off)
+static int deep_color;  // 16-bit back buffer, 10-bit window (BL_DEEP_COLOR, default on)
 
 #define LOG_ONCE(...) do { static int once_; if (!once_++) fprintf(stderr, __VA_ARGS__); } while (0)
 
@@ -282,7 +284,14 @@ static id<MTLTexture> target_texture(struct obj *o)
         t = [parent newTextureViewWithPixelFormat:parent.pixelFormat textureType:MTLTextureType2D
                                            levels:NSMakeRange(level, 1) slices:NSMakeRange(slice, 1)];
     } else {
-        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:target_format(o->format)
+        // The device's own colour surfaces (the back buffer) keep 16 bits per channel
+        // with deep colour, so the game's many blended passes (lightmaps, fog, decals)
+        // do not band. The values still clamp to 0..1 like the 8-bit format they stand
+        // for; reads and copies to 8-bit surfaces convert (as_bgra8, d3d_render_stretch).
+        MTLPixelFormat pf = target_format(o->format);
+        if (deep_color && pf == MTLPixelFormatBGRA8Unorm && owner && owner->type == OBJ_DEVICE)
+            pf = MTLPixelFormatRGBA16Unorm;
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
                                                                                      width:o->width
                                                                                     height:o->height
                                                                                  mipmapped:NO];
@@ -815,6 +824,7 @@ static void ensure_device(void)
     env_aniso = getenv("BL_ANISO") ? atoi(getenv("BL_ANISO")) : 16;
     env_aniso = env_aniso < 1 ? 1 : env_aniso > 16 ? 16 : env_aniso;
     msaa = getenv("BL_MSAA") ? atoi(getenv("BL_MSAA")) : 2;
+    deep_color = !(getenv("BL_DEEP_COLOR") && !strcmp(getenv("BL_DEEP_COLOR"), "0"));
     env_widescreen = !(getenv("BL_WIDESCREEN") && !strcmp(getenv("BL_WIDESCREEN"), "stretch"));
     if (msaa < 1 || ![mtl supportsTextureSampleCount:(NSUInteger)msaa]) msaa = 1;
 }
@@ -954,7 +964,12 @@ void d3d_render_init(uint32_t window)
         layer = bl_cocoa_open_window(w, h, "Vampire: The Masquerade – Bloodlines", window);
         if (layer) {
             layer.device = mtl;
-            layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            // The game's colours are sRGB. Without a colour space the compositor shows
+            // them unconverted, too saturated on a wide-gamut (P3) screen.
+            layer.pixelFormat = deep_color ? MTLPixelFormatBGR10A2Unorm : MTLPixelFormatBGRA8Unorm;
+            CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            layer.colorspace = srgb;
+            CGColorSpaceRelease(srgb);
             layer.framebufferOnly = NO;
             layer.drawableSize = CGSizeMake(w, h);
             bl_cocoa_set_fullscreen(full_screen());
@@ -1687,9 +1702,26 @@ void d3d_render_draw_up(struct d3d_state *s, uint32_t type, uint32_t min_index, 
 
 // --- copies, read back and frame dumps -------------------------------------------------
 
-// Copies a BGRA8 target into a shared buffer and waits; returns its contents.
+// A BGRA8 copy of a colour target in another format (the deep-colour back buffer).
+static id<MTLTexture> as_bgra8(id<MTLTexture> t)
+{
+    if (t.pixelFormat == MTLPixelFormatBGRA8Unorm) return t;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                 width:t.width height:t.height
+                                                                             mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> copy = [mtl newTextureWithDescriptor:td];
+    uint32_t r[4] = {0, 0, (uint32_t)t.width, (uint32_t)t.height};
+    stretch_draw(t, r, copy, r, 0);
+    return copy;
+}
+
+// Copies a colour target into a shared BGRA8 buffer and waits; returns its contents.
 static id<MTLBuffer> read_target(id<MTLTexture> t)
 {
+    end_pass();
+    t = as_bgra8(t);
     NSUInteger row = t.width * 4;
     id<MTLBuffer> b = [mtl newBufferWithLength:row * t.height options:MTLResourceStorageModeShared];
     id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
@@ -1811,6 +1843,20 @@ static void count_presented(id<CAMetalDrawable> drawable)
     }];
 }
 
+// The drawable is 10-bit with deep colour: a blit needs equal formats, a draw converts.
+static void copy_to_drawable(id<MTLTexture> t, id<CAMetalDrawable> drawable)
+{
+    end_pass();
+    if (t.pixelFormat == drawable.texture.pixelFormat) {
+        id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
+        [blit copyFromTexture:t toTexture:drawable.texture];
+        [blit endEncoding];
+    } else {
+        uint32_t r[4] = {0, 0, (uint32_t)t.width, (uint32_t)t.height};
+        stretch_draw(t, r, drawable.texture, r, 0);
+    }
+}
+
 static void present(id<CAMetalDrawable> drawable)
 {
     if (env_pacing_stats) count_presented(drawable);
@@ -1842,9 +1888,7 @@ void d3d_render_present(struct d3d_state *s)
         @autoreleasepool {
             id<CAMetalDrawable> drawable = [layer nextDrawable];
             if (drawable && drawable.texture.width == back.width && drawable.texture.height == back.height) {
-                id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
-                [blit copyFromTexture:back toTexture:drawable.texture];
-                [blit endEncoding];
+                copy_to_drawable(back, drawable);
                 present(drawable);
             }
             next_frame();
@@ -1930,9 +1974,7 @@ void d3d_render_present_pixels(const void *pixels, uint32_t w, uint32_t h, int b
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [layer nextDrawable];
         if (drawable && drawable.texture.width == sw && drawable.texture.height == sh) {
-            id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
-            [blit copyFromTexture:screen toTexture:drawable.texture];
-            [blit endEncoding];
+            copy_to_drawable(screen, drawable);
             present(drawable);
         }
         next_frame();
@@ -1948,7 +1990,8 @@ void d3d_render_stretch(struct obj *src, uint32_t src_rect, struct obj *dst, uin
     id<MTLTexture> a = src->gpu || (src->usage & 1) || (src->owner && src->owner->type == OBJ_DEVICE)
                        ? target_texture(src) : nil;
     id<MTLTexture> b = target_texture(dst);
-    if (!a || a.pixelFormat != b.pixelFormat) {
+    int depth = is_depth_format(src->format) || is_depth_format(dst->format);
+    if (!a || (a.pixelFormat != b.pixelFormat && depth)) {
         LOG_ONCE("[metal] StretchRect between these surfaces is not supported yet\n");
         return;
     }
@@ -1958,6 +2001,10 @@ void d3d_render_stretch(struct obj *src, uint32_t src_rect, struct obj *dst, uin
     if (multisampled(dst)) dst->ms_stale = 1;  // written outside its multisampled copy
     if (sr[2] - sr[0] != dr[2] - dr[0] || sr[3] - sr[1] != dr[3] - dr[1]) {
         stretch_draw(a, sr, b, dr, filter != 1);  // D3DTEXF_POINT is 1; NONE and LINEAR filter
+        return;
+    }
+    if (a.pixelFormat != b.pixelFormat) {  // deep-colour back buffer to an 8-bit texture, say
+        stretch_draw(a, sr, b, dr, 0);
         return;
     }
     uint32_t w = sr[2] - sr[0] < dr[2] - dr[0] ? sr[2] - sr[0] : dr[2] - dr[0];
