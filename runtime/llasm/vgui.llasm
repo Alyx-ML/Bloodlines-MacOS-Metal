@@ -1,0 +1,10 @@
+;; Entry points for native replacements of GameUI's vgui routines (runtime/bl_vgui.c).
+include llasm.llinc
+include asm-calls.llinc
+
+funcv bl_vgui_GetCursorLine_c $
+
+proc bl_vgui_GetCursorLine public
+        call bl_vgui_GetCursorLine_c $
+        Call_Asm_Return 0
+endp

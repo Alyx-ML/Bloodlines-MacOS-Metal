@@ -22,6 +22,8 @@
 //   BL_TEX_STATS=1           with BL_DRAW_STATS, log the mean brightness of each 32-bit texture drawn
 //   BL_SHADOW_SHOW=1         draw shadow receivers opaque instead of darkening
 //   BL_FPS_MAX=n             with a window, present at most n frames a second (default 60, 0 = no cap)
+//   BL_PACING=0              plain presents, even on screens whose refresh is a multiple of the cap
+//   BL_PACING_STATS=1        log how many refreshes apart frames reach the screen
 //   BL_FULLSCREEN=0|1        start in a window or full screen (default: what the game asks for)
 //   BL_WIDESCREEN=stretch    keep the game's 4:3 projection on wider modes (default: corrected)
 //   BL_MSAA=n                multisampling of the back buffer and its depth buffer (default 2, 1 = off)
@@ -31,6 +33,8 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include <math.h>
+#include <os/lock.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,6 +67,7 @@ static long draw_stats_frame, draw_stats_count = 1;
 static const char *env_draw_dump, *env_dump_dir;
 static int env_tex_stats, env_shadow_show;
 static double fps_max;  // frame cap with a window (BL_FPS_MAX, default 60; 0 = none)
+static int env_pacing, env_pacing_stats;  // BL_PACING (default on), BL_PACING_STATS
 static int env_aniso;   // forced anisotropy (BL_ANISO, default 16)
 static int env_widescreen;  // correct the 4:3 projection on wider modes (BL_WIDESCREEN, default on)
 static int msaa;        // samples for the back buffer and its depth (BL_MSAA, default 2; 1 = off)
@@ -805,6 +810,8 @@ static void ensure_device(void)
     env_tex_stats = getenv("BL_TEX_STATS") != NULL;
     env_shadow_show = getenv("BL_SHADOW_SHOW") != NULL;
     fps_max = getenv("BL_FPS_MAX") ? atof(getenv("BL_FPS_MAX")) : 60;
+    env_pacing = !(getenv("BL_PACING") && !strcmp(getenv("BL_PACING"), "0"));
+    env_pacing_stats = getenv("BL_PACING_STATS") != NULL;
     env_aniso = getenv("BL_ANISO") ? atoi(getenv("BL_ANISO")) : 16;
     env_aniso = env_aniso < 1 ? 1 : env_aniso > 16 ? 16 : env_aniso;
     msaa = getenv("BL_MSAA") ? atoi(getenv("BL_MSAA")) : 2;
@@ -1755,6 +1762,64 @@ static void next_frame(void)
     chunk_index = chunk_used = 0;
 }
 
+// Frame pacing. The game is capped at fps_max (its physics and scripts expect 60), but
+// a plain present shows each frame at the next refresh after the GPU finishes, so on a
+// 120 Hz ProMotion screen the small jitter of the cap's sleep makes frames alternate
+// between one and three refreshes. When the refresh rate is a whole multiple of the cap,
+// each frame is instead held for at least 1/fps_max (two refreshes at 120 Hz), which
+// gives an even cadence. Other rates (144 Hz, say) keep the plain present: holding a
+// frame for whole refreshes there would slow the game below the cap.
+static int paced_present(void)
+{
+    static int checked_at = -1000, paced = -1;
+    if (env_pacing && fps_max > 0 && (long)frames - checked_at >= 120) {  // the window may change screens
+        checked_at = (int)frames;
+        int hz = bl_cocoa_refresh_rate();
+        double ratio = hz / fps_max;
+        int whole = (int)(ratio + 0.5);
+        int now = whole >= 1 && fabs(ratio - whole) < 0.01;
+        if (now != paced)
+            fprintf(stderr, "[present] screen %d Hz, cap %g: %s\n", hz, fps_max,
+                    now ? "holding each frame for whole refreshes" : "plain present");
+        paced = now;
+    }
+    return paced > 0;
+}
+
+// BL_PACING_STATS=1 logs how many refreshes apart frames actually reached the screen.
+static void count_presented(id<CAMetalDrawable> drawable)
+{
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static double last;
+    static unsigned hist[5], total;
+    double hz = bl_cocoa_refresh_rate();
+    [drawable addPresentedHandler:^(id<MTLDrawable> d) {
+      double t = d.presentedTime;
+      if (t <= 0 || hz <= 0) return;  // dropped
+      os_unfair_lock_lock(&lock);
+      if (last > 0) {
+          int n = (int)((t - last) * hz + 0.5);
+          hist[n < 1 ? 0 : n > 4 ? 4 : n]++;
+          if (++total == 600) {
+              fprintf(stderr, "[pacing] last 600 frames, refreshes apart: 1:%u 2:%u 3:%u 4+:%u (dropped/odd %u)\n",
+                      hist[1], hist[2], hist[3], hist[4], hist[0]);
+              memset(hist, 0, sizeof hist), total = 0;
+          }
+      }
+      last = t;
+      os_unfair_lock_unlock(&lock);
+    }];
+}
+
+static void present(id<CAMetalDrawable> drawable)
+{
+    if (env_pacing_stats) count_presented(drawable);
+    if (paced_present())
+        [command_buffer() presentDrawable:drawable afterMinimumDuration:1.0 / fps_max];
+    else
+        [command_buffer() presentDrawable:drawable];
+}
+
 void d3d_render_present(struct d3d_state *s)
 {
     ensure_device();
@@ -1780,7 +1845,7 @@ void d3d_render_present(struct d3d_state *s)
                 id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
                 [blit copyFromTexture:back toTexture:drawable.texture];
                 [blit endEncoding];
-                [command_buffer() presentDrawable:drawable];
+                present(drawable);
             }
             next_frame();
         }
@@ -1868,7 +1933,7 @@ void d3d_render_present_pixels(const void *pixels, uint32_t w, uint32_t h, int b
             id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
             [blit copyFromTexture:screen toTexture:drawable.texture];
             [blit endEncoding];
-            [command_buffer() presentDrawable:drawable];
+            present(drawable);
         }
         next_frame();
     }

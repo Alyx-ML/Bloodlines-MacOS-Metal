@@ -170,6 +170,14 @@ void bl_cocoa_set_content_size(uint32_t width, uint32_t height)
     }
 }
 
+// The highest refresh rate of the screen the window is on (120 on ProMotion), 0 without
+// a window.
+int bl_cocoa_refresh_rate(void)
+{
+    NSScreen *screen = window.screen ? window.screen : NSScreen.mainScreen;
+    return window && screen ? (int)screen.maximumFramesPerSecond : 0;
+}
+
 // Cmd+Ctrl+F, Cmd+Return or the green button. A game started without -window asks
 // for full screen when it creates its device.
 void bl_cocoa_set_fullscreen(int on)

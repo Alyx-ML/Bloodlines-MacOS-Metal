@@ -789,3 +789,63 @@ Not verified:
 - Picking a mode in Options in the window, and the mode surviving a restart.
 - Native Retina sizes such as 3024x1964.
 - Screen-space effects (water refraction, discipline overlays) at 16:10.
+
+## 2026-10-23 — Frame pacing on ProMotion, and a fast -dev console
+
+### Frame pacing
+The game is capped at 60 fps (`BL_FPS_MAX`), since its physics and scripts expect it.
+A plain `presentDrawable` shows each frame at the first refresh after the GPU
+finishes. On a 120 Hz ProMotion screen the small jitter of the cap's sleep made some
+frames last one refresh and others three.
+
+- When the screen's `maximumFramesPerSecond` is a whole multiple of the cap, the
+  present is now `presentDrawable:afterMinimumDuration:1/cap`. Each frame is held
+  for exactly two refreshes at 120 Hz. The game tick is unchanged: the cap's sleep
+  still sets the loop rate.
+- Other rates (144 Hz, say) keep the plain present. Holding whole refreshes there
+  would slow the game to 48 fps.
+- The screen is re-checked every 120 frames, in case the window moves to another
+  display. `BL_PACING=0` turns this off.
+- `BL_PACING_STATS=1` logs, every 600 frames, how many refreshes apart frames
+  reached the screen (from the drawables' `presentedTime`).
+
+Measured in the window on this Mac's built-in 120 Hz screen, at the main menu:
+
+| | 1 refresh | 2 refreshes | 3 refreshes |
+|---|---|---|---|
+| before (`BL_PACING=0`) | 24 to 28 | 544 to 552 | 24 to 28 |
+| after | 0 | 600 | 0 |
+
+That is out of each 600 frames, over 3 windows of 600.
+
+Not verified:
+- In-game scenes, where a slow frame can still take three refreshes.
+- 60 Hz and 144 Hz external screens.
+- Added input latency. The minimum duration can hold a finished frame back by up to
+  one refresh.
+
+### -dev console
+The slow path noted earlier (see "Launching with -game Unofficial_Patch") was profiled
+with `sample` during a `-dev +map sp_theatre` load. About 99% of the main thread's
+time was in GameUI 0x10029250, vgui `RichText::GetCursorLine`.
+- That routine scans the line-break table from the start for the first break after
+  the cursor.
+- InsertChar calls it per character. The scroll-to-end code (0x100284CF onward)
+  calls it again in a loop, once per line it scrolls.
+- The table is in ascending text order, so a binary search gives the same index.
+
+Fix:
+- `runtime/bl_vgui.c` replaces the routine through
+  `modules/GameUI/external_procedures.sci` and `ignored_areas.sci` (63 bytes).
+- GameUI needs a re-translation for this, which takes 13 s.
+- `BL_VGUI_CHECK=1` also runs the original linear scan and logs any difference.
+
+Verified headless:
+- `-game Unofficial_Patch -window -dev +map sp_theatre` reaches frame 300 in the map
+  in 54 s, with 56,000 console lines. Before the fix the same run was still on frame
+  1 after 150 s, when it was stopped.
+- With `BL_VGUI_CHECK=1`, about 13,700 console lines gave no difference between the
+  two searches. That run was stopped early, since it runs at the old speed.
+
+Not verified:
+- Opening the console in the window and scrolling it.

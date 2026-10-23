@@ -63,6 +63,8 @@ Options (environment variables):
 | `BL_MSAA=n` | multisampling, default 2, 1 = off |
 | `BL_ANISO=n` | anisotropic filtering, default 16, 1 = off |
 | `BL_FPS_MAX=n` | frame cap, default 60 (the game's physics expect it) |
+| `BL_PACING=0` | plain presents; by default each frame is held for whole refreshes when the screen rate is a multiple of the cap (120 Hz ProMotion) |
+| `BL_PACING_STATS=1` | log how many refreshes apart frames reach the screen |
 | `BL_RAW_MOUSE=0` | use macOS's accelerated pointer for mouse look |
 | `BL_PAD_LOOK=n` | controller look speed, default 1400 |
 | `BL_DATA_DIR=dir` | where saves and settings go (`off` = the game folder) |

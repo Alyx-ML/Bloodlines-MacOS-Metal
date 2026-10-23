@@ -18,6 +18,7 @@ void bl_cocoa_pump_if_idle(void);  // main thread, at most every 100 ms
 // Mouse-look: hide the cursor and report only relative motion while on.
 void bl_cocoa_capture_mouse(int on);
 void bl_cocoa_set_fullscreen(int on);
+int bl_cocoa_refresh_rate(void);  // the window's screen, in Hz (0 = no window)
 // Synthetic input from bl_gamecontroller.m: a key by Mac key code, a mouse button
 // (0 left, 1 right, 2 middle), a wheel step (120 = one notch up) and relative motion.
 void bl_cocoa_key(uint16_t mac, int down);
