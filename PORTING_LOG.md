@@ -882,3 +882,29 @@ Not verified:
 - Whether banding is visibly less in-game.
 - The cost at high resolutions: the back buffer is twice the size, and twice again
   with 2x MSAA.
+
+## 2026-10-23 — Black surround for centred intro movies
+
+The user saw white around some intro movies. `BL_GDI_TRACE=1` (new) logs each change of
+Bink's GDI blit geometry. At 1920x1080 the four intro movies are:
+
+| DIB | source | destination |
+|---|---|---|
+| 640x480 | whole | 0,0 1920x1080 (stretched) |
+| 720x480 | whole | 0,0 1920x1080 (stretched); white background |
+| 1920x1080 | 640,300 640x480 | 640,300 640x480 (centred) |
+| 1920x1080 | 560,340 800x400 | 560,340 800x400 (centred) |
+
+The centred movies blit only their own rectangle. The persistent window image still held
+the last frame of the white-background movie around them. Windows repaints the window
+black in between, but our FillRect and WM_ERASEBKGND do nothing.
+
+Fix: `d3d_render_present_pixels` clears the window image to black whenever the frame
+size or destination rectangle changes.
+
+Verified: in the window, all four movies play with no errors, and the trace shows the
+geometry above. Not verified by me on screen: that the surround is now black (the
+user's check).
+
+Not changed: the first two movies are 4:3 and 3:2 but are stretched to fill a 16:9
+window. The game asks for that stretch; Windows would do the same.

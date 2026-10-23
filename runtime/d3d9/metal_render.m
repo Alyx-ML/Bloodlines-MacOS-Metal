@@ -1937,12 +1937,21 @@ void d3d_render_present_pixels(const void *pixels, uint32_t w, uint32_t h, int b
     }
     NSUInteger sw = (NSUInteger)layer.drawableSize.width, sh = (NSUInteger)layer.drawableSize.height;
     if (!sw || !sh) return;
-    if (!screen || screen.width != sw || screen.height != sh) {
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                     width:sw height:sh mipmapped:NO];
-        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
-        td.storageMode = MTLStorageModePrivate;
-        screen = [mtl newTextureWithDescriptor:td];
+    // A new movie (another frame size or place) starts on black. On Windows the window
+    // is repainted between movies; here the last frame of the previous one would stay
+    // around a smaller movie (the white Troika logo around the next, centred one).
+    static int32_t last[6];
+    int32_t now[6] = {(int32_t)w, (int32_t)h, dr[0], dr[1], dr[2], dr[3]};
+    int fresh = memcmp(now, last, sizeof now) != 0;
+    memcpy(last, now, sizeof now);
+    if (!screen || screen.width != sw || screen.height != sh || fresh) {
+        if (!screen || screen.width != sw || screen.height != sh) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                         width:sw height:sh mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+            td.storageMode = MTLStorageModePrivate;
+            screen = [mtl newTextureWithDescriptor:td];
+        }
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = screen;
         rp.colorAttachments[0].loadAction = MTLLoadActionClear;

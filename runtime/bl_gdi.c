@@ -247,6 +247,16 @@ static uint32_t blit(const char *name, uint32_t dst, int x, int y, int w, int h,
     pthread_mutex_unlock(&lock);
     if (!d && (dst & 0xffff0000) == 0x40000 && bm.bits && bm.bpp == 32) {  // a window DC (user32 GetDC)
         int32_t sr[4] = {sx, sy, sx + sw, sy + sh}, dr[4] = {x, y, x + w, y + h};
+        static int trace = -1;
+        static int32_t last[6];
+        if (trace < 0) trace = getenv("BL_GDI_TRACE") != NULL;
+        int32_t now[6] = {x, y, w, h, sw, sh};
+        if (trace && memcmp(now, last, sizeof now)) {
+            const uint32_t *px = bl_g2h(bm.bits);
+            fprintf(stderr, "[gdi] %s %dx%d DIB, src %d,%d %dx%d -> dst %d,%d %dx%d, corner %08x centre %08x\n", name,
+                    bm.width, bm.height, sx, sy, sw, sh, x, y, w, h, px[0], px[bm.height / 2 * bm.width + bm.width / 2]);
+            memcpy(last, now, sizeof now);
+        }
         d3d_render_present_pixels(bl_g2h(bm.bits), (uint32_t)bm.width, (uint32_t)bm.height, !bm.top_down, sr, dr);
         return 1;
     }
