@@ -1122,3 +1122,52 @@ Not verified:
 - Play in the window, and whether old 11.1 saves load.
 - Any of the 12.0 fixes themselves in play.
 - The menu and character creation under 12.0.
+
+### 12.0 content on 11.1 code (2026-10-24)
+In the window under the 12.0 DLLs, two things were wrong:
+- The resolution list had only the stock 4:3 modes.
+- The main menu flickered.
+
+Comparing the 12.0 DLLs with 11.1 shows that 12.0 took most of its code fixes out of
+them, and the 12.0 loader applies them in memory instead (`Bin/loader/loader.ini`,
+"Internal Hooks"). For example:
+- **engine:** the allowed-mode table at 0x200fc8b0 points at the stock five 4:3 entries
+  (0x201ad44c, count 5); 11.1 had a 34-entry table at 0x20195dd0. The 11.1 code cave at
+  0x20172fb0 (66 bytes) is gone, and several byte fixes are back to stock.
+- **GameUI:** the 11.1 code caves at 0x1004e640 (Cyrillic text conversion) are gone.
+- **shaderapidx9:** the texture memory measurement is back (see above).
+
+The loader also does widescreen aspect, FOV and HUD correction, and fixes coronas, lights
+through walls, model LODs, claw stats and refresh rate. The port does not run
+`Loader.exe`, so on the 12.0 DLLs those fixes are missing.
+
+Decision (the user's choice): use the 12.0 content (`Unofficial_Patch/`, `Vampire/maps`,
+`Vampire/python`, pack files) with the 11.1 DLLs.
+- The 11.1 DLLs are back in `Bin/` and `Vampire/`. The 12.0 DLLs are kept in
+  `UP12.0_dlls/`.
+- `modules/hashes.txt` lists 11.1 first, so `rebuild_all.sh` prefers it, and still
+  accepts 12.0.
+- `bl_shaderapi_TextureMemory` now always returns 0x7F000000, as 11.1 does.
+
+Between 11.1 and 12.0, vampire.dll differs by 1 byte of code and client.dll by 28, so
+the 12.0 scripts should match the 11.1 game DLL. This is not tested in play.
+
+Rebuilt from the 11.1 DLLs (the same seven modules, 14 minutes; the translated engine
+uses the 34-entry mode table at 0x20195dd0 again).
+
+Verified:
+- Two headless `+map sm_hub_1` runs of 600 frames exit 0 with no traps.
+
+Not verified:
+- The resolution list and the menu flicker in the window (needs the user).
+
+Also seen: one more headless run hung before its first frame. Every thread was waiting,
+and the main thread was in a WaitForSingleObject called from guest code. The same run
+passed twice afterwards. This looks like the intermittent hang noted earlier, so it is
+not new with 12.0, and it is still not understood.
+
+In the user's window run on the 12.0 DLLs (before this rebuild), the game printed
+"Not a RIFF File" after `_stat` of `unofficial_patch\sound\` for many sounds once a map
+was loaded. All 1962 .wav files in the 12.0 `sound/` folder start with RIFF, so it looks
+like a request for an empty sound name. It did not appear in the two headless runs on
+the 11.1 DLLs. It still needs checking in the window.

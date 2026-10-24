@@ -24,4 +24,5 @@ Write hand-made fixes here; the pipeline generates the rest.
 - `0x2A026250` the texture memory estimate (481 bytes), replaced by
   `bl_shaderapi_TextureMemory` (`runtime/bl_shaderapi.c`, `runtime/llasm/shaderapi.llasm`).
   Unofficial Patch 12.0 restored the measurement that creates 256x256 textures until
-  one fails; here that uses up the guest heap, so it returns 11.1's fixed answer.
+  one fails; here that uses up the guest heap, so it returns 11.1's fixed answer
+  for both versions.
