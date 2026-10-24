@@ -33,8 +33,13 @@
 //   BL_WIDESCREEN=stretch    keep the game's 4:3 projection on wider modes (default: corrected)
 //   BL_MSAA=n                multisampling of the back buffer and its depth buffer (default 2, 1 = off)
 //   BL_ANISO=n               anisotropic filtering for filtered mipmapped textures (default 16, 1 = off)
-//   BL_AO=0|1|show           ambient occlusion (see ao_run), over the options' check box;
+//   BL_AO=0|1|show           ambient occlusion (see post_run), over the options' check box;
 //                            BL_AO_RADIUS, BL_AO_STRENGTH tune it
+//   BL_SSR=0|1|show|hits     screen-space reflections (see post_run), over the options' check box;
+//                            "hits": red the reflection weight, green where rays met the picture,
+//                            blue what the cubemaps added; BL_SSR_STRENGTH (default 1) scales them
+//   BL_SHARPEN=0|1           sharpening of the world view (see post_apply), over the options'
+//                            check box; BL_SHARPEN_STRENGTH (0..1, default 0.5)
 //   BL_GPU_STATS=1           log the mean GPU time per frame every 100 frames
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
@@ -59,6 +64,8 @@ static id<MTLCommandBuffer> cmd;
 static id<MTLRenderCommandEncoder> enc;
 static struct obj *enc_color, *enc_depth;  // targets of the open pass
 static int enc_samples = 1;                // and its sample count
+static int enc_info;                       // and whether it draws reflection info (info_texture)
+#define INFO_FORMAT MTLPixelFormatRGBA16Float
 static CAMetalLayer *layer;
 
 // Clears waiting for the next pass on these targets.
@@ -86,42 +93,56 @@ static float frame_squeeze = 1;       // menu draws this frame were narrowed to 
 static int msaa;        // samples for the back buffer and its depth (BL_MSAA, default 2; 1 = off)
 static int deep_color;  // 16-bit back buffer, 10-bit window (BL_DEEP_COLOR, default on)
 
-// Ambient occlusion (ao_run). ao_state: 0 no world view yet this frame, 1 world drawn
-// (ao_proj holds its projection), 2 done for this frame.
-static int env_ao, env_ao_show;
-static float env_ao_radius, env_ao_strength;
-static int ao_state;
-static struct { float alpha, beta, p00, p11; } ao_proj;
+// Effects at the end of the world view, before the view model and HUD (post_run):
+// ambient occlusion, screen-space reflections and sharpening.
+// view_state: 0 no world view yet this frame, 1 world drawn (view_proj holds its
+// projection), 2 done for this frame.
+static int env_ao, env_ao_show, env_ssr, env_ssr_show, env_sharpen;
+static float env_ao_radius, env_ao_strength, env_ssr_strength, env_sharpen_strength;
+static int view_state;
+static struct { float alpha, beta, p00, p11; } view_proj;
 static id<MTLTexture> ao_result;  // waiting to be multiplied in at the next pass on the back buffer
+static int post_result;           // reflections or sharpening waiting for that pass too
 static void ao_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth);
+static void post_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth);
 
-// The Visual options tab's check box (bl_vgui.c, read once a frame by bl_vgui_poll)
-// sets env_ao and saves it in the registry; BL_AO, when set, wins over both.
-#define AO_KEY "HKCU\\Software\\Troika\\Vampire\\Native"
-static int ao_loaded, ao_forced;
+// The Visual options tab's check boxes (bl_vgui.c, read once a frame by bl_vgui_poll)
+// set the effects and save them in the registry; the environment, when set, wins over both.
+#define EFFECT_KEY "HKCU\\Software\\Troika\\Vampire\\Native"
+enum { BL_EFFECT_AO, BL_EFFECT_SSR, BL_EFFECT_SHARPEN, BL_EFFECTS };
+static const struct { const char *env, *value; int *on, *show; } effects[BL_EFFECTS] = {
+    {"BL_AO", "AmbientOcclusion", &env_ao, &env_ao_show},
+    {"BL_SSR", "Reflections", &env_ssr, &env_ssr_show},
+    {"BL_SHARPEN", "Sharpening", &env_sharpen, NULL},
+};
+static int effects_loaded, effect_forced[BL_EFFECTS];
 void bl_vgui_poll(void);
 
-static void ao_settings(void)
+static void effect_settings(void)
 {
-    if (ao_loaded) return;
-    ao_loaded = 1;
-    const char *e = getenv("BL_AO");
-    ao_forced = e != NULL;
-    env_ao_show = e && !strcmp(e, "show");
-    env_ao = e ? atoi(e) != 0 || env_ao_show : bl_reg_get_dword(AO_KEY, "AmbientOcclusion", 0) != 0;
+    if (effects_loaded) return;
+    effects_loaded = 1;
+    for (int i = 0; i < BL_EFFECTS; i++) {
+        const char *e = getenv(effects[i].env);
+        int show = !e ? 0 : !strcmp(e, "show") ? 1 : !strcmp(e, "hits") ? 2 : 0;
+        effect_forced[i] = e != NULL;
+        if (effects[i].show) *effects[i].show = show;
+        *effects[i].on = e ? atoi(e) != 0 || show : bl_reg_get_dword(EFFECT_KEY, effects[i].value, 0) != 0;
+    }
 }
 
-int bl_ao_enabled(void)
+int bl_effect_enabled(int effect)
 {
-    ao_settings();
-    return env_ao;
+    effect_settings();
+    return effect >= 0 && effect < BL_EFFECTS && *effects[effect].on;
 }
 
-void bl_ao_set(int on)
+void bl_effect_set(int effect, int on)
 {
-    ao_settings();
-    bl_reg_set_dword(AO_KEY, "AmbientOcclusion", on != 0);
-    if (!ao_forced) env_ao = on != 0;
+    effect_settings();
+    if (effect < 0 || effect >= BL_EFFECTS) return;
+    bl_reg_set_dword(EFFECT_KEY, effects[effect].value, on != 0);
+    if (!effect_forced[effect]) *effects[effect].on = on != 0;
 }
 
 #define LOG_ONCE(...) do { static int once_; if (!once_++) fprintf(stderr, __VA_ARGS__); } while (0)
@@ -389,7 +410,7 @@ static id<MTLTexture> ms_texture(struct obj *o)
                                                                              mipmapped:NO];
     d.textureType = MTLTextureType2DMultisample;
     d.sampleCount = (NSUInteger)msaa;
-    d.usage = MTLTextureUsageRenderTarget | (is_depth_format(o->format) ? MTLTextureUsageShaderRead : 0);  // ao_run reads depth
+    d.usage = MTLTextureUsageRenderTarget | (is_depth_format(o->format) ? MTLTextureUsageShaderRead : 0);  // post_run reads depth
     d.storageMode = MTLStorageModePrivate;
     id<MTLTexture> t = [mtl newTextureWithDescriptor:d];
     t.label = [NSString stringWithFormat:@"surface %ux%u fmt %u x%d", o->width, o->height, o->format, msaa];
@@ -605,6 +626,9 @@ void d3d_render_shader_created(struct obj *o)
         for (uint32_t i = 0; i < D3D_SHADER_MAX_SAMPLERS; i++)
             if (sh->info.sampler_mask & (1u << i))
                 v.tex_kind[i] = (uint8_t)(sh->info.sampler_type[i] ? sh->info.sampler_type[i] : D3D_TEX_2D);
+    // With reflections on, the world's shaders draw with reflection info (setup_draw).
+    effect_settings();
+    if (sh->info.pixel && env_ssr && !(sh->info.color_outputs & 2)) v.reflection_info = 1;
     static dispatch_queue_t queue;
     if (!queue) queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     // The game may release the shader before the compile ends: compile from a copy.
@@ -621,7 +645,7 @@ void d3d_render_shader_created(struct obj *o)
 
 // Internal shaders: partial clears.
 static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelFormat depth, uint32_t mask,
-                                                 int samples);
+                                                 int samples, int info);
 static id<MTLRenderPipelineState> stretch_pipeline(MTLPixelFormat color, int samples);
 
 // --- vertex input --------------------------------------------------------------------
@@ -704,6 +728,7 @@ struct pipe_key {
     uint8_t constant[17];
     uint8_t point;
     uint8_t samples, alpha_to_coverage;
+    uint8_t info;  // reflection info attachment: 0 none, 1 kept, 2 written
 };
 
 static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *pipelines;
@@ -806,6 +831,10 @@ static id<MTLRenderPipelineState> pipeline(struct pipe_key *k, id<MTLFunction> v
         if (k->write_mask & 4) m |= MTLColorWriteMaskBlue;
         if (k->write_mask & 8) m |= MTLColorWriteMaskAlpha;
         c.writeMask = m;
+    }
+    if (k->info) {
+        d.colorAttachments[1].pixelFormat = INFO_FORMAT;
+        d.colorAttachments[1].writeMask = k->info == 2 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
     }
     d.depthAttachmentPixelFormat = (MTLPixelFormat)k->depth_format;
     d.stencilAttachmentPixelFormat = (MTLPixelFormat)k->depth_format;
@@ -975,9 +1004,11 @@ static void ensure_device(void)
     deep_color = !(getenv("BL_DEEP_COLOR") && !strcmp(getenv("BL_DEEP_COLOR"), "0"));
     env_widescreen = !(getenv("BL_WIDESCREEN") && !strcmp(getenv("BL_WIDESCREEN"), "stretch"));
     if (msaa < 1 || ![mtl supportsTextureSampleCount:(NSUInteger)msaa]) msaa = 1;
-    ao_settings();
+    effect_settings();
     env_ao_radius = getenv("BL_AO_RADIUS") ? (float)atof(getenv("BL_AO_RADIUS")) : 32;
     env_ao_strength = getenv("BL_AO_STRENGTH") ? (float)atof(getenv("BL_AO_STRENGTH")) : 0.6f;
+    env_ssr_strength = getenv("BL_SSR_STRENGTH") ? (float)atof(getenv("BL_SSR_STRENGTH")) : 1;
+    env_sharpen_strength = getenv("BL_SHARPEN_STRENGTH") ? (float)atof(getenv("BL_SHARPEN_STRENGTH")) : 0.5f;
 }
 
 static id<MTLCommandBuffer> command_buffer(void)
@@ -998,6 +1029,27 @@ static void end_pass(void)
 // pending clears for them.
 static void write_png(id<MTLBuffer> b, NSUInteger w, NSUInteger h, const char *path);
 static struct obj *last_offscreen_target;  // for BL_DUMP_FRAME: the last non-back-buffer color target
+
+// Reflection info drawn by the world view's shaders (d3d_shader_variant reflection_info),
+// the back buffer's size: the resolved texture, or with samples > 1 the multisampled one.
+static unsigned long info_frame = ~0ul;  // the frame it was last drawn in
+static id<MTLTexture> info_texture(id<MTLTexture> color, int samples)
+{
+    static id<MTLTexture> t[2];
+    int ms = samples > 1;
+    if (!t[ms] || t[ms].width != color.width || t[ms].height != color.height || (int)t[ms].sampleCount != samples) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:INFO_FORMAT
+                                                                                     width:color.width
+                                                                                    height:color.height
+                                                                                 mipmapped:NO];
+        if (ms) td.textureType = MTLTextureType2DMultisample, td.sampleCount = (NSUInteger)samples;
+        td.usage = MTLTextureUsageRenderTarget | (ms ? 0 : MTLTextureUsageShaderRead);
+        td.storageMode = MTLStorageModePrivate;
+        t[ms] = [mtl newTextureWithDescriptor:td];
+        t[ms].label = @"reflection info";
+    }
+    return t[ms];
+}
 
 // Copies a surface's texture into its multisampled copy, after something other than a
 // multisampled pass wrote it (StretchRect, a pass that could not be multisampled).
@@ -1069,8 +1121,28 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
             clear_depth_target = NULL;
         }
     }
+    // The world view's passes on the back buffer also draw reflection info (post_run),
+    // cleared with the frame's first one or with the colour.
+    int info = env_ssr && color && color == s->back_buffer && !menu_frame && view_state != 2;
+    if (info) {
+        id<MTLTexture> ct = target_texture(color);
+        MTLRenderPassColorAttachmentDescriptor *a = d.colorAttachments[1];
+        if (samples > 1) {
+            a.texture = info_texture(ct, samples);
+            a.resolveTexture = info_texture(ct, 1);
+            a.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+        } else {
+            a.texture = info_texture(ct, 1);
+            a.storeAction = MTLStoreActionStore;
+        }
+        int fresh = info_frame != frames || d.colorAttachments[0].loadAction == MTLLoadActionClear;
+        a.loadAction = fresh ? MTLLoadActionClear : MTLLoadActionLoad;
+        a.clearColor = MTLClearColorMake(0, 0, 0, 0);
+        info_frame = frames;
+    }
     enc = [command_buffer() renderCommandEncoderWithDescriptor:d];
-    enc_color = color, enc_depth = depth, enc_samples = samples;
+    enc_color = color, enc_depth = depth, enc_samples = samples, enc_info = info;
+    if (post_result && color && color == s->back_buffer) post_apply(enc, target_texture(color), samples, depth != NULL);
     if (ao_result && color && color == s->back_buffer) ao_apply(enc, target_texture(color), samples, depth != NULL);
     return enc;
 }
@@ -1191,7 +1263,7 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
     if (!rt) return;
     // A depth clear after a view (a sky box drawn first) starts over: the occlusion is
     // for the view drawn after it.
-    if ((flags & 2) && ds && ao_state == 1) ao_state = 0;
+    if ((flags & 2) && ds && view_state == 1) view_state = 0;
     const uint32_t *vp = s->viewport;
     int full = count == 0 && vp[0] == 0 && vp[1] == 0 && vp[2] >= rt->width && vp[3] >= rt->height &&
                (!s->rs[174] || (s->scissor[0] == 0 && s->scissor[1] == 0 && s->scissor[2] >= rt->width &&
@@ -1215,7 +1287,7 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
     MTLPixelFormat dfmt = ds ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
     uint32_t mask = (flags & 1 ? 1u : 0u) | (flags & 2 && ds ? 2u : 0u) | (flags & 4 && ds ? 4u : 0u);
     if (!mask) return;
-    [e setRenderPipelineState:clear_pipeline(t.pixelFormat, dfmt, mask, enc_samples)];
+    [e setRenderPipelineState:clear_pipeline(t.pixelFormat, dfmt, mask, enc_samples, enc_info)];
     static NSMutableDictionary *clear_depth_states;
     if (!clear_depth_states) clear_depth_states = [NSMutableDictionary new];
     NSNumber *dk = @(mask);
@@ -1270,7 +1342,7 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
 }
 
 static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelFormat depth, uint32_t mask,
-                                                 int samples)
+                                                 int samples, int info)
 {
     static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *cache;
     static id<MTLLibrary> lib;
@@ -1289,8 +1361,8 @@ static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelF
         lib = [mtl newLibraryWithSource:src options:nil error:&error];
         if (!lib) bl_fatal("clear shader: %s", error.localizedDescription.UTF8String);
     }
-    NSString *key = [NSString stringWithFormat:@"%lu/%lu/%u/%d", (unsigned long)color, (unsigned long)depth, mask,
-                                               samples];
+    NSString *key = [NSString stringWithFormat:@"%lu/%lu/%u/%d/%d", (unsigned long)color, (unsigned long)depth, mask,
+                                               samples, info];
     id<MTLRenderPipelineState> p = cache[key];
     if (p) return p;
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
@@ -1298,6 +1370,7 @@ static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelF
     d.fragmentFunction = [lib newFunctionWithName:@"clear_fs"];
     d.colorAttachments[0].pixelFormat = color;
     d.colorAttachments[0].writeMask = mask & 1 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+    if (info) d.colorAttachments[1].pixelFormat = INFO_FORMAT, d.colorAttachments[1].writeMask = MTLColorWriteMaskNone;
     d.rasterSampleCount = (NSUInteger)samples;
     d.depthAttachmentPixelFormat = depth;
     d.stencilAttachmentPixelFormat = depth;
@@ -1384,8 +1457,8 @@ static void stretch_draw(id<MTLTexture> a, const uint32_t sr[4], id<MTLTexture> 
 //
 // Ground-truth ambient occlusion (Jimenez et al. 2016, as in Intel's XeGTAO) from the
 // back buffer's depth, once the world is drawn and before the view model and HUD
-// (ao_before_draw). The depth is turned back into view-space positions with the world
-// view's projection, taken from its draws (ao_note_projection). Four passes, the first
+// (post_before_draw). The depth is turned back into view-space positions with the world
+// view's projection, taken from its draws (note_projection). Four passes, the first
 // three at half resolution: view depth from the depth buffer; the occlusion, 3 slices of
 // 8 steps a side whose angles and offsets follow a 4x4 pattern; a depth-aware 4x4 filter
 // that averages the pattern out; and, at full resolution, a depth-aware upsample that
@@ -1536,27 +1609,28 @@ static id<MTLRenderPipelineState> ao_pipeline(int kind, int ms_depth, MTLPixelFo
 // the depth buffer was last cleared gives the projection (a sky box drawn before the
 // clear does not count). Draws of models carry the model transform in c8-c11 as well,
 // which leaves the depth terms alone and only changes the x/y scales by its scale.
-static void ao_note_projection(const float r8[4], const float r9[4], const float r10[4], const float r11[4], float clip_y)
+static void note_projection(const float r8[4], const float r9[4], const float r10[4], const float r11[4], float clip_y)
 {
-    if (ao_state) return;
+    if (view_state) return;
     float ww = r11[0] * r11[0] + r11[1] * r11[1] + r11[2] * r11[2];
     if (ww <= 0) return;
     // z = alpha w + beta, with w the view depth: the z row is alpha times the w row plus
     // a constant. Dividing the x and y rows by the w row's length cancels a model scale.
     float alpha = (r10[0] * r11[0] + r10[1] * r11[1] + r10[2] * r11[2]) / ww;
     float lw = sqrtf(ww);
-    ao_proj.alpha = alpha;
-    ao_proj.beta = r10[3] - alpha * r11[3];
-    ao_proj.p00 = sqrtf(r8[0] * r8[0] + r8[1] * r8[1] + r8[2] * r8[2]) / lw;
-    ao_proj.p11 = sqrtf(r9[0] * r9[0] + r9[1] * r9[1] + r9[2] * r9[2]) / lw * clip_y;
-    if (ao_proj.beta != 0 && ao_proj.p00 > 0 && ao_proj.p11 > 0) ao_state = 1;
+    view_proj.alpha = alpha;
+    view_proj.beta = r10[3] - alpha * r11[3];
+    view_proj.p00 = sqrtf(r8[0] * r8[0] + r8[1] * r8[1] + r8[2] * r8[2]) / lw;
+    view_proj.p11 = sqrtf(r9[0] * r9[0] + r9[1] * r9[1] + r9[2] * r9[2]) / lw * clip_y;
+    if (view_proj.beta != 0 && view_proj.p00 > 0 && view_proj.p11 > 0) view_state = 1;
 }
 
-// A half-resolution texture for ao_run, kept between frames.
+// A texture for post_run, kept between frames (half resolution but for the copy of the
+// world view).
 static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h)
 {
-    static id<MTLTexture> t[3];
-    if (!t[i] || t[i].width != w || t[i].height != h) {
+    static id<MTLTexture> t[6];
+    if (!t[i] || t[i].width != w || t[i].height != h || t[i].pixelFormat != pf) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h
                                                                                  mipmapped:NO];
         td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
@@ -1583,15 +1657,196 @@ static void ao_pass(int kind, int ms_depth, id<MTLTexture> target, id<MTLTexture
     [e endEncoding];
 }
 
-// ao_result's parameters: the occlusion of the frame's world view is multiplied into
-// the back buffer at the start of the game's next pass on it (ao_apply).
-static struct ao_params ao_result_params;
+// --- screen-space reflections and sharpening ------------------------------------------
+//
+// The game's shiny surfaces add a reflection cubemap to their colour: a picture of the
+// room from one point, the same wherever it is seen from. With reflections on, the world
+// view's shaders also write how much their cubemaps added and how much a white one would
+// (reflection info, d3d_shader_variant reflection_info), and the trace replaces that
+// share of the cubemap with what the screen shows where the reflected ray meets it.
+// Three passes after the ambient occlusion's view depth (half resolution): the trace,
+// 24 steps along the reflected ray from the depth's normal, denser near the start and
+// offset in a 4x4 pattern, then 5 halvings; a depth-aware 5x5 filter; and, at full
+// resolution in the game's next pass on the back buffer, post_apply: a copy of the world
+// view, sharpened (BL_SHARPEN, contrast adaptive like AMD's CAS), plus the reflections
+// where they were found. Elsewhere (off screen, behind things) the cubemap stays.
+// BL_SSR=show shows the reflections alone, BL_SSR=hits what the trace had to go on;
+// BL_SSR_STRENGTH (default 1) scales them.
 
-static void ao_run(struct d3d_state *s)
+struct ssr_params {
+    float full[2], half[2];  // back buffer and half-resolution sizes
+    float p00, p11;          // projection scales in x and y
+    float strength;          // of the reflections; 0: none this frame
+    float sharpen;           // 0..1; 0: none
+    float max_dist, show;    // longest ray (world units); show the reflections alone
+};
+
+static NSString *const ssr_source =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct SP { float2 full, hsize; float p00, p11, strength, sharpen, max_dist, show; };\n"
+     "struct V { float4 pos [[position]]; };\n"
+     "vertex V ssr_vs(uint id [[vertex_id]]) {\n"
+     "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
+     "static float3 vpos(constant SP &a, texture2d<float> zt, int2 p) {\n"
+     "    p = clamp(p, int2(0), int2(a.hsize) - 1);\n"
+     "    float w = zt.read(uint2(p)).x;\n"
+     "    if (w <= 0.0) w = 1e6;\n"
+     "    float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.hsize.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.hsize.y);\n"
+     "    return float3(ndc.x * w / a.p00, ndc.y * w / a.p11, w); }\n"
+     // View-space point to half-resolution pixel coordinates (centres at +0.5).
+     "static float2 project(constant SP &a, float3 q) {\n"
+     "    return float2((q.x * a.p00 / q.z + 1.0) * 0.5 * a.hsize.x, (1.0 - q.y * a.p11 / q.z) * 0.5 * a.hsize.y); }\n"
+     "constant float bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};\n"
+     // Output: the colour where the ray meets the picture, times the confidence; the confidence.
+     "fragment float4 ssr_trace(V in [[stage_in]], texture2d<float> zt [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
+     "                          texture2d<float> color [[texture(2)]], constant SP &a [[buffer(0)]]) {\n"
+     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+     "    int2 p = int2(in.pos.xy);\n"
+     "    if (zt.read(uint2(p)).x <= 0.0 || info.sample(s, in.pos.xy / a.hsize).w < 0.004) return 0.0;\n"
+     "    float3 P = vpos(a, zt, p);\n"
+     "    float3 l = vpos(a, zt, p - int2(1, 0)), r = vpos(a, zt, p + int2(1, 0));\n"
+     "    float3 u = vpos(a, zt, p - int2(0, 1)), b = vpos(a, zt, p + int2(0, 1));\n"
+     "    float3 dx = abs(r.z - P.z) < abs(P.z - l.z) ? r - P : P - l;\n"
+     "    float3 dy = abs(b.z - P.z) < abs(P.z - u.z) ? b - P : P - u;\n"
+     "    float3 N = normalize(cross(dx, dy)), D = normalize(P);\n"
+     "    if (dot(N, D) > 0.0) N = -N;\n"
+     "    float3 R = reflect(D, N);\n"
+     "    float len = a.max_dist;\n"
+     "    if (R.z < 0.0) len = min(len, (P.z - 4.0) / -R.z);\n"
+     "    if (len <= 0.0) return 0.0;\n"
+     "    float3 E = P + R * len;\n"
+     "    float2 s0 = project(a, P), d = project(a, E) - s0;\n"
+     "    float t1 = 1.0;\n"
+     "    if (d.x > 1e-3) t1 = min(t1, (a.hsize.x - 0.5 - s0.x) / d.x); else if (d.x < -1e-3) t1 = min(t1, (0.5 - s0.x) / d.x);\n"
+     "    if (d.y > 1e-3) t1 = min(t1, (a.hsize.y - 0.5 - s0.y) / d.y); else if (d.y < -1e-3) t1 = min(t1, (0.5 - s0.y) / d.y);\n"
+     "    float px = length(d) * t1;\n"
+     "    if (px < 2.0) return 0.0;\n"
+     "    float iz0 = 1.0 / P.z, iz1 = 1.0 / E.z;\n"
+     "    float t0 = 1.5 / length(d);\n"
+     "    float jitter = (bayer[(p.x & 3) + (p.y & 3) * 4] + 0.5) / 16.0;\n"
+     "    const int STEPS = 24;\n"
+     "    float lo = 0.0, hi = -1.0, prz = P.z;\n"
+     "    for (int i = 0; i < STEPS; i++) {\n"
+     "        float f = (float(i) + jitter) / float(STEPS);\n"
+     "        float t = t0 + (t1 - t0) * f * f;\n"
+     "        float rz = 1.0 / mix(iz0, iz1, t);\n"
+     "        float sz = zt.read(uint2(s0 + d * t)).x;\n"
+     "        if (sz > 0.0 && rz > sz && rz - sz < max(abs(rz - prz) * 2.0, sz * 0.02)) { hi = t; break; }\n"
+     "        lo = t, prz = rz;\n"
+     "    }\n"
+     "    if (hi < 0.0) return 0.0;\n"
+     "    for (int i = 0; i < 5; i++) {\n"
+     "        float t = 0.5 * (lo + hi);\n"
+     "        float rz = 1.0 / mix(iz0, iz1, t);\n"
+     "        float sz = zt.read(uint2(s0 + d * t)).x;\n"
+     "        if (sz > 0.0 && rz > sz) hi = t; else lo = t;\n"
+     "    }\n"
+     "    float2 uv = (s0 + d * hi) / a.hsize, edge = min(uv, 1.0 - uv);\n"
+     // Fade out towards the screen's edges, the ray's end and rays coming back at the camera.
+     "    float conf = saturate(min(edge.x, edge.y) * 12.0) * (1.0 - smoothstep(0.7, 1.0, hi)) * saturate(R.z * 2.0 + 1.0);\n"
+     "    return float4(color.sample(s, uv).rgb * conf, conf); }\n"
+     "fragment float4 ssr_blur(V in [[stage_in]], texture2d<float> ssr [[texture(0)]], texture2d<float> zt [[texture(1)]],\n"
+     "                         constant SP &a [[buffer(0)]]) {\n"
+     "    int2 p = int2(in.pos.xy), hs = int2(a.hsize) - 1;\n"
+     "    float z = zt.read(uint2(p)).x;\n"
+     "    if (z <= 0.0) return 0.0;\n"
+     "    float4 sum = 0.0;\n"
+     "    float wsum = 0.0;\n"
+     "    for (int j = -2; j <= 2; j++)\n"
+     "        for (int i = -2; i <= 2; i++) {\n"
+     "            uint2 q = uint2(clamp(p + int2(i, j), int2(0), hs));\n"
+     "            float w = exp(-abs(zt.read(q).x - z) * 20.0 / z);\n"
+     "            sum += ssr.read(q) * w, wsum += w;\n"
+     "        }\n"
+     "    return sum / wsum; }\n"
+     // Full resolution, in the game's next pass on the back buffer: the world view again,
+     // sharpened, with the reflections in place of that share of the cubemaps.
+     "fragment float4 post_apply(V in [[stage_in]], texture2d<float> base [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
+     "                           texture2d<float> ssr [[texture(2)]], constant SP &a [[buffer(0)]]) {\n"
+     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+     "    int2 p = int2(in.pos.xy), m = int2(a.full) - 1;\n"
+     "    float4 c = base.read(uint2(p));\n"
+     "    float3 col = c.rgb;\n"
+     "    if (a.sharpen > 0.0) {\n"
+     "        float3 n = base.read(uint2(clamp(p - int2(0, 1), int2(0), m))).rgb;\n"
+     "        float3 w = base.read(uint2(clamp(p - int2(1, 0), int2(0), m))).rgb;\n"
+     "        float3 e = base.read(uint2(clamp(p + int2(1, 0), int2(0), m))).rgb;\n"
+     "        float3 so = base.read(uint2(clamp(p + int2(0, 1), int2(0), m))).rgb;\n"
+     "        float3 mn = min(min(min(n, w), min(e, so)), col), mx = max(max(max(n, w), max(e, so)), col);\n"
+     "        float3 k = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1e-4))) * (-1.0 / mix(8.0, 5.0, a.sharpen));\n"
+     "        col = saturate(((n + w + e + so) * k + col) / (1.0 + 4.0 * k));\n"
+     "    }\n"
+     "    if (a.strength > 0.0) {\n"
+     "        float4 f = info.read(uint2(p));\n"
+     "        float4 r = f.w > 0.004 ? ssr.sample(s, in.pos.xy / a.full) : float4(0.0);\n"
+     "        if (a.show > 1.5) col = float3(f.w, r.a, length(f.rgb));\n"
+     "        else if (a.show > 0.0) col = f.w > 0.004 ? r.rgb : col * 0.25;\n"
+     "        else col += a.strength * (max(f.w, 0.0) * r.rgb - r.a * f.rgb);\n"
+     "    }\n"
+     "    return float4(saturate(col), c.a); }\n";
+
+// kind 0: trace; 1: filter; 2: post_apply, in the game's pass with its depth attachment (`depth`).
+static id<MTLRenderPipelineState> ssr_pipeline(int kind, MTLPixelFormat color, int samples, MTLPixelFormat depth)
 {
-    ao_state = 2;
-    LOG_ONCE("[metal] ambient occlusion: depth %g + %g / w, scales %g %g\n", ao_proj.alpha, ao_proj.beta, ao_proj.p00,
-             ao_proj.p11);
+    static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *cache;
+    static id<MTLLibrary> lib;
+    if (!cache) {
+        cache = [NSMutableDictionary new];
+        NSError *error = nil;
+        lib = [mtl newLibraryWithSource:ssr_source options:nil error:&error];
+        if (!lib) bl_fatal("reflection shader: %s", error.localizedDescription.UTF8String);
+    }
+    NSString *key = [NSString stringWithFormat:@"%d/%lu/%d/%lu", kind, (unsigned long)color, samples,
+                                               (unsigned long)depth];
+    id<MTLRenderPipelineState> p = cache[key];
+    if (p) return p;
+    static NSString *const names[] = {@"ssr_trace", @"ssr_blur", @"post_apply"};
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [lib newFunctionWithName:@"ssr_vs"];
+    d.fragmentFunction = [lib newFunctionWithName:names[kind]];
+    d.colorAttachments[0].pixelFormat = color;
+    d.rasterSampleCount = (NSUInteger)samples;
+    d.depthAttachmentPixelFormat = depth;
+    d.stencilAttachmentPixelFormat = depth;
+    NSError *error = nil;
+    p = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!p) bl_fatal("reflection pipeline: %s", error.localizedDescription.UTF8String);
+    cache[key] = p;
+    return p;
+}
+
+// One full-screen pass of ssr_pipeline `kind` into `target`.
+static void ssr_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTexture> t1, id<MTLTexture> t2,
+                     const struct ssr_params *a)
+{
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = target;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:ssr_pipeline(kind, target.pixelFormat, 1, MTLPixelFormatInvalid)];
+    [e setFragmentTexture:t0 atIndex:0];
+    [e setFragmentTexture:t1 atIndex:1];
+    [e setFragmentTexture:t2 atIndex:2];
+    [e setFragmentBytes:a length:sizeof *a atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+}
+
+// --- the world view's end ----------------------------------------------------------------
+
+// What the game's next pass on the back buffer draws first: post_apply (its copy of the
+// world view and reflections), then the occlusion multiplied in (ao_apply).
+static struct ao_params ao_result_params;
+static struct ssr_params post_params;
+static id<MTLTexture> post_base, post_ssr;
+
+static void post_run(struct d3d_state *s)
+{
+    view_state = 2;
+    LOG_ONCE("[metal] world view: depth %g + %g / w, scales %g %g\n", view_proj.alpha, view_proj.beta, view_proj.p00,
+             view_proj.p11);
     struct obj *bb = s->back_buffer, *ds = s->depth_stencil;
     if (!bb || !ds || clear_color_target == bb || clear_depth_target == ds) return;
     int samples = multisampled(bb) ? msaa : 1;
@@ -1601,19 +1856,58 @@ static void ao_run(struct d3d_state *s)
     id<MTLTexture> depth = samples > 1 ? ms_texture(ds) : target_texture(ds);
     if (depth.width != color.width || depth.height != color.height) return;
     NSUInteger hw = (color.width + 1) / 2, hh = (color.height + 1) / 2;
+    int reflect = env_ssr && info_frame == frames;
     id<MTLTexture> z = ao_texture(0, MTLPixelFormatR32Float, hw, hh);
-    id<MTLTexture> raw = ao_texture(1, MTLPixelFormatR16Float, hw, hh);
-    id<MTLTexture> soft = ao_texture(2, MTLPixelFormatRG32Float, hw, hh);
-    struct ao_params a = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, ao_proj.alpha,
-                          ao_proj.beta, ao_proj.p00, ao_proj.p11, env_ao_radius,
+    struct ao_params a = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, view_proj.alpha,
+                          view_proj.beta, view_proj.p00, view_proj.p11, env_ao_radius,
                           1 / (env_ao_radius * env_ao_radius), 0.2f * (float)hh, env_ao_strength};
-    ao_pass(0, samples > 1, z, depth, nil, &a);
-    ao_pass(1, 0, raw, z, nil, &a);
-    ao_pass(2, 0, soft, raw, z, &a);
-    ao_result = soft, ao_result_params = a;
+    if (env_ao || reflect) ao_pass(0, samples > 1, z, depth, nil, &a);
+    if (env_ao) {
+        id<MTLTexture> raw = ao_texture(1, MTLPixelFormatR16Float, hw, hh);
+        id<MTLTexture> soft = ao_texture(2, MTLPixelFormatRG32Float, hw, hh);
+        ao_pass(1, 0, raw, z, nil, &a);
+        ao_pass(2, 0, soft, raw, z, &a);
+        ao_result = soft, ao_result_params = a;
+    }
+    if (!reflect && !env_sharpen) return;
+    post_base = ao_texture(3, color.pixelFormat, color.width, color.height);
+    id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
+    [blit copyFromTexture:color toTexture:post_base];
+    [blit endEncoding];
+    float sharpen = env_sharpen_strength < 0 ? 0 : env_sharpen_strength > 1 ? 1 : env_sharpen_strength;
+    struct ssr_params p = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, view_proj.p00,
+                           view_proj.p11, reflect ? env_ssr_strength : 0, env_sharpen ? sharpen : 0, 2000,
+                           (float)env_ssr_show};
+    post_ssr = post_base;  // bound but unread without reflections
+    if (reflect) {
+        id<MTLTexture> raw = ao_texture(4, MTLPixelFormatRGBA16Float, hw, hh);
+        post_ssr = ao_texture(5, MTLPixelFormatRGBA16Float, hw, hh);
+        ssr_pass(0, raw, z, info_texture(color, 1), post_base, &p);
+        ssr_pass(1, post_ssr, raw, z, nil, &p);
+    }
+    post_params = p, post_result = 1;
 }
 
 // Called by pass() for a new pass on the back buffer.
+static void post_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth)
+{
+    MTLPixelFormat df = has_depth ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
+    [e setRenderPipelineState:ssr_pipeline(2, color.pixelFormat, samples, df)];
+    static id<MTLDepthStencilState> none;
+    if (!none) none = [mtl newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
+    [e setDepthStencilState:none];
+    [e setCullMode:MTLCullModeNone];
+    [e setViewport:(MTLViewport){0, 0, color.width, color.height, 0, 1}];
+    [e setScissorRect:(MTLScissorRect){0, 0, color.width, color.height}];
+    [e setFragmentTexture:post_base atIndex:0];
+    [e setFragmentTexture:post_params.strength > 0 ? info_texture(color, 1) : post_base atIndex:1];
+    [e setFragmentTexture:post_ssr atIndex:2];
+    [e setFragmentBytes:&post_params length:sizeof post_params atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    post_result = 0;
+}
+
+// Called by pass() for a new pass on the back buffer, after post_apply.
 static void ao_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth)
 {
     MTLPixelFormat df = has_depth ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
@@ -1631,10 +1925,10 @@ static void ao_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int sa
 }
 
 // Before a draw to the back buffer: once the world view is drawn, the first draw of the
-// view model (drawn with a narrowed depth range) or of the 2D HUD runs the occlusion.
-static void ao_before_draw(struct d3d_state *s, const struct element *el, int nel)
+// view model (drawn with a narrowed depth range) or of the 2D HUD runs the effects.
+static void post_before_draw(struct d3d_state *s, const struct element *el, int nel)
 {
-    if (ao_state != 1 || s->render_target[0] != s->back_buffer) return;
+    if (view_state != 1 || s->render_target[0] != s->back_buffer) return;
     int end = u2f(s->viewport[5]) < 0.99f;
     if (!end) {
         int perspective;
@@ -1649,7 +1943,7 @@ static void ao_before_draw(struct d3d_state *s, const struct element *el, int ne
         }
         end = !perspective;
     }
-    if (end) ao_run(s);
+    if (end) post_run(s);
 }
 
 // --- draws -------------------------------------------------------------------------
@@ -1798,6 +2092,12 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     k->alpha_to_coverage = enc_samples > 1 && rs[15] && !rs[27];  // ALPHATESTENABLE, no blending
     for (int b = 0; b < 16; b++) k->stride[b] = (uint16_t)s->stream_stride[b];
     k->stride[16] = 16;
+    // In the world view's passes, draws that replace the colour also replace the
+    // reflection info: what their reflection cubemaps added, or nothing.
+    if (enc_info) {
+        k->info = !rs[27] && (rs[168] & 7) && !(ps->info.color_outputs & 2) ? 2 : 1;
+        k->psv.reflection_info = k->info == 2;
+    }
 
     id<MTLFunction> vf = shader_function(vs, &k->vsv), pf = shader_function(ps, &k->psv);
     id<MTLRenderPipelineState> pso = vf && pf ? pipeline(k, vf, pf) : nil;
@@ -1880,10 +2180,10 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         }
         if (proj > 0 && aspect > proj * 1.01f) vp.clip_y = aspect / proj;
     }
-    if (env_ao && perspective && to_back_buffer && fabsf(w_row[3]) > 1e-4f && s->viewport[2] == rtt.width &&
+    if ((env_ao || env_ssr || env_sharpen) && perspective && to_back_buffer && fabsf(w_row[3]) > 1e-4f && s->viewport[2] == rtt.width &&
         s->viewport[3] == rtt.height && u2f(s->viewport[4]) == 0 && u2f(s->viewport[5]) >= 0.99f) {
         const float(*r)[4] = vs->ff_vertex ? vc : vc + 8;
-        ao_note_projection(r[0], r[1], r[2], r[3], vp.clip_y);
+        note_projection(r[0], r[1], r[2], r[3], vp.clip_y);
     }
     set_viewport(s, e, (uint32_t)rtt.width, (uint32_t)rtt.height, squeeze);
     [e setVertexBytes:&vp length:sizeof vp atIndex:21];
@@ -1973,7 +2273,7 @@ void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
     if (!s->render_target[0] || !count) return;
     struct element el[64];
     int nel = vertex_elements(s, el, 64);
-    ao_before_draw(s, el, nel);
+    post_before_draw(s, el, nel);
     id<MTLRenderCommandEncoder> e = pass(s);
     struct pipe_key k;
     if (!setup_draw(s, e, type, el, nel, &k)) return;
@@ -2138,7 +2438,7 @@ void d3d_render_draw_up(struct d3d_state *s, uint32_t type, uint32_t min_index, 
     if (!s->render_target[0] || !count || !stride) return;
     struct element el[64];
     int nel = vertex_elements(s, el, 64);
-    ao_before_draw(s, el, nel);
+    post_before_draw(s, el, nel);
     id<MTLRenderCommandEncoder> e = pass(s);
     struct pipe_key k;
     // UP draws read stream 0 with the given stride.
@@ -2361,11 +2661,11 @@ void d3d_render_present(struct d3d_state *s)
 {
     ensure_device();
     bl_vgui_poll();  // the options' check box
-    if (ao_state == 1) {  // a frame with no view model or HUD
-        ao_run(s);
-        if (ao_result && s->render_target[0] == s->back_buffer) pass(s);
+    if (view_state == 1) {  // a frame with no view model or HUD
+        post_run(s);
+        if ((ao_result || post_result) && s->render_target[0] == s->back_buffer) pass(s);
     }
-    ao_state = 0, ao_result = nil;
+    view_state = 0, ao_result = nil, post_result = 0;
     flush_clears(s);
     frames++;
     bl_cocoa_script_input(frames, game_window);

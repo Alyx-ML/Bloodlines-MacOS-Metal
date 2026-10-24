@@ -1270,3 +1270,57 @@ The defaults are now radius 32 and strength 0.6: 7% darker overall, half the pix
 changed by under 3%, and contact shadows under furniture and in corners kept. Tried
 too: 24 / 0.7 (much the same) and 48 / 0.5 (9% darker, broader). Not verified: the
 user's view of the new defaults.
+
+### Screen-space reflections and sharpening, with check boxes (2026-10-24)
+**Where reflections go.** The game marks its shiny surfaces itself: their pixel shaders
+add a reflection cubemap (a fixed picture of the room) on top of the lit colour. A
+diagnostic run over five levels found these are a handful of ps_1_1 shaders, all of the
+form `base * lightmap * 2 + cubemap * mask * tint`: floors and walls in the Ventrue
+Tower lobby, the Asylum's tiles, windows in the Downtown hub. One ps_1_4 shader also
+reads a normalisation cubemap, used as a vector (`_bx2`); `d3d_shader_env_maps` skips
+cube samplers read that way.
+
+**Reflection info.** With reflections on, each shader drawn in the world view's passes on
+the back buffer gets a second colour output (`d3d_shader_variant.reflection_info`). For a
+shader with reflection cubemaps the translator runs its body twice more with them read as
+black and as white, so the output holds exactly what the cubemaps added (rgb) and how
+much a white cubemap would add (alpha), after fog. Other opaque draws write zero, so a
+character standing on a shiny floor clears it; blended draws leave it. The attachment is
+RGBA16Float, multisampled with the back buffer and resolved like it.
+
+**Trace and apply.** At the world view's end (`post_run`, which now also runs the ambient
+occlusion: `ao_run`, `ao_state` and `ao_before_draw` became `post_run`, `view_state` and
+`post_before_draw`), from the occlusion's half-resolution view depth: a normal from
+neighbouring depths, the reflected ray marched in screen space (24 steps, denser near the
+start, offset in a 4x4 pattern, then 5 halvings), the colour where it meets the picture
+weighted by a confidence that fades at the screen's edges, at the ray's end and for rays
+coming back at the camera; then a depth-aware 5x5 filter. The next pass on the back buffer
+starts with `post_apply`: a copy of the world view plus, on reflective pixels,
+`strength * (weight * reflection - confidence * cubemap share)`, so where a ray finds
+something it takes the cubemap's place and elsewhere the cubemap stays. `BL_SSR=0|1|show|hits`
+overrides the setting; `BL_SSR_STRENGTH` (default 1) scales it.
+
+**Sharpening.** `post_apply` also sharpens the world view before the view model and HUD
+are drawn (so text and the HUD are left alone): a 5-tap contrast-adaptive filter like
+AMD's CAS. `BL_SHARPEN=0|1` overrides the setting, `BL_SHARPEN_STRENGTH` (0..1, default
+0.5) tunes it.
+
+**Check boxes.** The Visual tab's three boxes are saved as `AmbientOcclusion`,
+`Reflections` and `Sharpening` under `HKCU\Software\Troika\Vampire\Native` (default off).
+Stacking them under "Combat effects" covered the "Particles" slider, so "Reflections" and
+"Sharpening" sit beside that slider, placed in `optionssubvisual.res` units scaled from
+"Combat effects".
+
+- Verified (M4 Pro, 1920x1080, MSAA 2x, headless, no audio): in `sm_asylum_1` the bar's
+  tiled floor shows the bar, stools and green lights reflected; in `la_ventruetower_1` the
+  lobby floor reflects the desk, faintly, because the room is dark and its cubemap was
+  brighter than the room; in `la_hub_1` only windows change. Sharpening visibly crisps
+  the Asylum's frieze and bottles. All three effects together and the no-MSAA path run
+  with Metal API validation clean. GPU time in `sm_asylum_1`: 1.79 ms a frame without,
+  2.57 ms with reflections, sharpening about free. With scripted clicks the boxes appear
+  beside the slider without covering it, ticking them saves 1, and a level started with
+  the saved settings runs them.
+- Not verified: the look in a window and in motion (the half-resolution trace may shimmer
+  at edges), Retina resolution, reflections of the view model (drawn after the trace, so
+  never reflected), and shaders on other levels that might write a second colour output
+  themselves (they are left without reflections).

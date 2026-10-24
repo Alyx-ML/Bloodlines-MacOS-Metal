@@ -209,6 +209,47 @@ int d3d_shader_parse(const uint32_t *code, struct d3d_shader_info *info, char *e
     return r < 0 ? -1 : 0;
 }
 
+// The sampler an instruction reads, or -1.
+static int sampled_stage(const struct parser *ps, const struct insn *in)
+{
+    if (!ps->pixel || !in->nparams) return -1;
+    if (ps->major == 2) return in->op == OP_TEX ? (int)reg_num(in->p[2]) : -1;
+    switch (in->op) {
+    case OP_TEX: case OP_TEXBEM: case OP_TEXBEML: case OP_TEXREG2AR: case OP_TEXREG2GB: case OP_TEXREG2RGB:
+    case OP_TEXM3x2TEX: case OP_TEXM3x3TEX: case OP_TEXM3x3SPEC: case OP_TEXM3x3VSPEC: case OP_TEXDP3TEX:
+        return (int)reg_num(in->p[0]);
+    default: return -1;
+    }
+}
+
+uint32_t d3d_shader_env_maps(const uint32_t *code)
+{
+    struct parser ps;
+    struct insn in;
+    char err[128];
+    uint32_t sampled = 0, vector = 0, dst[D3D_SHADER_MAX_SAMPLERS];
+    if (start(&ps, code, err, sizeof err) || !ps.pixel) return 0;
+    while (next(&ps, &in) > 0) {
+        int stage = sampled_stage(&ps, &in);
+        if (stage < 0 || stage >= D3D_SHADER_MAX_SAMPLERS) continue;
+        sampled |= 1u << stage;
+        dst[stage] = in.p[0];
+    }
+    // A sample read with _bias or _bx2 (signed or not) is a vector, not a colour.
+    start(&ps, code, err, sizeof err);
+    while (next(&ps, &in) > 0) {
+        if (in.op == OP_DCL || in.op == OP_DEF || in.op == OP_DEFI || in.op == OP_DEFB) continue;
+        for (int i = 1; i < in.nparams; i++) {
+            uint32_t t = in.p[i], mod = t >> 24 & 0xF;
+            if (mod < 2 || mod > 5) continue;
+            for (int k = 0; k < D3D_SHADER_MAX_SAMPLERS; k++)
+                if ((sampled & (1u << k)) && reg_type(t) == reg_type(dst[k]) && reg_num(t) == reg_num(dst[k]))
+                    vector |= 1u << k;
+        }
+    }
+    return sampled & ~vector;
+}
+
 // --- code generation -------------------------------------------------------------
 
 struct gen {
@@ -220,6 +261,10 @@ struct gen {
     char pending[2][512];
     int npending;
     int nco;  // co-issue temporaries so far: each gets its own name
+    // Reflection cubemaps (variant reflection_info) and what they read for now: 0 the
+    // texture, 1 black, 2 white.
+    uint32_t env;
+    int env_value;
 };
 
 static const char comp[] = "xyzw";
@@ -394,6 +439,10 @@ static int tex_kind(struct gen *g, uint32_t stage)
 // Sample expression for a stage with float4 coordinates.
 static void sample(struct gen *g, uint32_t stage, const char *coord, const char *extra, char *buf, size_t len)
 {
+    if (g->env_value && stage < 32 && (g->env & (1u << stage))) {
+        snprintf(buf, len, "float4(%s)", g->env_value == 1 ? "0.0" : "1.0");
+        return;
+    }
     int k = tex_kind(g, stage);
     snprintf(buf, len, "tex%u.sample(smp%u, (%s).%s%s)", stage, stage, coord, k == D3D_TEX_2D ? "xy" : "xyz",
              extra ? extra : "");
@@ -718,16 +767,34 @@ static int gen_body(struct gen *g)
 }
 
 // Alpha test and fog on oc0, as the fixed-function back end does after any pixel shader.
+// _fog: the share of the colour the fog leaves.
 static void ps_alpha_and_fog(struct out *o)
 {
     line(o, "if (!bl_cmp(p.alpha_func, oc0.w, p.alpha_ref)) discard_fragment();");
+    line(o, "float _fog = 1.0;");
     line(o, "if (p.fog_mode != 0) {");
     line(o, "    float z = in.fogz, f = in.fog;");
     line(o, "    if (p.fog_mode == 2) f = (p.fog_end - z) / (p.fog_end - p.fog_start);");
     line(o, "    else if (p.fog_mode == 3) f = exp(-p.fog_density * z);");
     line(o, "    else if (p.fog_mode == 4) f = exp(-(p.fog_density * z) * (p.fog_density * z));");
-    line(o, "    oc0.xyz = mix(p.fog_color.xyz, oc0.xyz, saturate(f));");
+    line(o, "    _fog = saturate(f);");
+    line(o, "    oc0.xyz = mix(p.fog_color.xyz, oc0.xyz, _fog);");
     line(o, "}");
+}
+
+// A pixel shader's registers, before its body.
+static void ps_locals(struct gen *g)
+{
+    struct out *o = &g->o;
+    line(o, "float4 v0 = in.d0, v1 = in.d1;");
+    line(o, "float4 r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0, r8 = 0, r9 = 0, r10 = 0, "
+            "r11 = 0, r12 = 0, r13 = 0, r14 = 0, r15 = 0;");
+    if (g->ps.major == 1 && g->ps.minor < 4)
+        line(o, "float4 t0 = in.t0, t1 = in.t1, t2 = in.t2, t3 = in.t3;");
+    else
+        line(o, "float4 t0 = in.t0, t1 = in.t1, t2 = in.t2, t3 = in.t3, t4 = in.t4, t5 = in.t5, t6 = in.t6, "
+                "t7 = in.t7;");
+    line(o, "float4 oc0 = 0, oc1 = 0, oc2 = 0, oc3 = 0; float odepth = in.pos.z; float3 _m = 0;");
 }
 
 char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, char *err, int errlen)
@@ -775,9 +842,16 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         line(o, "return out;");
         put(o, "}\n");
     } else {
+        int info = v && v->reflection_info && !(g.info.color_outputs & 2);
+        if (info) {
+            uint32_t maps = d3d_shader_env_maps(code);
+            for (uint32_t i = 0; i < D3D_SHADER_MAX_SAMPLERS; i++)
+                if ((maps & (1u << i)) && tex_kind(&g, i) == D3D_TEX_CUBE) g.env |= 1u << i;
+        }
         put(o, "struct BLPSOut {\n");
         for (int i = 0; i < 4; i++)
             if (g.info.color_outputs & (1u << i)) put(o, "    float4 c%d [[color(%d)]];\n", i, i);
+        if (info) put(o, "    float4 c1 [[color(1)]];\n");
         if (g.info.writes_depth) put(o, "    float depth [[depth(any)]];\n");
         put(o, "};\n");
         put(o, "fragment BLPSOut bl_main(BLPSIn in [[stage_in]], constant float4 *c [[buffer(0)]],\n"
@@ -788,21 +862,35 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
                     tex_type(tex_kind(&g, i)), i, i, i, i);
         put(o, ") {\n");
         o->indent = 1;
-        line(o, "float4 v0 = in.d0, v1 = in.d1;");
-        line(o, "float4 r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0, r8 = 0, r9 = 0, r10 = 0, "
-                "r11 = 0, r12 = 0, r13 = 0, r14 = 0, r15 = 0;");
-        if (g.ps.major == 1 && g.ps.minor < 4)
-            line(o, "float4 t0 = in.t0, t1 = in.t1, t2 = in.t2, t3 = in.t3;");
-        else
-            line(o, "float4 t0 = in.t0, t1 = in.t1, t2 = in.t2, t3 = in.t3, t4 = in.t4, t5 = in.t5, t6 = in.t6, "
-                    "t7 = in.t7;");
-        line(o, "float4 oc0 = 0, oc1 = 0, oc2 = 0, oc3 = 0; float odepth = in.pos.z; float3 _m = 0;");
+        if (g.env) {
+            // The body again with the reflection cubemaps read as black, then as white:
+            // the colour without them (_e0) and with white ones (_e1).
+            line(o, "float3 _e0, _e1;");
+            for (int k = 1; k <= 2; k++) {
+                line(o, "{");
+                o->indent++;
+                ps_locals(&g);
+                start(&g.ps, code, err, errlen);
+                g.env_value = k;
+                if (gen_body(&g)) goto failed;
+                if (g.ps.major == 1) line(o, "oc0 = r0;");
+                line(o, "_e%d = oc0.xyz;", k - 1);
+                o->indent--;
+                line(o, "}");
+            }
+            start(&g.ps, code, err, errlen);
+            g.env_value = 0;
+        }
+        ps_locals(&g);
         if (gen_body(&g)) goto failed;
         if (g.ps.major == 1) line(o, "oc0 = r0;");
+        if (g.env) line(o, "float3 _d = oc0.xyz - _e0, _w = _e1 - _e0;");
         ps_alpha_and_fog(o);
         line(o, "BLPSOut out;");
         for (int i = 0; i < 4; i++)
             if (g.info.color_outputs & (1u << i)) line(o, "out.c%d = oc%d;", i, i);
+        if (info && g.env) line(o, "out.c1 = float4(_d * _fog, (_w.x + _w.y + _w.z) * _fog / 3.0);");
+        else if (info) line(o, "out.c1 = 0;");
         if (g.info.writes_depth) line(o, "out.depth = odepth;");
         line(o, "return out;");
         put(o, "}\n");
@@ -884,7 +972,8 @@ char *d3d_ff_ps_msl(const struct d3d_ff_ps *k, const struct d3d_shader_variant *
 {
     struct out out = {0}, *o = &out;
     put(o, "%s", header);
-    put(o, "struct BLPSOut { float4 c0 [[color(0)]]; };\n");
+    int info = v && v->reflection_info;
+    put(o, "struct BLPSOut { float4 c0 [[color(0)]];%s };\n", info ? " float4 c1 [[color(1)]];" : "");
     put(o, "fragment BLPSOut bl_main(BLPSIn in [[stage_in]], constant float4 *c [[buffer(0)]],\n"
            "                         constant BLPSParams &p [[buffer(1)]]");
     uint32_t samplers = d3d_ff_ps_samplers(k);
@@ -933,6 +1022,7 @@ char *d3d_ff_ps_msl(const struct d3d_ff_ps *k, const struct d3d_shader_variant *
     ps_alpha_and_fog(o);
     line(o, "BLPSOut out;");
     line(o, "out.c0 = oc0;");
+    if (info) line(o, "out.c1 = 0;");
     line(o, "return out;");
     put(o, "}\n");
     return o->s;

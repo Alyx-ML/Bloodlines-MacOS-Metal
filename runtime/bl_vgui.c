@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "llasm_cpu.h"
 
@@ -41,14 +42,14 @@ void bl_vgui_GetCursorLine_c(_cpu *cpu)
     eax = (uint32_t)lo;
 }
 
-// COptionsSubVisual, the Visual tab of the options dialog, gets an "Ambient Occlusion"
-// check box under "Combat effects". Like the tab's other settings it takes effect as
-// soon as it is clicked: bl_vgui_poll, once a frame, passes a change to the renderer,
-// which saves it (bl_ao_enabled, bl_ao_set in metal_render.m). The page's OnResetData
-// (0x1001bd30) is replaced to create the box: it does what the original did (the
-// controls' own reset, through the aliases in modules/GameUI/global_aliases.manual.sci),
-// then adds the box the first time. Its destructor (0x1001bcd0) is replaced to forget
-// the box with the page.
+// COptionsSubVisual, the Visual tab of the options dialog, gets "Ambient Occlusion",
+// "Reflections" and "Sharpening" check boxes under "Combat effects". Like the tab's other
+// settings they take effect as soon as they are clicked: bl_vgui_poll, once a frame,
+// passes a change to the renderer, which saves it (bl_effect_enabled, bl_effect_set in
+// metal_render.m). The page's OnResetData (0x1001bd30) is replaced to create the boxes:
+// it does what the original did (the controls' own reset, through the aliases in
+// modules/GameUI/global_aliases.manual.sci), then adds the boxes the first time. Its
+// destructor (0x1001bcd0) is replaced to forget the boxes with the page.
 //
 // Page fields: +0x80 shadows combo box, +0x84 "Combat effects" box, +0x88..+0x94
 // sliders. The box is a plain vgui::CheckButton (0xfc bytes): SetFont at vtable +0x1d8,
@@ -58,10 +59,14 @@ void bl_vgui_GetCursorLine_c(_cpu *cpu)
 extern char GameUI_operator_new[], GameUI_CheckButton_ctor[], GameUI_Panel_SetPos[], GameUI_Panel_GetPos[],
     GameUI_Panel_SetSize[], GameUI_Panel_GetSize[], GameUI_PropertyPage_dtor[], GameUI_SubVisual_Update[],
     GameUI_CvarSlider_Reset[], GameUI_CommandCombo_Reset[], GameUI_CvarToggle_Reset[];
-int bl_ao_enabled(void);
-void bl_ao_set(int on);
+int bl_effect_enabled(int effect);
+void bl_effect_set(int effect, int on);
 
-static uint32_t ao_page, ao_box;
+// In the order of the renderer's effects (BL_EFFECT_* in metal_render.m).
+static const char *const box_names[] = { "AmbientOcclusion", "Reflections", "Sharpening" };
+static const char *const box_texts[] = { "Ambient Occlusion", "Reflections", "Sharpening" };
+#define NBOXES 3
+static uint32_t box_page, boxes[NBOXES];
 
 static uint32_t call_this(void *cpu, const void *fn, uint32_t self, int nargs, const uint32_t *args)
 {
@@ -75,34 +80,42 @@ static uint32_t vcall(void *cpu, uint32_t self, uint32_t slot, int nargs, const 
     return bl_call_guest(cpu, field(field(self, 0), slot), BL_THISCALL, self, nargs, args);
 }
 
-// The box is the size of "Combat effects" and just below it (the .res file places that
-// one, scaled to the screen), in the page's Copperplate font.
-static void ao_make_box(void *cpu, uint32_t page)
+// The boxes go where optionssubvisual.res leaves room, in its units (scaled to the
+// screen like the rest: "Combat effects" is 28 tall there): "Ambient Occlusion" just
+// below "Combat effects" (336,160 360x28) and the size of it, the others beside the
+// "Particles" slider (340,216 180x80). In the page's Copperplate font.
+// From Combat effects: x, y, width (0: Combat effects' own).
+static const int box_place[NBOXES][3] = { { 0, 28, 0 }, { 224, 56, 240 }, { 224, 84, 240 } };
+static void make_boxes(void *cpu, uint32_t page)
 {
-    static uint32_t name, text, out;
+    static uint32_t names[NBOXES], texts[NBOXES], out;
     if (!out) {
-        name = bl_guest_strdup("AmbientOcclusion");
-        text = bl_guest_strdup("Ambient Occlusion");
+        for (int i = 0; i < NBOXES; i++) names[i] = bl_guest_strdup(box_names[i]), texts[i] = bl_guest_strdup(box_texts[i]);
         out = bl_guest_malloc(8);
     }
-    uint32_t size = 0xfc;
-    uint32_t box = bl_call_guest(cpu, bl_h2g(GameUI_operator_new), BL_CDECL, 0, 1, &size);
-    if (!box) return;
-    uint32_t a[3] = { page, name, text };
-    call_this(cpu, GameUI_CheckButton_ctor, box, 3, a);
     uint32_t combat = field(page, 0x84), p[2] = { out, out + 4 };
     call_this(cpu, GameUI_Panel_GetPos, combat, 2, p);
     uint32_t pos[2] = { field(out, 0), field(out, 4) };
     call_this(cpu, GameUI_Panel_GetSize, combat, 2, p);
     uint32_t sz[2] = { field(out, 0), field(out, 4) };
-    pos[1] += sz[1];
-    call_this(cpu, GameUI_Panel_SetPos, box, 2, pos);
-    call_this(cpu, GameUI_Panel_SetSize, box, 2, sz);
+    double k = sz[1] / 28.0;
     uint32_t font = vcall(cpu, combat, 0x1dc, 0, NULL);
-    vcall(cpu, box, 0x1d8, 1, &font);
-    uint32_t on = bl_ao_enabled() != 0;
-    vcall(cpu, box, 0x23c, 1, &on);
-    ao_page = page, ao_box = box;
+    box_page = page;
+    for (int i = 0; i < NBOXES; i++) {
+        uint32_t size = 0xfc;
+        uint32_t box = bl_call_guest(cpu, bl_h2g(GameUI_operator_new), BL_CDECL, 0, 1, &size);
+        if (!box) return;
+        uint32_t a[3] = { page, names[i], texts[i] };
+        call_this(cpu, GameUI_CheckButton_ctor, box, 3, a);
+        uint32_t at[2] = { pos[0] + (uint32_t)(box_place[i][0] * k + 0.5), pos[1] + (uint32_t)(box_place[i][1] * k + 0.5) };
+        uint32_t wh[2] = { box_place[i][2] ? (uint32_t)(box_place[i][2] * k + 0.5) : sz[0], sz[1] };
+        call_this(cpu, GameUI_Panel_SetPos, box, 2, at);
+        call_this(cpu, GameUI_Panel_SetSize, box, 2, wh);
+        vcall(cpu, box, 0x1d8, 1, &font);
+        uint32_t on = bl_effect_enabled(i) != 0;
+        vcall(cpu, box, 0x23c, 1, &on);
+        boxes[i] = box;
+    }
 }
 
 void bl_vgui_VisualReset_c(_cpu *cpu)
@@ -113,7 +126,7 @@ void bl_vgui_VisualReset_c(_cpu *cpu)
     for (int i = 0; i < 4; i++) call_this(cpu, GameUI_CvarSlider_Reset, field(page, sliders[i]), 0, NULL);
     call_this(cpu, GameUI_CommandCombo_Reset, field(page, 0x80), 0, NULL);
     call_this(cpu, GameUI_CvarToggle_Reset, field(page, 0x84), 0, NULL);
-    if (ao_page != page || !ao_box) ao_make_box(cpu, page);
+    if (box_page != page || !boxes[0]) make_boxes(cpu, page);
 }
 
 // The page's destructor body: the vtable it restores is the one already in place.
@@ -121,13 +134,15 @@ void bl_vgui_VisualReset_c(_cpu *cpu)
 void bl_vgui_VisualDestroy_c(_cpu *cpu)
 {
     uint32_t page = ecx;
-    if (ao_page == page) ao_page = 0, ao_box = 0;
+    if (box_page == page) box_page = 0, memset(boxes, 0, sizeof boxes);
     call_this(cpu, GameUI_PropertyPage_dtor, page, 0, NULL);
 }
 
 void bl_vgui_poll(void)
 {
-    if (!ao_box) return;
-    int on = *(const uint8_t *)bl_g2h(ao_box + 0xba) != 0;
-    if (on != (bl_ao_enabled() != 0)) bl_ao_set(on);
+    for (int i = 0; i < NBOXES; i++) {
+        if (!boxes[i]) continue;
+        int on = *(const uint8_t *)bl_g2h(boxes[i] + 0xba) != 0;
+        if (on != (bl_effect_enabled(i) != 0)) bl_effect_set(i, on);
+    }
 }

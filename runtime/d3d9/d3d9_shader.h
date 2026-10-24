@@ -37,8 +37,15 @@ struct d3d_shader_variant {
     uint8_t input_kind[D3D_SHADER_MAX_INPUTS];   // vertex: enum d3d_input_kind per v<n>
     uint8_t tex_kind[D3D_SHADER_MAX_SAMPLERS];   // pixel: enum d3d_tex_kind per sampler (0 = 2D)
     uint8_t projected[D3D_SHADER_MAX_SAMPLERS];  // ps_1_x: divide texcoords by component 3 or 4 (0 = no)
+    // Pixel: also write [[color(1)]] for screen-space reflections (metal_render.m ssr_run):
+    // rgb what the shader's reflection cubemaps added to oc0, a how much a white cubemap
+    // would add (the mean over rgb); zero for shaders without one.
+    uint8_t reflection_info;
 };
 
+// Pixel shader samplers that read a reflection cubemap: cube samplers whose result is
+// not used as a vector (normalisation cubemaps are read with _bx2).
+uint32_t d3d_shader_env_maps(const uint32_t *code);
 // Returns 0 on success, else fills err.
 int d3d_shader_parse(const uint32_t *code, struct d3d_shader_info *info, char *err, int errlen);
 // MSL source (malloc'd) with entry point bl_main; NULL and err on failure.
