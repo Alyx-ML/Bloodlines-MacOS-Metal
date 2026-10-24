@@ -8,3 +8,16 @@ proc bl_vgui_GetCursorLine public
         call bl_vgui_GetCursorLine_c $
         Call_Asm_Return 0
 endp
+
+funcv bl_vgui_VisualReset_c $
+funcv bl_vgui_VisualDestroy_c $
+
+proc bl_vgui_VisualReset public
+        call bl_vgui_VisualReset_c $
+        Call_Asm_Return 0
+endp
+
+proc bl_vgui_VisualDestroy public
+        call bl_vgui_VisualDestroy_c $
+        Call_Asm_Return 0
+endp

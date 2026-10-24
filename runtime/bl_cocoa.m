@@ -287,6 +287,37 @@ static void button(int b, int down, uint32_t lp)
     }
 }
 
+// BL_CLICKS="frame:x,y ..." clicks the left button at x,y (game pixels) on those
+// frames, for testing menus without a window: the cursor moves there on the frame,
+// the button goes down three frames later and up three after that.
+void bl_cocoa_script_input(unsigned long frame, uint32_t hwnd)
+{
+    static const char *script;
+    static int init;
+    if (!init) init = 1, script = getenv("BL_CLICKS");
+    if (!script) return;
+    if (!game_hwnd) game_hwnd = hwnd;
+    for (const char *p = script; *p;) {
+        char *end;
+        unsigned long f = strtoul(p, &end, 10);
+        int x = 0, y = 0;
+        if (*end == ':') x = (int)strtol(end + 1, &end, 10);
+        if (*end == ',') y = (int)strtol(end + 1, &end, 10);
+        uint32_t lp = (uint32_t)(x & 0xFFFF) | (uint32_t)(y & 0xFFFF) << 16;
+        if (frame == f) {
+            bl_window_set_cursor(game_hwnd, x, y);
+            bl_u32_PostMessageA_c(game_hwnd, WM_MOUSEMOVE, mouse_wparam(), lp);
+        }
+        if (frame == f + 3 || frame == f + 6) {
+            fprintf(stderr, "[input] frame %lu: click %s at %d,%d\n", frame, frame == f + 3 ? "down" : "up", x, y);
+            button(0, frame == f + 3, lp);
+        }
+        p = end;
+        while (*p == ' ') p++;
+        if (p == end && *p) break;  // not a frame:x,y entry
+    }
+}
+
 static void wheel(int dz, uint32_t lp)
 {
     bl_input_mouse_wheel(dz);

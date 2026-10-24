@@ -1227,3 +1227,37 @@ test runs pass `BL_AUDIO=0`.
   and fire with no shards. A 900-frame run into `sm_hub_1` renders normally.
 - Not verified: the user's own view of the menu in the window, and whether the extra
   texture allocations cost frame time in busy scenes.
+
+### Ambient occlusion, with a check box in the Visual options (2026-10-24)
+**Effect.** Screen-space ambient occlusion (GTAO) on the world view, in
+`metal_render.m` (`ao_run`). The renderer notes the world's projection from the first
+full-screen perspective draw to the back buffer. When the world is done (the view model's
+short depth range, a non-perspective draw such as the HUD, or Present), it ends the pass
+and runs three half-resolution passes: linear depth from the multisampled depth buffer,
+GTAO with 2 slices of 4 steps and normals from neighbouring depths, and a 4x4
+depth-aware blur. The next pass on the back buffer starts by multiplying the result into
+the colour. Sky (depth 1) is left alone. `BL_AO=0|1|show` overrides the setting;
+`BL_AO_RADIUS` (48 world units) and `BL_AO_STRENGTH` (1) tune it. `BL_GPU_STATS=1`
+prints the mean GPU time per frame.
+
+**Check box.** GameUI's Visual tab gets "Ambient Occlusion" under "Combat effects", the
+same size and font. GameUI is rebuilt with the page's OnResetData and destructor replaced
+(`modules/README.md`); the new reset creates a vgui CheckButton on the page. Like the
+tab's other settings (its note says they apply at once), a click takes effect
+immediately: once a frame the renderer reads the box, and a change is saved as
+`HKCU\Software\Troika\Vampire\Native\AmbientOcclusion` in the runtime's registry file.
+The default is off.
+
+**Test input.** `BL_CLICKS="frame:x,y ..."` clicks at game pixels on given frames, so
+menus can be driven without a window.
+
+- Verified (M4 Pro, 1920x1080, MSAA 2x): the haven, an Elysium corridor, an outdoor
+  street and a dialogue close-up look right, with corners, furniture and window recesses
+  shaded and the sky untouched. GPU time in `sm_pawnshop_1` went from 1.75 ms to 2.79 ms
+  a frame (an earlier full-resolution version cost 3.7 ms more); `la_hub_1` from 3.44 ms
+  to 4.53 ms. With scripted clicks, headless: the box appears in the right place and font,
+  a click ticks it, the setting saves as 1 and then 0, a restart shows it ticked, and a
+  level started with the setting on runs AO while one with it off does not.
+- Not verified: the view model (no weapon was drawn in the test scenes), cost at Retina
+  resolution, toggling from the in-game pause menu, and the user's own look in the
+  window. Some streaking shows on nearby floors at grazing angles.

@@ -1,0 +1,11 @@
+loc_1001F8E0,GameUI_operator_new
+loc_1002B610,GameUI_CheckButton_ctor
+loc_1001CB20,GameUI_Panel_SetPos
+loc_1001CB50,GameUI_Panel_GetPos
+loc_1001CB80,GameUI_Panel_SetSize
+loc_1001CBB0,GameUI_Panel_GetSize
+loc_100252A0,GameUI_PropertyPage_dtor
+loc_1001BDA0,GameUI_SubVisual_Update
+loc_1000F0B0,GameUI_CvarSlider_Reset
+loc_1000EBA0,GameUI_CommandCombo_Reset
+loc_1000F7E0,GameUI_CvarToggle_Reset

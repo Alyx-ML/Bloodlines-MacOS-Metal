@@ -320,3 +320,36 @@ uint32_t bl_adv_RegEnumKeyExA_c(uint32_t key, uint32_t i, uint32_t name, uint32_
     pthread_mutex_unlock(&lock);
     return result;
 }
+
+uint32_t bl_reg_get_dword(const char *path, const char *name, uint32_t def)
+{
+    pthread_mutex_lock(&lock);
+    load();
+    const struct value *v = find_value(path, name);
+    uint32_t r = def;
+    if (v && v->type == 4 && v->size == 4) memcpy(&r, v->data, 4);  // REG_DWORD
+    pthread_mutex_unlock(&lock);
+    return r;
+}
+
+void bl_reg_set_dword(const char *path, const char *name, uint32_t value)
+{
+    pthread_mutex_lock(&lock);
+    load();
+    struct value *v = find_value(path, name);
+    if (!v) {
+        if (nvalues == cap_values)
+            values = realloc(values, sizeof *values * (size_t)(cap_values = cap_values ? cap_values * 2 : 64));
+        v = &values[nvalues++];
+        memset(v, 0, sizeof *v);
+        snprintf(v->key, sizeof v->key, "%s", path);
+        snprintf(v->name, sizeof v->name, "%s", name);
+    }
+    free(v->data);
+    v->type = 4, v->size = 4;
+    v->data = malloc(4);
+    memcpy(v->data, &value, 4);
+    add_key(path);
+    save();
+    pthread_mutex_unlock(&lock);
+}

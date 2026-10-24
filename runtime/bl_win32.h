@@ -49,6 +49,9 @@ int bl_sync_close(uint32_t h);
 int bl_path_to_host(const char *win, char *host, size_t cap);
 // Where saves, settings and the registry are kept; "" when they stay in the game folder.
 const char *bl_data_dir(void);
+// Registry DWORDs for the runtime's own settings (bl_registry.c); path like "HKCU\\Software\\...".
+uint32_t bl_reg_get_dword(const char *path, const char *name, uint32_t def);
+void bl_reg_set_dword(const char *path, const char *name, uint32_t value);
 // The main display (bl_display.c): desktop size in pixels, and the video modes offered.
 void bl_screen_size(uint32_t *w, uint32_t *h);
 int bl_display_mode_count(void);

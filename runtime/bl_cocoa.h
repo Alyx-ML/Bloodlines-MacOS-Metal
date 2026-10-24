@@ -28,3 +28,4 @@ void bl_cocoa_key(uint16_t mac, int down);
 void bl_cocoa_button(int b, int down);
 void bl_cocoa_wheel(int dz);
 void bl_cocoa_motion(int dx, int dy);
+void bl_cocoa_script_input(unsigned long frame, uint32_t hwnd);  // BL_CLICKS

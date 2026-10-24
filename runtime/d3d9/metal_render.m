@@ -12,6 +12,7 @@
 //
 // Debug environment:
 //   BL_MAX_FRAMES=n          exit after n presented frames
+//   BL_CLICKS="f:x,y ..."    left clicks at game pixels x,y from frame f (bl_cocoa.m)
 //   BL_DUMP_FRAME=n[,m...]   write frame n's back buffer to BL_DUMP_DIR/frame_<n>.png, and the last
 //                            offscreen target (e.g. the shadow atlas) to frame_<n>_rt.png
 //   BL_DUMP_DIR=dir          (default: current directory)
@@ -32,6 +33,9 @@
 //   BL_WIDESCREEN=stretch    keep the game's 4:3 projection on wider modes (default: corrected)
 //   BL_MSAA=n                multisampling of the back buffer and its depth buffer (default 2, 1 = off)
 //   BL_ANISO=n               anisotropic filtering for filtered mipmapped textures (default 16, 1 = off)
+//   BL_AO=0|1|show           ambient occlusion (see ao_run), over the options' check box;
+//                            BL_AO_RADIUS, BL_AO_STRENGTH tune it
+//   BL_GPU_STATS=1           log the mean GPU time per frame every 100 frames
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
@@ -45,6 +49,7 @@
 #include <string.h>
 
 #include "bl_cocoa.h"
+#include "bl_win32.h"
 #include "d3d9_shader.h"
 #include "d3d9_state.h"
 
@@ -80,6 +85,44 @@ static int last_3d;
 static float frame_squeeze = 1;       // menu draws this frame were narrowed to this share of the width
 static int msaa;        // samples for the back buffer and its depth (BL_MSAA, default 2; 1 = off)
 static int deep_color;  // 16-bit back buffer, 10-bit window (BL_DEEP_COLOR, default on)
+
+// Ambient occlusion (ao_run). ao_state: 0 no world view yet this frame, 1 world drawn
+// (ao_proj holds its projection), 2 done for this frame.
+static int env_ao, env_ao_show;
+static float env_ao_radius, env_ao_strength;
+static int ao_state;
+static struct { float alpha, beta, p00, p11; } ao_proj;
+static id<MTLTexture> ao_result;  // waiting to be multiplied in at the next pass on the back buffer
+static void ao_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth);
+
+// The Visual options tab's check box (bl_vgui.c, read once a frame by bl_vgui_poll)
+// sets env_ao and saves it in the registry; BL_AO, when set, wins over both.
+#define AO_KEY "HKCU\\Software\\Troika\\Vampire\\Native"
+static int ao_loaded, ao_forced;
+void bl_vgui_poll(void);
+
+static void ao_settings(void)
+{
+    if (ao_loaded) return;
+    ao_loaded = 1;
+    const char *e = getenv("BL_AO");
+    ao_forced = e != NULL;
+    env_ao_show = e && !strcmp(e, "show");
+    env_ao = e ? atoi(e) != 0 || env_ao_show : bl_reg_get_dword(AO_KEY, "AmbientOcclusion", 0) != 0;
+}
+
+int bl_ao_enabled(void)
+{
+    ao_settings();
+    return env_ao;
+}
+
+void bl_ao_set(int on)
+{
+    ao_settings();
+    bl_reg_set_dword(AO_KEY, "AmbientOcclusion", on != 0);
+    if (!ao_forced) env_ao = on != 0;
+}
 
 #define LOG_ONCE(...) do { static int once_; if (!once_++) fprintf(stderr, __VA_ARGS__); } while (0)
 
@@ -346,7 +389,7 @@ static id<MTLTexture> ms_texture(struct obj *o)
                                                                              mipmapped:NO];
     d.textureType = MTLTextureType2DMultisample;
     d.sampleCount = (NSUInteger)msaa;
-    d.usage = MTLTextureUsageRenderTarget;
+    d.usage = MTLTextureUsageRenderTarget | (is_depth_format(o->format) ? MTLTextureUsageShaderRead : 0);  // ao_run reads depth
     d.storageMode = MTLStorageModePrivate;
     id<MTLTexture> t = [mtl newTextureWithDescriptor:d];
     t.label = [NSString stringWithFormat:@"surface %ux%u fmt %u x%d", o->width, o->height, o->format, msaa];
@@ -932,6 +975,9 @@ static void ensure_device(void)
     deep_color = !(getenv("BL_DEEP_COLOR") && !strcmp(getenv("BL_DEEP_COLOR"), "0"));
     env_widescreen = !(getenv("BL_WIDESCREEN") && !strcmp(getenv("BL_WIDESCREEN"), "stretch"));
     if (msaa < 1 || ![mtl supportsTextureSampleCount:(NSUInteger)msaa]) msaa = 1;
+    ao_settings();
+    env_ao_radius = getenv("BL_AO_RADIUS") ? (float)atof(getenv("BL_AO_RADIUS")) : 48;
+    env_ao_strength = getenv("BL_AO_STRENGTH") ? (float)atof(getenv("BL_AO_STRENGTH")) : 1;
 }
 
 static id<MTLCommandBuffer> command_buffer(void)
@@ -1025,6 +1071,7 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
     }
     enc = [command_buffer() renderCommandEncoderWithDescriptor:d];
     enc_color = color, enc_depth = depth, enc_samples = samples;
+    if (ao_result && color && color == s->back_buffer) ao_apply(enc, target_texture(color), samples, depth != NULL);
     return enc;
 }
 
@@ -1061,9 +1108,12 @@ static int full_screen(void)
     return f && *f ? f[0] != '0' : !game_windowed;
 }
 
+static uint32_t game_window;
+
 void d3d_render_init(uint32_t window)
 {
     ensure_device();
+    game_window = window;
     if (getenv("BL_WINDOW")) {
         uint32_t w = resized_w ? resized_w : 1024, h = resized_h ? resized_h : 768;
         layer = bl_cocoa_open_window(w, h, "Vampire: The Masquerade – Bloodlines", window);
@@ -1139,6 +1189,9 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
     ensure_device();
     struct obj *rt = s->render_target[0], *ds = s->depth_stencil;
     if (!rt) return;
+    // A depth clear after a view (a sky box drawn first) starts over: the occlusion is
+    // for the view drawn after it.
+    if ((flags & 2) && ds && ao_state == 1) ao_state = 0;
     const uint32_t *vp = s->viewport;
     int full = count == 0 && vp[0] == 0 && vp[1] == 0 && vp[2] >= rt->width && vp[3] >= rt->height &&
                (!s->rs[174] || (s->scissor[0] == 0 && s->scissor[1] == 0 && s->scissor[2] >= rt->width &&
@@ -1327,6 +1380,278 @@ static void stretch_draw(id<MTLTexture> a, const uint32_t sr[4], id<MTLTexture> 
     [e endEncoding];
 }
 
+// --- ambient occlusion -------------------------------------------------------------------
+//
+// Ground-truth ambient occlusion (Jimenez et al. 2016, as in Intel's XeGTAO) from the
+// back buffer's depth, once the world is drawn and before the view model and HUD
+// (ao_before_draw). The depth is turned back into view-space positions with the world
+// view's projection, taken from its draws (ao_note_projection). Four passes, the first
+// three at half resolution: view depth from the depth buffer; the occlusion, 3 slices of
+// 8 steps a side whose angles and offsets follow a 4x4 pattern; a depth-aware 4x4 filter
+// that averages the pattern out; and, at full resolution, a depth-aware upsample that
+// multiplies the image by the result. BL_AO=1 turns it on, BL_AO=show shows the
+// occlusion alone; BL_AO_RADIUS (world units, default 48) and BL_AO_STRENGTH (default 1)
+// tune it.
+
+struct ao_params {
+    float full[2], half[2];  // back buffer and half-resolution sizes
+    float alpha, beta;       // depth d = alpha + beta / w
+    float p00, p11;          // projection scales in x and y
+    float radius, inv_radius2;
+    float max_px, strength;  // max_px: largest radius in half-resolution pixels
+};
+
+static NSString *const ao_source =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct AOP { float2 full, hsize; float alpha, beta, p00, p11, radius, inv_radius2, max_px, strength; };\n"
+     "struct V { float4 pos [[position]]; };\n"
+     "vertex V ao_vs(uint id [[vertex_id]]) {\n"
+     "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
+     "static float rd(depth2d_ms<float> t, uint2 p) { return t.read(p, 0); }\n"
+     "static float rd(depth2d<float> t, uint2 p) { return t.read(p); }\n"
+     // View depth, 0 for the sky (cleared depth) and anything not drawn.
+     "static float lin(constant AOP &a, float d) { return d >= 0.99999 || d <= 0.0 ? 0.0 : a.beta / (d - a.alpha); }\n"
+     "fragment float ao_depth_ms(V in [[stage_in]], depth2d_ms<float> dt [[texture(0)]], constant AOP &a [[buffer(0)]]) {\n"
+     "    uint2 p = min(uint2(in.pos.xy) * 2, uint2(a.full) - 1); return lin(a, rd(dt, p)); }\n"
+     "fragment float ao_depth(V in [[stage_in]], depth2d<float> dt [[texture(0)]], constant AOP &a [[buffer(0)]]) {\n"
+     "    uint2 p = min(uint2(in.pos.xy) * 2, uint2(a.full) - 1); return lin(a, rd(dt, p)); }\n"
+     "static float3 vpos(constant AOP &a, texture2d<float> zt, int2 p) {\n"
+     "    p = clamp(p, int2(0), int2(a.hsize) - 1);\n"
+     "    float w = zt.read(uint2(p)).x;\n"
+     "    if (w <= 0.0) w = 1e6;\n"
+     "    float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.hsize.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.hsize.y);\n"
+     "    return float3(ndc.x * w / a.p00, ndc.y * w / a.p11, w); }\n"
+     "constant float bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};\n"
+     "fragment float ao_main(V in [[stage_in]], texture2d<float> zt [[texture(0)]], constant AOP &a [[buffer(0)]]) {\n"
+     "    int2 p = int2(in.pos.xy);\n"
+     "    if (zt.read(uint2(p)).x <= 0.0) return 1.0;\n"
+     "    float3 P = vpos(a, zt, p);\n"
+     "    float3 l = vpos(a, zt, p - int2(1, 0)), r = vpos(a, zt, p + int2(1, 0));\n"
+     "    float3 u = vpos(a, zt, p - int2(0, 1)), b = vpos(a, zt, p + int2(0, 1));\n"
+     "    float3 dx = abs(r.z - P.z) < abs(P.z - l.z) ? r - P : P - l;\n"
+     "    float3 dy = abs(b.z - P.z) < abs(P.z - u.z) ? b - P : P - u;\n"
+     "    float3 V = normalize(-P);\n"
+     "    float3 N = normalize(cross(dx, dy));\n"
+     "    if (dot(N, V) < 0.0) N = -N;\n"
+     "    float rpx = min(a.radius * a.p00 * 0.5 * a.hsize.x / P.z, a.max_px);\n"
+     "    if (rpx < 1.0) return 1.0;\n"
+     "    float n0 = (bayer[(p.x & 3) + (p.y & 3) * 4] + 0.5) / 16.0;\n"
+     "    float n1 = (bayer[((p.x + 2) & 3) + ((p.y + 1) & 3) * 4] + 0.5) / 16.0;\n"
+     "    const int SLICES = 2, STEPS = 4;\n"
+     "    float vis = 0.0;\n"
+     "    for (int s = 0; s < SLICES; s++) {\n"
+     "        float phi = (float(s) + n0) * (M_PI_F / float(SLICES));\n"
+     "        float2 omega = float2(cos(phi), -sin(phi));\n"
+     "        float3 dir = float3(cos(phi), sin(phi), 0.0);\n"
+     "        float3 ortho = dir - dot(dir, V) * V;\n"
+     "        float3 axis = normalize(cross(dir, V));\n"
+     "        float3 pn = N - axis * dot(N, axis);\n"
+     "        float plen = length(pn);\n"
+     "        float cosn = saturate(dot(pn, V) / max(plen, 1e-4));\n"
+     "        float n = sign(dot(ortho, pn)) * acos(cosn);\n"
+     "        float low0 = cos(n + M_PI_2_F), low1 = cos(n - M_PI_2_F);\n"
+     "        float h0c = low0, h1c = low1;\n"
+     "        for (int k = 0; k < STEPS; k++) {\n"
+     "            float t = (float(k) + n1) / float(STEPS);\n"
+     "            float2 off = omega * max(t * t * rpx, float(k) * 0.5 + 1.0);\n"
+     "            int2 q0 = int2(float2(p) + 0.5 + off), q1 = int2(float2(p) + 0.5 - off);\n"
+     "            float3 S0 = vpos(a, zt, q0) - P, S1 = vpos(a, zt, q1) - P;\n"
+     "            float l0 = dot(S0, S0), l1 = dot(S1, S1);\n"
+     "            float c0 = dot(S0, V) * rsqrt(max(l0, 1e-6)), c1 = dot(S1, V) * rsqrt(max(l1, 1e-6));\n"
+     "            float w0 = saturate((1.0 - l0 * a.inv_radius2) * 2.5), w1 = saturate((1.0 - l1 * a.inv_radius2) * 2.5);\n"
+     "            h0c = max(h0c, mix(low0, c0, w0));\n"
+     "            h1c = max(h1c, mix(low1, c1, w1));\n"
+     "        }\n"
+     "        float h1 = n + clamp(acos(h0c) - n, -M_PI_2_F, M_PI_2_F);\n"
+     "        float h0 = n + clamp(-acos(h1c) - n, -M_PI_2_F, M_PI_2_F);\n"
+     "        float sn = sin(n);\n"
+     "        vis += plen * 0.25 * ((cosn + 2.0 * h0 * sn - cos(2.0 * h0 - n)) + (cosn + 2.0 * h1 * sn - cos(2.0 * h1 - n)));\n"
+     "    }\n"
+     "    return saturate(vis / float(SLICES)); }\n"
+     // Depth-aware 4x4 average: covers one tile of the pattern. Output: occlusion, depth.
+     "fragment float2 ao_blur(V in [[stage_in]], texture2d<float> ao [[texture(0)]], texture2d<float> zt [[texture(1)]],\n"
+     "                        constant AOP &a [[buffer(0)]]) {\n"
+     "    int2 p = int2(in.pos.xy), hs = int2(a.hsize) - 1;\n"
+     "    float z = zt.read(uint2(p)).x;\n"
+     "    if (z <= 0.0) return float2(1.0, 0.0);\n"
+     "    float sum = 0.0, wsum = 0.0;\n"
+     "    for (int j = -2; j < 2; j++)\n"
+     "        for (int i = -2; i < 2; i++) {\n"
+     "            uint2 q = uint2(clamp(p + int2(i, j), int2(0), hs));\n"
+     "            float w = exp(-abs(zt.read(q).x - z) * 20.0 / z);\n"
+     "            sum += ao.read(q).x * w, wsum += w;\n"
+     "        }\n"
+     "    return float2(sum / wsum, z); }\n"
+     // Full resolution, in the game's next pass on the back buffer: the filtered
+     // occlusion, upsampled.
+     "fragment float4 ao_apply(V in [[stage_in]], texture2d<float> ao [[texture(0)]], constant AOP &a [[buffer(0)]]) {\n"
+     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+     "    float o = mix(1.0, ao.sample(s, in.pos.xy / a.full).x, a.strength);\n"
+     "    return float4(o, o, o, 1.0); }\n";
+
+// kind 0: view depth (from the depth buffer, multisampled or not); 1: occlusion;
+// 2: filter; 3: multiply into the image; 4: show the occlusion alone. Kinds 3 and 4 draw
+// in the game's pass, with its depth attachment (`depth`).
+static id<MTLRenderPipelineState> ao_pipeline(int kind, int ms_depth, MTLPixelFormat color, int samples,
+                                              MTLPixelFormat depth)
+{
+    static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *cache;
+    static id<MTLLibrary> lib;
+    if (!cache) {
+        cache = [NSMutableDictionary new];
+        NSError *error = nil;
+        lib = [mtl newLibraryWithSource:ao_source options:nil error:&error];
+        if (!lib) bl_fatal("ambient occlusion shader: %s", error.localizedDescription.UTF8String);
+    }
+    NSString *key = [NSString stringWithFormat:@"%d/%d/%lu/%d/%lu", kind, ms_depth, (unsigned long)color, samples,
+                                               (unsigned long)depth];
+    id<MTLRenderPipelineState> p = cache[key];
+    if (p) return p;
+    static NSString *const names[] = {@"ao_depth", @"ao_main", @"ao_blur", @"ao_apply", @"ao_apply"};
+    NSString *fs = names[kind];
+    if (ms_depth && kind == 0) fs = [fs stringByAppendingString:@"_ms"];
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [lib newFunctionWithName:@"ao_vs"];
+    d.fragmentFunction = [lib newFunctionWithName:fs];
+    d.colorAttachments[0].pixelFormat = color;
+    d.rasterSampleCount = (NSUInteger)samples;
+    d.depthAttachmentPixelFormat = depth;
+    d.stencilAttachmentPixelFormat = depth;
+    if (kind == 3) {  // image *= occlusion; alpha kept
+        d.colorAttachments[0].blendingEnabled = YES;
+        d.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorZero;
+        d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorSourceColor;
+        d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+        d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+    }
+    NSError *error = nil;
+    p = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!p) bl_fatal("ambient occlusion pipeline: %s", error.localizedDescription.UTF8String);
+    cache[key] = p;
+    return p;
+}
+
+// Called for perspective draws of the world view to the back buffer: the first one after
+// the depth buffer was last cleared gives the projection (a sky box drawn before the
+// clear does not count). Draws of models carry the model transform in c8-c11 as well,
+// which leaves the depth terms alone and only changes the x/y scales by its scale.
+static void ao_note_projection(const float r8[4], const float r9[4], const float r10[4], const float r11[4], float clip_y)
+{
+    if (ao_state) return;
+    float ww = r11[0] * r11[0] + r11[1] * r11[1] + r11[2] * r11[2];
+    if (ww <= 0) return;
+    // z = alpha w + beta, with w the view depth: the z row is alpha times the w row plus
+    // a constant. Dividing the x and y rows by the w row's length cancels a model scale.
+    float alpha = (r10[0] * r11[0] + r10[1] * r11[1] + r10[2] * r11[2]) / ww;
+    float lw = sqrtf(ww);
+    ao_proj.alpha = alpha;
+    ao_proj.beta = r10[3] - alpha * r11[3];
+    ao_proj.p00 = sqrtf(r8[0] * r8[0] + r8[1] * r8[1] + r8[2] * r8[2]) / lw;
+    ao_proj.p11 = sqrtf(r9[0] * r9[0] + r9[1] * r9[1] + r9[2] * r9[2]) / lw * clip_y;
+    if (ao_proj.beta != 0 && ao_proj.p00 > 0 && ao_proj.p11 > 0) ao_state = 1;
+}
+
+// A half-resolution texture for ao_run, kept between frames.
+static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h)
+{
+    static id<MTLTexture> t[3];
+    if (!t[i] || t[i].width != w || t[i].height != h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h
+                                                                                 mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        t[i] = [mtl newTextureWithDescriptor:td];
+    }
+    return t[i];
+}
+
+// One full-screen pass of ao_pipeline `kind` into `target`.
+static void ao_pass(int kind, int ms_depth, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTexture> t1,
+                    const struct ao_params *a)
+{
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = target;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:ao_pipeline(kind, ms_depth, target.pixelFormat, 1, MTLPixelFormatInvalid)];
+    [e setFragmentTexture:t0 atIndex:0];
+    [e setFragmentTexture:t1 atIndex:1];
+    [e setFragmentBytes:a length:sizeof *a atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+}
+
+// ao_result's parameters: the occlusion of the frame's world view is multiplied into
+// the back buffer at the start of the game's next pass on it (ao_apply).
+static struct ao_params ao_result_params;
+
+static void ao_run(struct d3d_state *s)
+{
+    ao_state = 2;
+    LOG_ONCE("[metal] ambient occlusion: depth %g + %g / w, scales %g %g\n", ao_proj.alpha, ao_proj.beta, ao_proj.p00,
+             ao_proj.p11);
+    struct obj *bb = s->back_buffer, *ds = s->depth_stencil;
+    if (!bb || !ds || clear_color_target == bb || clear_depth_target == ds) return;
+    int samples = multisampled(bb) ? msaa : 1;
+    if (multisampled(ds) != (samples > 1)) return;
+    end_pass();
+    id<MTLTexture> color = target_texture(bb);
+    id<MTLTexture> depth = samples > 1 ? ms_texture(ds) : target_texture(ds);
+    if (depth.width != color.width || depth.height != color.height) return;
+    NSUInteger hw = (color.width + 1) / 2, hh = (color.height + 1) / 2;
+    id<MTLTexture> z = ao_texture(0, MTLPixelFormatR32Float, hw, hh);
+    id<MTLTexture> raw = ao_texture(1, MTLPixelFormatR16Float, hw, hh);
+    id<MTLTexture> soft = ao_texture(2, MTLPixelFormatRG32Float, hw, hh);
+    struct ao_params a = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, ao_proj.alpha,
+                          ao_proj.beta, ao_proj.p00, ao_proj.p11, env_ao_radius,
+                          1 / (env_ao_radius * env_ao_radius), 0.2f * (float)hh, env_ao_strength};
+    ao_pass(0, samples > 1, z, depth, nil, &a);
+    ao_pass(1, 0, raw, z, nil, &a);
+    ao_pass(2, 0, soft, raw, z, &a);
+    ao_result = soft, ao_result_params = a;
+}
+
+// Called by pass() for a new pass on the back buffer.
+static void ao_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth)
+{
+    MTLPixelFormat df = has_depth ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
+    [e setRenderPipelineState:ao_pipeline(env_ao_show ? 4 : 3, 0, color.pixelFormat, samples, df)];
+    static id<MTLDepthStencilState> none;
+    if (!none) none = [mtl newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
+    [e setDepthStencilState:none];
+    [e setCullMode:MTLCullModeNone];
+    [e setViewport:(MTLViewport){0, 0, color.width, color.height, 0, 1}];
+    [e setScissorRect:(MTLScissorRect){0, 0, color.width, color.height}];
+    [e setFragmentTexture:ao_result atIndex:0];
+    [e setFragmentBytes:&ao_result_params length:sizeof ao_result_params atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    ao_result = nil;
+}
+
+// Before a draw to the back buffer: once the world view is drawn, the first draw of the
+// view model (drawn with a narrowed depth range) or of the 2D HUD runs the occlusion.
+static void ao_before_draw(struct d3d_state *s, const struct element *el, int nel)
+{
+    if (ao_state != 1 || s->render_target[0] != s->back_buffer) return;
+    int end = u2f(s->viewport[5]) < 0.99f;
+    if (!end) {
+        int perspective;
+        if (s->vs) {
+            const uint32_t *w = s->vs_f[11];
+            perspective = w[0] || w[1] || w[2] || u2f(w[3]) != 1;
+        } else {
+            int pretransformed = 0;
+            for (int i = 0; i < nel; i++) pretransformed |= el[i].usage == 9;  // POSITIONT
+            const float *p = (const float *)s->transform[3];
+            perspective = !pretransformed && (p[3] != 0 || p[7] != 0 || p[11] != 0 || p[15] != 1);
+        }
+        end = !perspective;
+    }
+    if (end) ao_run(s);
+}
+
 // --- draws -------------------------------------------------------------------------
 
 static uint32_t index_count(uint32_t type, uint32_t prims)
@@ -1406,11 +1731,11 @@ static void log_draw(struct d3d_state *s, const char *what, uint32_t type, uint3
 {
     if (!draw_stats || (long)frames < draw_stats_frame || (long)frames >= draw_stats_frame + draw_stats_count) return;
     struct obj *t = s->texture[0];
-    fprintf(stderr, "[%s] #%lu type %u prims %u vs %d ps %d fvf 0x%x rt %ux%u vp %u,%u %ux%u tex0 %ux%u fmt %u blend %u z %u\n",
+    fprintf(stderr, "[%s] #%lu type %u prims %u vs %d ps %d fvf 0x%x rt %ux%u vp %u,%u %ux%u z %g-%g tex0 %ux%u fmt %u blend %u z %u/%u\n",
             what, draws, type, count, s->vs != NULL, s->ps != NULL, s->fvf,
             s->render_target[0] ? s->render_target[0]->width : 0, s->render_target[0] ? s->render_target[0]->height : 0,
-            s->viewport[0], s->viewport[1], s->viewport[2], s->viewport[3], t ? t->width : 0, t ? t->height : 0,
-            t ? t->format : 0, s->rs[27], s->rs[7]);
+            s->viewport[0], s->viewport[1], s->viewport[2], s->viewport[3], u2f(s->viewport[4]), u2f(s->viewport[5]),
+            t ? t->width : 0, t ? t->height : 0, t ? t->format : 0, s->rs[27], s->rs[7], s->rs[14]);
 }
 
 // Everything a draw needs except vertex and index data; returns 0 if it cannot draw.
@@ -1555,6 +1880,11 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         }
         if (proj > 0 && aspect > proj * 1.01f) vp.clip_y = aspect / proj;
     }
+    if (env_ao && perspective && to_back_buffer && fabsf(w_row[3]) > 1e-4f && s->viewport[2] == rtt.width &&
+        s->viewport[3] == rtt.height && u2f(s->viewport[4]) == 0 && u2f(s->viewport[5]) >= 0.99f) {
+        const float(*r)[4] = vs->ff_vertex ? vc : vc + 8;
+        ao_note_projection(r[0], r[1], r[2], r[3], vp.clip_y);
+    }
     set_viewport(s, e, (uint32_t)rtt.width, (uint32_t)rtt.height, squeeze);
     [e setVertexBytes:&vp length:sizeof vp atIndex:21];
 
@@ -1643,6 +1973,7 @@ void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
     if (!s->render_target[0] || !count) return;
     struct element el[64];
     int nel = vertex_elements(s, el, 64);
+    ao_before_draw(s, el, nel);
     id<MTLRenderCommandEncoder> e = pass(s);
     struct pipe_key k;
     if (!setup_draw(s, e, type, el, nel, &k)) return;
@@ -1807,6 +2138,7 @@ void d3d_render_draw_up(struct d3d_state *s, uint32_t type, uint32_t min_index, 
     if (!s->render_target[0] || !count || !stride) return;
     struct element el[64];
     int nel = vertex_elements(s, el, 64);
+    ao_before_draw(s, el, nel);
     id<MTLRenderCommandEncoder> e = pass(s);
     struct pipe_key k;
     // UP draws read stream 0 with the given stride.
@@ -1914,8 +2246,16 @@ void d3d_render_read_back(struct obj *rt)
 static void next_frame(void)
 {
     __block dispatch_semaphore_t sem = in_flight;
+    static int gpu_stats = -1;
+    if (gpu_stats < 0) gpu_stats = getenv("BL_GPU_STATS") != NULL;
+    int stats = gpu_stats;
     [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer> b) {
-      (void)b;
+      if (stats) {  // BL_GPU_STATS=1: mean GPU time per frame, every 100 frames
+          static double sum;
+          static int n;
+          sum += b.GPUEndTime - b.GPUStartTime;
+          if (++n == 100) fprintf(stderr, "[gpu] %.2f ms a frame\n", sum * 10), sum = 0, n = 0;
+      }
       dispatch_semaphore_signal(sem);
     }];
     [cmd commit];
@@ -2020,8 +2360,15 @@ static void menu_bars(id<MTLTexture> t, float squeeze)
 void d3d_render_present(struct d3d_state *s)
 {
     ensure_device();
+    bl_vgui_poll();  // the options' check box
+    if (ao_state == 1) {  // a frame with no view model or HUD
+        ao_run(s);
+        if (ao_result && s->render_target[0] == s->back_buffer) pass(s);
+    }
+    ao_state = 0, ao_result = nil;
     flush_clears(s);
     frames++;
+    bl_cocoa_script_input(frames, game_window);
     struct obj *bb = s->back_buffer;
     id<MTLTexture> back = bb ? target_texture(bb) : nil;
     if (back && frame_squeeze < 1) menu_bars(back, frame_squeeze);
