@@ -155,7 +155,8 @@ static void start_output(void)
 {
     if (started) return;
     started = 1;
-    if (getenv("BL_WINDOW") || (getenv("BL_AUDIO") && atoi(getenv("BL_AUDIO")))) {
+    // Audio plays in a window by default; BL_AUDIO=0 mutes it there, BL_AUDIO=1 enables it headless.
+    if (getenv("BL_AUDIO") ? atoi(getenv("BL_AUDIO")) != 0 : getenv("BL_WINDOW") != NULL) {
         AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput,
                                        kAudioUnitManufacturer_Apple, 0, 0};
         AudioComponent c = AudioComponentFindNext(NULL, &d);

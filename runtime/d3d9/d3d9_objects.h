@@ -38,6 +38,8 @@ struct obj {
     int ms_stale;              // gpu was written without going through gpu_ms
     void *sound;               // DirectSound buffer state (dsound.c)
     int dirty;                 // guest memory changed since the last upload
+    int rewrites;              // static vertex buffers: times rewritten after first use
+    int used;                  // textures: bound for a draw since the last upload
 };
 
 struct obj *obj_new(enum obj_type type, uint32_t vtbl);

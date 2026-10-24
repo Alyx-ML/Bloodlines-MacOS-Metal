@@ -265,6 +265,24 @@ static id<MTLTexture> texture_of(struct obj *tex)
         if (!rt)
             for (uint32_t i = 0; i < tex->nsubs; i++) tex->subs[i]->dirty = 1;
     }
+    if (tex->dirty && !rt && tex->used) {
+        // Rewritten after draws used it, which may still be encoded in this frame or running
+        // on the GPU: those keep the old texture (command buffers retain it) and the new
+        // contents go to a new one. The main menu's particle systems share a few textures
+        // and rewrite them between draws within a frame; uploading in place showed every
+        // system the last image written.
+        MTLTextureDescriptor *d = [MTLTextureDescriptor new];
+        d.textureType = t.textureType, d.pixelFormat = t.pixelFormat;
+        d.width = t.width, d.height = t.height, d.depth = t.depth, d.mipmapLevelCount = t.mipmapLevelCount;
+        d.usage = t.usage, d.storageMode = t.storageMode, d.swizzle = t.swizzle;
+        id<MTLTexture> n = [mtl newTextureWithDescriptor:d];
+        if (n) {
+            CFRelease(tex->gpu);
+            tex->gpu = (__bridge_retained void *)n;
+            t = n;
+            for (uint32_t i = 0; i < tex->nsubs; i++) tex->subs[i]->dirty = 1;
+        }
+    }
     if (tex->dirty && !rt) {
         uint32_t faces = tex->type == OBJ_CUBETEXTURE ? 6 : 1;
         for (uint32_t f = 0; f < faces; f++)
@@ -274,6 +292,7 @@ static id<MTLTexture> texture_of(struct obj *tex)
             }
         tex->dirty = 0;
     }
+    tex->used = 1;
     return t;
 }
 
@@ -1345,16 +1364,22 @@ static struct stream_src stream_data(struct obj *vb, uint32_t offset, uint32_t s
 {
     struct stream_src r = {nil, 0, stride};
     if (!vb) return r;
-    int dynamic = (vb->usage & 0x200) != 0;  // D3DUSAGE_DYNAMIC
+    // A static buffer rewritten after draws used it must not change under those draws:
+    // they may still be encoded in this frame or running on the GPU (the window keeps
+    // up to FRAMES_IN_FLIGHT frames queued). Each rewrite gets a new MTLBuffer, and a
+    // buffer rewritten often is copied per draw from then on, like D3DUSAGE_DYNAMIC ones.
+    if (vb->dirty && vb->gpu && !(vb->usage & 0x200) && vb->rewrites < 8) {
+        CFRelease(vb->gpu);
+        vb->gpu = NULL;
+        vb->rewrites++;
+    }
+    int dynamic = (vb->usage & 0x200) != 0 || vb->rewrites >= 8;  // D3DUSAGE_DYNAMIC
     if (!dynamic) {
         id<MTLBuffer> b = (__bridge id<MTLBuffer>)vb->gpu;
         if (!b) {
             b = [mtl newBufferWithBytes:bl_g2h(vb->mem) length:vb->size ? vb->size : 4
                                 options:MTLResourceStorageModeShared];
             vb->gpu = (__bridge_retained void *)b;
-            vb->dirty = 0;
-        } else if (vb->dirty) {
-            memcpy(b.contents, bl_g2h(vb->mem), vb->size);
             vb->dirty = 0;
         }
         r.buf = b, r.offset = offset;

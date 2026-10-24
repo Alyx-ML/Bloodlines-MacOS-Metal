@@ -1198,3 +1198,32 @@ the guest backtrace, so the next hang shows what the main thread is waiting for.
 
 **Menu flicker.** Not reproduced headless. Consecutive menu frames differ only where
 the particles move. It needs a description from the user.
+
+### Main menu particle flicker (2026-10-24)
+**Cause.** The menu's smoke and fire are five fixed-function particle draws per frame,
+blended ONE / INVSRCALPHA. The game shares a few 256x256 textures between those particle
+systems and rewrites them with LockRect between draws, within a frame: one texture object
+was drawn twice in frame 320 with different contents. `texture_of` uploaded into the same
+MTLTexture in place, so every draw in the command buffer saw the last image written, and
+which system got the wrong image changed from frame to frame. That gave the sharp-edged
+shards and the frame-to-frame flashing. The vertex data was correct (I dumped it over four
+frames: square quads, smooth motion, valid index ranges, nothing behind the near plane).
+The earlier "not reproduced headless" was wrong: headless flickers too. My first metric
+compared runs that caught different phases of the menu animation.
+
+**Fix.** A texture rewritten after a draw has bound it gets a new MTLTexture with all
+levels uploaded. Command buffers retain the old one, so draws already encoded keep their
+image. Static vertex buffers rewritten after use get the same treatment (a new MTLBuffer;
+after 8 rewrites they are copied per draw like dynamic ones). That case is the same bug
+class, but it is not what caused this flicker.
+
+**Muting test runs.** A window used to turn audio on regardless of `BL_AUDIO`. Now an
+explicit `BL_AUDIO=0` mutes a window run and `BL_AUDIO=1` enables headless audio. All my
+test runs pass `BL_AUDIO=0`.
+
+- Verified: brightness of the lower menu band, frames 300-339. Before the fix, most runs
+  had a mean frame-to-frame jitter of 5-23, with alternating values (113, 77, 108, 74).
+  After it, three headless and two window runs gave 0.1 each. The frames show soft smoke
+  and fire with no shards. A 900-frame run into `sm_hub_1` renders normally.
+- Not verified: the user's own view of the menu in the window, and whether the extra
+  texture allocations cost frame time in busy scenes.
