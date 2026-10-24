@@ -140,7 +140,7 @@ void d3d_alloc_image(struct obj *o, uint32_t w, uint32_t h, uint32_t d)
     }
     o->size = o->slice * o->depth;
     o->mem = bl_guest_calloc(1, o->size);
-    if (!o->mem) bl_fatal("out of guest memory for a %ux%ux%u image", o->width, o->height, o->depth);
+    if (!o->mem) bl_fatal("out of guest memory for a %ux%ux%u image (format %u, %u bytes)", o->width, o->height, o->depth, o->format, o->size);
 }
 
 // --- IDirect3DResource9 / IDirect3DBaseTexture9 --------------------------------

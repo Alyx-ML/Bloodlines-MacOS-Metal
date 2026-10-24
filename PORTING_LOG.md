@@ -1042,3 +1042,83 @@ Not changed. GameUI and the HUD draw text with bitmap fonts, not GDI: the game c
 one GDI font (Arial, -15) at both 1024x768 and 1920x1200. Larger dialogue text would
 need a change to how the game's 2D code draws those fonts. `BL_FONT_TRACE=1` (new)
 logs GDI font requests.
+
+## 2026-10-24 — Unofficial Patch 12.0
+
+The player's copy had Unofficial Patch 11.1. The 12.0 installer
+(`VTMBup120.6.exe`, SHA-256 `e3bf44aa…f734`) is an Inno Setup 5.6 package, so it was
+unpacked with `innoextract` into a temporary folder instead of being run. Nothing from it
+was executed.
+
+Installed into the game folder:
+- `Unofficial_Patch/` replaced as a whole (the readme says to remove the old folder).
+- `Bin/`: engine, launcher, shaderapidx9, vampire_python21 (changed), vguimatsurface and
+  binkw32 (same as before).
+- `Vampire/`: cl_dlls/client.dll, cl_dlls/GameUI.dll, dlls/vampire.dll, pack102/103.vpk,
+  and 103 files under maps/ and python/.
+- `Loader.exe`, `Bin/loader/`, `Version.inf`, `VTMBup-readme.txt`.
+- Not installed: `Patch_Extras/` (dgVoodoo, ENB, ReShade, tools) and the `.12` files,
+  which are the stock 1.2 files from 2004 that the installer keeps for older retail copies.
+
+The 11.1 files that were replaced are in `UP11.1_backup/` beside the game.
+
+What changed in the code: every changed DLL keeps its size, so these are byte patches
+and no addresses move.
+
+| Module | Bytes patched in .text | Other |
+| --- | --- | --- |
+| engine | 106 in 22 places | .rdata, .data |
+| GameUI | 290 in 5 places | .rdata, most of .reloc |
+| shaderapidx9 | 43 | .data |
+| client | 28 | .data |
+| vampire | 1 | .data |
+| launcher | none | 11 bytes of .rdata |
+| vampire_python21 | none | .rdata, .data |
+
+None of the patches touch the one hand-replaced routine (GameUI `loc_10029250`,
+`bl_vgui_GetCursorLine`), and the runtime has no hard-coded addresses in these modules.
+Data sections are built into the translated objects, so all seven modules need a full
+re-translation, not just a relink.
+
+`modules/hashes.txt` now pins the 12.0 hashes as well as the old ones, and
+`rebuild_all.sh` takes the first version listed that it finds (12.0 first). A dry run
+picked the 12.0 file for each of the seven modules.
+
+Not covered: the 12.0 Game Mod Loader. `Bin/loader/*.vtm` are Windows DLLs that
+`Loader.exe` injects into the game, each with its own fixes (Griffith frenzy werewolf,
+history stat reset, subtitle and console pause, Protean, and the vtmb-tweaks options
+such as corpses not despawning). The port starts the game without the loader, so those
+fixes are missing until the .vtm modules are translated and loaded.
+
+Also noted: the old `Unofficial_Patch/` held a 299 KB file named `nul` written on
+2026-10-23, so a guest write to the Windows `NUL` device created a real file.
+
+### 12.0 rebuild (2026-10-24)
+All seven modules re-translated with no SRW errors: launcher 2 s, vampire_python21 36 s,
+shaderapidx9 16 s, GameUI 12 s, client 100 s, engine 147 s, vampire 525 s.
+
+The first boot stopped before the menu with "out of guest memory for a 256x256x1 image".
+The cause is the texture memory estimate in shaderapidx9 (0x2A026250):
+- 11.1 had patched it to return 0x7F000000 straight away.
+- 12.0 undoes that. With no `Bin/vidcfg.bin` cache, it creates 256x256 R5G6B5 textures
+  until CreateTexture fails, then frees them and caches the count.
+- Our CreateTexture does not fail, so about 10,000 textures used up the 1.6 GB guest
+  heap. Making it fail would not be enough, because freed guest blocks stay in their size
+  class, so the measurement would still leave the heap unusable for anything else.
+
+The routine is now replaced by `bl_shaderapi_TextureMemory`. It returns 0x7F000000 as
+11.1 did, or 64 MiB when the second argument is 2 as 12.0 does, and it does not write
+`vidcfg.bin`.
+
+`BL_HEAP_TRACE=1` now also logs:
+- a count every 1000 blocks of a size class of 4 KiB or more, and every 20000 below that;
+- requests of 64 MiB or more;
+- the arena state when the heap is full.
+
+Verified: headless `-game Unofficial_Patch -window +map sm_hub_1`, 1500 frames, exit 0,
+no traps. Frame 1400 shows the hub with the HUD.
+
+Not verified:
+- Play in the window, and whether old 11.1 saves load.
+- Any of the 12.0 fixes themselves in play.
+- The menu and character creation under 12.0.

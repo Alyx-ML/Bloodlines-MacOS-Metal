@@ -13,11 +13,17 @@ MODULES="$*"
 [ -n "$MODULES" ] || MODULES="$(grep -v '^#' "$HERE/modules/modules.txt")"
 mkdir -p "$HERE/build/logs"
 for m in $MODULES; do
-    want="$(awk -v m="$m" '$2 == m { print $1 }' "$HERE/modules/hashes.txt")"
-    src=""
+    # A module may have several pinned versions; take the first one listed that is present.
+    found=""
     for f in $(find "$GAME" -path "$HERE" -prune -o \( -iname "$m.dll" -o -iname "$m.asi" \) -print | tr ' ' '\001'); do
         f="$(printf '%s' "$f" | tr '\001' ' ')"
-        [ "$(shasum -a 256 "$f" | cut -d' ' -f1)" = "$want" ] && { src="$f"; break; }
+        found="$found$(shasum -a 256 "$f" | cut -d' ' -f1) $f
+"
+    done
+    src=""
+    for want in $(awk -v m="$m" '$2 == m { print $1 }' "$HERE/modules/hashes.txt"); do
+        src="$(printf '%s' "$found" | awk -v h="$want" '$1 == h { sub(/^[^ ]* /, ""); print; exit }')"
+        [ -n "$src" ] && break
     done
     if [ -z "$src" ]; then echo "$m: no DLL with the pinned hash under $GAME"; exit 1; fi
     start=$(date +%s)

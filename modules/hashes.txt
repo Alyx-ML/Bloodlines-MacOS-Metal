@@ -1,4 +1,13 @@
-# SHA-256 of each supported game module (GOG release). recompile_module.sh refuses other files.
+# SHA-256 of each supported game module (GOG release, Unofficial Patch 11.1 and 12.0). recompile_module.sh refuses other files.
+# Unofficial Patch 12.0 (listed first, so rebuild_all.sh prefers it when both are present)
+9d00b2c1e5edbad052fb0b514634ba54574666e12d1b408c46ce141d51ed2313  engine
+3dda6800ce90f3392d507f116ac854b54e3cff856b84f817b395a95d4c750e00  launcher
+b939d0469e1e7b09a53fd8ea0d84b218042e1cf64f62db58a56ff2a5bb924c7b  shaderapidx9
+2ce854ddd5191721f38ccbe6c19988655632c5c9a79fdfef03a4cd8f49b04645  vampire_python21
+5616e95e4906ec4757ae5b40b5e757b7c1fe133ba59d29ab4ee2554481855fe5  GameUI
+e88beae0dd03af06493c71c5e8d87a6993b54e590cb6ad37cd3513c588582870  client
+c546f4de2003624d72f54d03805e0dbe1d8157231adcc62368ff53fe6e48a76f  vampire
+# Original GOG files, and Unofficial Patch 11.1 for the modules 12.0 replaces
 8aaf9e851021d1afab9e2b93c9e796d37dd31c114a76476e6c00bd8931ee9446  zlib1
 0ae990d9f49a1fb67192700440b967d90113e9f811eb0e1937dc6faa52ea0cfb  tier0
 75778ca72bcaca98f9606aab087b5aee3171a6749a96e7789d7598e9f9825f32  vstdlib

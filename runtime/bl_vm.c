@@ -129,6 +129,11 @@ static void bl_guest_free_unlocked(uint32_t addr);
 static uint32_t bl_guest_malloc_unlocked(uint32_t size)
 {
     unsigned s = size_class(size);
+    if (size >= (64u << 20) && getenv("BL_HEAP_TRACE")) {
+        uint64_t used = heap_bump - arenas[cur_arena].base;
+        for (int i = 0; i < cur_arena; i++) used += arenas[i].end - arenas[i].base;
+        fprintf(stderr, "[heap] asked for %u MiB, %llu MiB used\n", size >> 20, (unsigned long long)(used >> 20));
+    }
     if (s >= NCLASSES) return 0;
     uint8_t *block;
     if (free_lists[s]) {
@@ -137,12 +142,20 @@ static uint32_t bl_guest_malloc_unlocked(uint32_t size)
     } else {
         uint64_t len = class_len(s);
         while ((uint64_t)(arenas[cur_arena].end - heap_bump) < len) {
-            if (cur_arena + 1 >= narenas) return 0;
+            if (cur_arena + 1 >= narenas) {
+                if (getenv("BL_HEAP_TRACE"))
+                    fprintf(stderr, "[heap] full asking %u: arena %d of %d, bump %p, end %p, base %p\n", size, cur_arena, narenas,
+                            (void *)heap_bump, (void *)arenas[cur_arena].end, (void *)arenas[cur_arena].base);
+                return 0;
+            }
             heap_bump = arenas[++cur_arena].base;
         }
         block = heap_bump;
         heap_bump += len;
     }
+    static uint32_t class_count[NCLASSES];
+    if (++class_count[s] % (class_len(s) >= 4096 ? 1000 : 20000) == 0 && getenv("BL_HEAP_TRACE"))
+        fprintf(stderr, "[heap] %u blocks of %u bytes (last asked %u)\n", class_count[s], (unsigned)class_len(s), size);
     *(uint32_t *)block = s;
     *(uint32_t *)(block + 4) = 0;
     *(uint32_t *)(block + 8) = size;

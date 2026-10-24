@@ -19,3 +19,9 @@ Write hand-made fixes here; the pipeline generates the rest.
 - `0x10029250` vgui `RichText::GetCursorLine` (63 bytes), replaced by
   `bl_vgui_GetCursorLine`: a binary search over the line-break table instead of a
   linear scan, which made the `-dev` console O(n²).
+
+## shaderapidx9
+- `0x2A026250` the texture memory estimate (481 bytes), replaced by
+  `bl_shaderapi_TextureMemory` (`runtime/bl_shaderapi.c`, `runtime/llasm/shaderapi.llasm`).
+  Unofficial Patch 12.0 restored the measurement that creates 256x256 textures until
+  one fails; here that uses up the guest heap, so it returns 11.1's fixed answer.

@@ -1,0 +1,10 @@
+;; Entry points for native replacements of shaderapidx9 routines (runtime/bl_shaderapi.c).
+include llasm.llinc
+include asm-calls.llinc
+
+funcv bl_shaderapi_TextureMemory_c $
+
+proc bl_shaderapi_TextureMemory public
+        call bl_shaderapi_TextureMemory_c $
+        Call_Asm_Return 0
+endp
