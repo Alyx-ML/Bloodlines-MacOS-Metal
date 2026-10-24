@@ -140,6 +140,7 @@ static uint32_t lock_rect(struct obj *s, uint32_t locked, uint32_t rect)
 }
 
 void d3d_image_changed(struct obj *s);  // renderer: re-upload on unlock
+void d3d_render_shader_created(struct obj *s);  // renderer: start compiling it
 
 static void report_trap(struct obj *s)
 {
@@ -458,6 +459,7 @@ uint32_t d3d_create_shader(enum obj_type type, uint32_t code, uint32_t out)
         FILE *f = fopen(path, "wb");
         if (f) fwrite(bl_g2h(s->mem), 1, s->size, f), fclose(f);
     }
+    d3d_render_shader_created(s);
     put_out(out, s);
     return D3D_OK;
 }

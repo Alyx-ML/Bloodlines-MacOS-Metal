@@ -63,6 +63,7 @@ Options (environment variables):
 | `BL_MSAA=n` | multisampling, default 2, 1 = off |
 | `BL_ANISO=n` | anisotropic filtering, default 16, 1 = off |
 | `BL_FPS_MAX=n` | frame cap, default 60 (the game's physics expect it) |
+| `BL_SHADER_EARLY=0` | compile shaders only when a draw first needs them; by default they compile in the background when the game creates them |
 | `BL_DEEP_COLOR=0` | 8-bit back buffer and window; by default the back buffer is 16-bit and the window 10-bit |
 | `BL_PACING=0` | plain presents; by default each frame is held for whole refreshes when the screen rate is a multiple of the cap (120 Hz ProMotion) |
 | `BL_PACING_STATS=1` | log how many refreshes apart frames reach the screen |

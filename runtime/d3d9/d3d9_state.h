@@ -51,3 +51,4 @@ void d3d_render_read_back(struct obj *render_target);  // GPU contents into gues
 void d3d_image_changed(struct obj *surface);            // guest memory written (unlock)
 void d3d_buffer_changed(struct obj *buffer);
 void d3d_render_free(struct obj *o);                    // object destroyed: drop its GPU copy
+void d3d_render_shader_created(struct obj *shader);     // start compiling it in the background

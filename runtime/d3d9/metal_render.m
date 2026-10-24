@@ -23,6 +23,8 @@
 //   BL_SHADOW_SHOW=1         draw shadow receivers opaque instead of darkening
 //   BL_FPS_MAX=n             with a window, present at most n frames a second (default 60, 0 = no cap)
 //   BL_MOVIE_DUMP=1          write frame 60 of each GDI-drawn movie to BL_DUMP_DIR
+//   BL_SHADER_EARLY=0        compile shaders only when a draw first needs them
+//   BL_SHADER_STATS=1        log frames that wait for shader or pipeline builds
 //   BL_DEEP_COLOR=0          8-bit back buffer and window (default: 16-bit back buffer, 10-bit window)
 //   BL_PACING=0              plain presents, even on screens whose refresh is a multiple of the cap
 //   BL_PACING_STATS=1        log how many refreshes apart frames reach the screen
@@ -36,6 +38,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <math.h>
+#include <stdatomic.h>
 #include <os/lock.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -344,6 +347,12 @@ struct element { uint16_t stream, offset; uint8_t type, method, usage, index; };
     int ff_vertex;
     uint64_t serial;
     NSMutableDictionary<NSData *, id> *variants;  // id<MTLFunction>, or NSNull for a shader that failed
+    // Background compile of the likely variant, started when the game creates the
+    // shader (d3d_render_shader_created); shader_function waits for it.
+    dispatch_group_t early;
+    struct d3d_shader_variant early_variant;
+    id early_function;  // id<MTLFunction> or NSNull, written by the background block
+    _Atomic int early_state;  // 0 queued, 1 compiling in the background, 2 taken by a draw
 }
 @end
 @implementation BLShader
@@ -444,37 +453,105 @@ static void mat_mul(const float *a, const float *b, float *out)
         }
 }
 
-static id<MTLFunction> shader_function(BLShader *sh, const struct d3d_shader_variant *v)
+// BL_SHADER_STATS=1: time spent building shaders and pipelines during draws, per frame.
+static int env_shader_stats;
+static uint64_t build_ns[2], build_count[2], frame_build_ns;  // [0] shaders, [1] pipelines
+static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+// Translates and compiles one variant: an MTLFunction, or NSNull (logged) when the
+// shader does not translate or compile. Thread-safe; `code` is the shader's bytecode
+// (NULL for the fixed-function stages in sh).
+static id compile_variant(BLShader *sh, const uint32_t *code, const struct d3d_shader_variant *v)
 {
-    NSData *key = [NSData dataWithBytes:v length:sizeof *v];
-    id f = sh->variants[key];
-    if (f) return f == [NSNull null] ? nil : f;
-    // A shader that does not translate or compile is logged once and its draws are
-    // skipped (NSNull in the cache), so one bad shader does not end the game.
     char err[256];
-    char *msl = sh->code ? d3d_shader_msl(sh->code, v, err, sizeof err)
+    char *msl = code ? d3d_shader_msl(code, v, err, sizeof err)
                 : sh->ff_vertex ? d3d_ff_vs_msl(&sh->ffv, err, sizeof err) : d3d_ff_ps_msl(&sh->ff, v, err, sizeof err);
     if (!msl) {
         fprintf(stderr, "[metal] shader %lu does not translate: %s\n", (unsigned long)sh->serial, err);
-        sh->variants[key] = [NSNull null];
-        return nil;
+        return [NSNull null];
     }
     NSError *error = nil;
     MTLCompileOptions *opt = [MTLCompileOptions new];
     if (@available(macOS 15.0, *)) opt.mathMode = MTLMathModeSafe;
     else opt.fastMathEnabled = NO;
-    id<MTLLibrary> lib = [mtl newLibraryWithSource:[NSString stringWithUTF8String:msl] options:opt error:&error];
+    NSString *source = [NSString stringWithUTF8String:msl];
+    // BL_SHADER_SALT=x changes every source, so macOS's own shader cache misses: a
+    // first launch, for measuring.
+    if (getenv("BL_SHADER_SALT")) source = [NSString stringWithFormat:@"// %s\n%@", getenv("BL_SHADER_SALT"), source];
+    id<MTLLibrary> lib = [mtl newLibraryWithSource:source options:opt error:&error];
     if (!lib) {
         fprintf(stderr, "[metal] shader %lu does not compile, its draws are skipped: %s\n%s\n",
                 (unsigned long)sh->serial, error.localizedDescription.UTF8String, msl);
         free(msl);
-        sh->variants[key] = [NSNull null];
-        return nil;
+        return [NSNull null];
     }
     free(msl);
-    f = [lib newFunctionWithName:@"bl_main"];
-    sh->variants[key] = f;
-    return f;
+    return [lib newFunctionWithName:@"bl_main"];
+}
+
+// A shader that does not translate or compile is logged once and its draws are
+// skipped (NSNull in the cache), so one bad shader does not end the game.
+static id<MTLFunction> shader_function(BLShader *sh, const struct d3d_shader_variant *v)
+{
+    NSData *key = [NSData dataWithBytes:v length:sizeof *v];
+    id f = sh->variants[key];
+    if (f) return f == [NSNull null] ? nil : f;
+    uint64_t t0 = now_ns();
+    if (sh->early) {
+        // Still queued behind other shaders: compile it here instead of waiting. Already
+        // compiling: wait for it.
+        int queued = 0;
+        if (!atomic_compare_exchange_strong(&sh->early_state, &queued, 2)) {
+            dispatch_group_wait(sh->early, DISPATCH_TIME_FOREVER);
+            sh->variants[[NSData dataWithBytes:&sh->early_variant length:sizeof sh->early_variant]] = sh->early_function;
+        }
+        sh->early = nil, sh->early_function = nil;
+        f = sh->variants[key];
+    }
+    if (!f) {
+        f = compile_variant(sh, sh->code, v);
+        sh->variants[key] = f;
+        build_count[0]++;
+    }
+    uint64_t dt = now_ns() - t0;  // with an early compile: only the part not yet done
+    build_ns[0] += dt, frame_build_ns += dt;
+    return f == [NSNull null] ? nil : f;
+}
+
+// Compiling a shader the first time a draw uses it stalls that frame: about 30 ms per
+// shader when macOS's shader cache does not have it yet (first launch, or after a
+// macOS update), and over half a second on a map's first frame. The game creates its
+// shaders while loading, so each one starts compiling then, on all cores, for the
+// variant its draws most likely use: float vertex inputs, 2D textures, no projected
+// texture coordinates. A draw that needs another variant compiles it as before.
+// BL_SHADER_EARLY=0 turns this off.
+static int env_shader_early;
+static unsigned long shaders_early;
+static void ensure_device(void);
+
+void d3d_render_shader_created(struct obj *o)
+{
+    ensure_device();
+    if (!env_shader_early) return;
+    BLShader *sh = shader_of(o);
+    struct d3d_shader_variant v;
+    memset(&v, 0, sizeof v);
+    if (sh->info.pixel)
+        for (uint32_t i = 0; i < D3D_SHADER_MAX_SAMPLERS; i++)
+            if (sh->info.sampler_mask & (1u << i))
+                v.tex_kind[i] = (uint8_t)(sh->info.sampler_type[i] ? sh->info.sampler_type[i] : D3D_TEX_2D);
+    static dispatch_queue_t queue;
+    if (!queue) queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    // The game may release the shader before the compile ends: compile from a copy.
+    NSData *code = [NSData dataWithBytes:sh->code length:o->size];
+    sh->early = dispatch_group_create();
+    sh->early_variant = v;
+    shaders_early++;
+    dispatch_group_async(sh->early, queue, ^{
+      int queued = 0;
+      if (atomic_compare_exchange_strong(&sh->early_state, &queued, 1))
+          sh->early_function = compile_variant(sh, code.bytes, &v);
+    });
 }
 
 // Internal shaders: partial clears.
@@ -671,7 +748,10 @@ static id<MTLRenderPipelineState> pipeline(struct pipe_key *k, id<MTLFunction> v
     d.rasterSampleCount = k->samples ? k->samples : 1;
     d.alphaToCoverageEnabled = k->alpha_to_coverage != 0;
     NSError *error = nil;
+    uint64_t t0 = now_ns();
     p = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
+    uint64_t dt = now_ns() - t0;
+    build_ns[1] += dt, build_count[1]++, frame_build_ns += dt;
     if (!p) {
         fprintf(stderr, "[metal] pipeline failed, its draws are skipped: %s\n", error.localizedDescription.UTF8String);
         return nil;  // not cached: rare, and the log says each time
@@ -822,6 +902,8 @@ static void ensure_device(void)
     fps_max = getenv("BL_FPS_MAX") ? atof(getenv("BL_FPS_MAX")) : 60;
     env_pacing = !(getenv("BL_PACING") && !strcmp(getenv("BL_PACING"), "0"));
     env_pacing_stats = getenv("BL_PACING_STATS") != NULL;
+    env_shader_stats = getenv("BL_SHADER_STATS") != NULL;
+    env_shader_early = !(getenv("BL_SHADER_EARLY") && !strcmp(getenv("BL_SHADER_EARLY"), "0"));
     env_aniso = getenv("BL_ANISO") ? atoi(getenv("BL_ANISO")) : 16;
     env_aniso = env_aniso < 1 ? 1 : env_aniso > 16 ? 16 : env_aniso;
     msaa = getenv("BL_MSAA") ? atoi(getenv("BL_MSAA")) : 2;
@@ -1910,6 +1992,15 @@ void d3d_render_present(struct d3d_state *s)
             next_ns = now + period;  // first frame, or behind by more than a frame
         }
     }
+    if (env_shader_stats) {
+        if (frame_build_ns > 2000000)
+            fprintf(stderr, "[shaders] frame %lu: %.1f ms building\n", frames, frame_build_ns / 1e6);
+        if (frames % 100 == 0)
+            fprintf(stderr, "[shaders] total: %lu compiled early, %llu at draws; %.0f ms waiting in draws, %llu pipelines %.0f ms\n",
+                    shaders_early, (unsigned long long)build_count[0], build_ns[0] / 1e6,
+                    (unsigned long long)build_count[1], build_ns[1] / 1e6);
+    }
+    frame_build_ns = 0;
     if (frames == 1 || frames % 100 == 0)
         fprintf(stderr, "[d3d9] frame %lu: %lu draws (%lu total)\n", frames, frame_draws, draws);
     frame_draws = 0;

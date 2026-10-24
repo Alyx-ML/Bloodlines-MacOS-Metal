@@ -928,3 +928,58 @@ Verified in the window at 1920x1080, from those dumps:
 
 Not verified: other window sizes, and movies played later in the game, if any use
 this path.
+
+## 2026-10-24 — Shader compile hitches
+
+**Measurement.** `BL_SHADER_STATS=1` (new) logs every frame that waits more than 2 ms
+for shader or pipeline builds, and totals every 100 frames. `BL_SHADER_SALT=x` (new)
+changes every generated MSL source, so macOS's own shader cache misses. That stands
+in for a first launch, or the first launch after a macOS update.
+
+Headless, `-game Unofficial_Patch -window`, 1500 frames:
+
+| map | cache | shaders at draws | worst frames |
+|---|---|---|---|
+| sp_theatre | cold | 24, 755 ms | 584 ms (first map frame), 174 ms |
+| sp_theatre | warm | 24, 2 ms | none over 2 ms |
+| sm_hub_1 | cold | 33, 789 ms | 657, 130 (in the world), 128 ms |
+| sm_hub_1 | warm | 33, 1 ms | none |
+
+Pipelines cost only 3 ms warm; 158 ms cold on sm_hub_1. So the hitch happens only the
+first time each shader is ever compiled. Once macOS has cached it, building it again is
+almost free, and a cache of our own would add nothing.
+
+**Change: early compiles** (`BL_SHADER_EARLY`, default on).
+- When the game creates a vertex or pixel shader (`d3d_render_shader_created`), its
+  likely variant starts compiling on GCD's concurrent queue: float vertex inputs, 2D
+  textures (or the declared sampler types), no projection.
+- The game creates its whole shader set while loading, 1431 shaders, so all cores
+  work on them during the load.
+- A draw that needs a shader still waiting in the queue claims it and compiles it
+  itself, instead of waiting behind the rest. A shader already compiling is waited
+  for.
+- A draw that needs another variant compiles it as before.
+- The compile works from a copy of the bytecode, in case the game releases the
+  shader first.
+
+Result on sm_hub_1, 1500 frames:
+
+| cache | early | waiting in draws | worst frames | max RSS |
+|---|---|---|---|---|
+| cold | off | 786 ms | 572, 126, 75 (in the world) ms | — |
+| cold | on | 315 ms | 266 (first map frame), 47, 5 ms | 761 MB |
+| warm | off | 3 ms | 2 ms | 714 MB |
+| warm | on | 0 ms | 5 ms | 748 MB |
+
+- On a cold cache the in-world hitch is gone. The first map frame still waits for the
+  7 shaders whose variant was guessed wrong; that frame falls in the load transition.
+- The cost is about 34 MB more memory for the compiled functions. Run time is
+  unchanged.
+- Frame 1400 of sm_hub_1 (dialogue) looks the same with early compiles on and off.
+  Pixel differences between runs match those between two runs with it off
+  (animation timing).
+
+Not verified:
+- In the window.
+- Other maps, and discipline or combat effects first seen mid-game.
+- The machine cost of 1431 cold compiles at startup on a Mac with fewer cores.
