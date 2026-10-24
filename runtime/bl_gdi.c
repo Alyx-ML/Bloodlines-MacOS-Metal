@@ -23,6 +23,7 @@ enum kind { K_FREE, K_DC, K_FONT, K_BITMAP };
 
 struct font {
     CTFontRef ct;
+    int marlett;  // em size in pixels when the font is Marlett, drawn by marlett_render
     int ascent, descent, height, internal_leading, ave_width, max_width, weight, italic;
 };
 
@@ -94,6 +95,95 @@ static struct box glyph_box(CTFontRef f, CGGlyph g)
         b.x1 = (int)ceil(r.origin.x + r.size.width), b.y1 = (int)ceil(r.origin.y + r.size.height);
     }
     return b;
+}
+
+// Marlett, the Windows symbol font that vgui draws check boxes, radio buttons, scroll
+// arrows and the combo box arrow with, is not on macOS. Its glyphs are drawn here as
+// shapes in an em square: vgui's CheckButton prints 'g' (background), 'e' and 'f' (the
+// dark and light edges) and 'b' (the check); RadioButton 'n', 'j', 'k', 'l', 'm' and 'h';
+// ScrollBar and Menu '3' to '6'; ComboBox 'u'; Frame '0' to '2' and 'r'.
+static int marlett_has(UniChar c)
+{
+    return strchr("abeghjklmnrtu0123456", c) != NULL && c != 0;
+}
+
+static void marlett_tri(CGContextRef cg, double s, double cx, double cy, double r, int dir)
+{
+    // dir: 0 left, 1 right, 2 up, 3 down; y runs down from the top of the cell.
+    double p[3][2];
+    if (dir < 2) {
+        double t = dir ? r : -r;
+        p[0][0] = cx + t, p[0][1] = cy;
+        p[1][0] = cx - t, p[1][1] = cy - r * 1.8;
+        p[2][0] = cx - t, p[2][1] = cy + r * 1.8;
+    } else {
+        double t = dir == 3 ? r : -r;
+        p[0][0] = cx, p[0][1] = cy + t;
+        p[1][0] = cx - r * 1.8, p[1][1] = cy - t;
+        p[2][0] = cx + r * 1.8, p[2][1] = cy - t;
+    }
+    CGContextMoveToPoint(cg, p[0][0], s - p[0][1]);
+    CGContextAddLineToPoint(cg, p[1][0], s - p[1][1]);
+    CGContextAddLineToPoint(cg, p[2][0], s - p[2][1]);
+    CGContextClosePath(cg);
+    CGContextFillPath(cg);
+}
+
+// 8-bit coverage of Marlett character c in an s x s cell, top row first.
+static uint8_t *marlett_render(UniChar c, int s, int *w, int *h)
+{
+    *w = *h = s;
+    if (s <= 0 || !marlett_has(c)) return NULL;
+    uint8_t *px = calloc((size_t)s * s, 1);
+    CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
+    CGContextRef cg = CGBitmapContextCreate(px, s, s, 8, s, gray, kCGImageAlphaNone);
+    CGColorSpaceRelease(gray);
+    CGContextSetGrayFillColor(cg, 1, 1);
+    CGContextSetGrayStrokeColor(cg, 1, 1);
+    double u = s / 13.0;  // Windows draws a 13-pixel check box from a 13-pixel Marlett
+#define RECT(x0, y0, x1, y1) CGContextFillRect(cg, CGRectMake((x0) * u, s - (y1) * u, ((x1) - (x0)) * u, ((y1) - (y0)) * u))
+    switch (c) {
+    case 'g': RECT(1, 1, 12, 12); break;                        // box background
+    case 'e': RECT(1, 1, 12, 2); RECT(1, 1, 2, 12); break;      // top and left edge
+    case 'f': RECT(1, 11, 12, 12); RECT(11, 1, 12, 12); break;  // bottom and right edge
+    case 'a': case 'b':                                         // check mark
+        CGContextSetLineWidth(cg, 1.7 * u);
+        CGContextSetLineCap(cg, kCGLineCapSquare);
+        CGContextMoveToPoint(cg, 3.5 * u, s - 6.0 * u);
+        CGContextAddLineToPoint(cg, 5.5 * u, s - 8.3 * u);
+        CGContextAddLineToPoint(cg, 9.5 * u, s - 4.0 * u);
+        CGContextStrokePath(cg);
+        break;
+    case 'n': CGContextFillEllipseInRect(cg, CGRectMake(1 * u, s - 12 * u, 11 * u, 11 * u)); break;
+    case 'j': case 'k': case 'l': case 'm': {                   // radio edges: outer, inner
+        double in = (c == 'l' || c == 'm') ? 1 : 0;
+        double a0 = (c == 'j' || c == 'l') ? M_PI * 0.25 : M_PI * 1.25;
+        CGContextSetLineWidth(cg, 1.0 * u);
+        CGContextAddArc(cg, 6.5 * u, s - 6.5 * u, (5.0 - in) * u, a0, a0 + M_PI, 0);
+        CGContextStrokePath(cg);
+        break;
+    }
+    case 'h': CGContextFillEllipseInRect(cg, CGRectMake(4.5 * u, s - 8.5 * u, 4 * u, 4 * u)); break;
+    case '3': marlett_tri(cg, s, 6.5 * u, 6.5 * u, 1.8 * u, 0); break;
+    case '4': marlett_tri(cg, s, 6.5 * u, 6.5 * u, 1.8 * u, 1); break;
+    case '5': marlett_tri(cg, s, 6.5 * u, 6.5 * u, 1.8 * u, 2); break;
+    case '6': marlett_tri(cg, s, 6.5 * u, 6.5 * u, 1.8 * u, 3); break;
+    case 't': marlett_tri(cg, s, 6.5 * u, 6.5 * u, 1.4 * u, 2); break;
+    case 'u': marlett_tri(cg, s, 6.5 * u, 6.5 * u, 1.4 * u, 3); break;
+    case '0': RECT(3, 9, 9, 11); break;                          // minimise
+    case '1': RECT(2, 2, 11, 11); CGContextClearRect(cg, CGRectMake(3 * u, s - 10 * u, 7 * u, 6 * u)); break;
+    case '2': RECT(4, 1, 12, 8); CGContextClearRect(cg, CGRectMake(5 * u, s - 7 * u, 6 * u, 4 * u));
+              RECT(1, 5, 9, 12); CGContextClearRect(cg, CGRectMake(2 * u, s - 11 * u, 6 * u, 4 * u)); break;
+    case 'r':                                                    // close
+        CGContextSetLineWidth(cg, 1.6 * u);
+        CGContextMoveToPoint(cg, 3.5 * u, s - 3.5 * u), CGContextAddLineToPoint(cg, 9.5 * u, s - 9.5 * u);
+        CGContextMoveToPoint(cg, 9.5 * u, s - 3.5 * u), CGContextAddLineToPoint(cg, 3.5 * u, s - 9.5 * u);
+        CGContextStrokePath(cg);
+        break;
+    }
+#undef RECT
+    CGContextRelease(cg);
+    return px;
 }
 
 // Face names the game asks for that macOS does not have, and the stand-in.
@@ -172,6 +262,13 @@ uint32_t bl_gdi_CreateFontA_c(uint32_t h, uint32_t w, uint32_t esc, uint32_t ori
     f->max_width = max ? max : 1;
     f->weight = weight ? (int)weight : 400;
     f->italic = ital;
+    if (!strcasecmp(name, "Marlett")) {
+        // A square cell, the glyph filling it from the top.
+        int em = height < 0 ? -height : height > 0 ? height : 12;
+        f->marlett = em;
+        f->ascent = f->height = f->ave_width = f->max_width = em;
+        f->descent = f->internal_leading = 0;
+    }
     pthread_mutex_unlock(&lock);
     return handle;
 }
@@ -346,12 +443,14 @@ uint32_t bl_gdi_CreateDIBSection_c(uint32_t dc, uint32_t bmi, uint32_t usage, ui
     return handle;
 }
 
+static struct box font_box(const struct font *f, UniChar c);
+
 static uint32_t abc_widths(uint32_t dc, uint32_t first, uint32_t last, uint32_t out, int wide)
 {
     pthread_mutex_lock(&lock);
     struct font *f = dc_font(dc);
     for (uint32_t c = first; f && c <= last; c++) {
-        struct box b = glyph_box(f->ct, glyph_of(f->ct, wide ? (UniChar)c : ansi_char(c)));
+        struct box b = font_box(f, wide ? (UniChar)c : ansi_char(c));
         int a = b.x0, w = b.x1 - b.x0;
         if (w <= 0) a = 0, w = 1;  // Windows reports at least one pixel of black box
         uint32_t e = out + 12 * (c - first);
@@ -387,6 +486,20 @@ static uint8_t *render_gray(CTFontRef f, CGGlyph g, struct box b, int *w, int *h
     return px;  // CG bitmaps store the top row first
 }
 
+// A character's box and coverage in font f, for Core Text fonts and Marlett alike.
+static struct box font_box(const struct font *f, UniChar c)
+{
+    if (f->marlett) return marlett_has(c) ? (struct box){ 0, 0, f->marlett, f->marlett, f->marlett }
+                                          : (struct box){ 0, 0, 0, 0, f->marlett };
+    return glyph_box(f->ct, glyph_of(f->ct, c));
+}
+
+static uint8_t *font_render(const struct font *f, UniChar c, struct box b, int *w, int *h)
+{
+    if (f->marlett) return marlett_render(c, f->marlett, w, h);
+    return render_gray(f->ct, glyph_of(f->ct, c), b, w, h);
+}
+
 // GetGlyphOutlineA with GGO_METRICS (0) or GGO_GRAY8_BITMAP (6) and an identity matrix.
 uint32_t bl_gdi_GetGlyphOutlineA_c(uint32_t dc, uint32_t ch, uint32_t format, uint32_t gm, uint32_t size,
                                    uint32_t buf, uint32_t mat2)
@@ -404,8 +517,7 @@ uint32_t bl_gdi_GetGlyphOutlineA_c(uint32_t dc, uint32_t ch, uint32_t format, ui
     }
     // vguimatsurface passes wide characters here; values above 0xff are Unicode.
     UniChar c = ch > 0xff ? (UniChar)ch : ansi_char(ch);
-    CGGlyph g = glyph_of(f->ct, c);
-    struct box b = glyph_box(f->ct, g);
+    struct box b = font_box(f, c);
     int w = b.x1 - b.x0, h = b.y1 - b.y0;
     if (gm) {
         U32(gm) = w > 0 ? (uint32_t)w : 1, U32(gm + 4) = h > 0 ? (uint32_t)h : 1;
@@ -416,7 +528,7 @@ uint32_t bl_gdi_GetGlyphOutlineA_c(uint32_t dc, uint32_t ch, uint32_t format, ui
     uint32_t ret = format == 0 ? 0 : need;
     if (format == 6 && need && buf && size >= need) {
         int rw, rh;
-        uint8_t *px = render_gray(f->ct, g, b, &rw, &rh);
+        uint8_t *px = font_render(f, c, b, &rw, &rh);
         uint8_t *dst = G(buf);
         memset(dst, 0, need);
         for (int y = 0; y < rh; y++)
@@ -445,10 +557,9 @@ static uint32_t ext_text_out(uint32_t dc, int x, int y, const UniChar *s, int n)
     uint8_t *bits = G(bm->bits);
     uint32_t fg = d->dc.text_color, bg = d->dc.bk_color;
     for (int i = 0; i < n; i++) {
-        CGGlyph g = glyph_of(f->ct, s[i]);
-        struct box b = glyph_box(f->ct, g);
+        struct box b = font_box(f, s[i]);
         int rw = 0, rh = 0;
-        uint8_t *px = render_gray(f->ct, g, b, &rw, &rh);
+        uint8_t *px = font_render(f, s[i], b, &rw, &rh);
         for (int row = 0; row < f->height; row++) {
             int py = y + row;
             if (py < 0 || py >= bm->height) continue;

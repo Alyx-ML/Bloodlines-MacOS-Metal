@@ -267,6 +267,19 @@ uint32_t bl_k32_WaitForSingleObject_c(uint32_t h, uint32_t ms)
         bl_set_last_error(BL_ERROR_INVALID_HANDLE);
         return 0xffffffffu;  // WAIT_FAILED
     }
+    // BL_WAIT_TRACE=1: an infinite wait still blocked after 5 s logs the handle and the
+    // guest backtrace once, then keeps waiting.
+    static int trace = -1;
+    if (trace < 0) trace = getenv("BL_WAIT_TRACE") != NULL;
+    if (trace && ms == INFINITE && waitable_wait(w, 5000) == WAIT_TIMEOUT) {
+        uint32_t bl_vm_esp(void);
+        void bl_guest_backtrace(uint32_t sp);
+        fprintf(stderr, "[wait] thread %p blocked 5 s on handle 0x%x (%s, signaled %d)\n", (void *)pthread_self(), h,
+                w->is_sem ? "semaphore" : w->start ? "thread" : w->manual ? "manual event" : "event", w->signaled);
+        bl_guest_backtrace(bl_vm_esp());
+        return waitable_wait(w, ms);
+    }
+    if (trace && ms == INFINITE) return WAIT_OBJECT_0;
     return waitable_wait(w, ms);
 }
 

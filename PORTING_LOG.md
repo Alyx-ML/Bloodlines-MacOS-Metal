@@ -1171,3 +1171,30 @@ In the user's window run on the 12.0 DLLs (before this rebuild), the game printe
 was loaded. All 1962 .wav files in the 12.0 `sound/` folder start with RIFF, so it looks
 like a request for an empty sound name. It did not appear in the two headless runs on
 the 11.1 DLLs. It still needs checking in the window.
+
+### Node graphs, Marlett check boxes, wait trace (2026-10-24)
+**Node graph out of date.** Every map rebuilt its AI node graph on load, which made
+loading long. The cause: I copied the 12.0 files with `cp -R`, which drops modification
+times, so each `.bsp` looked newer than its `maps/graphs/*.ain`. The times are now restored
+from the unpacked installer with `rsync -a` (this also put back the shipped `.ain` files the
+game had rewritten). Only `sp_genesisdevice_1`, which has no NPCs, ships with its map newer
+than its graph.
+- Verified: 8 headless loads of `sp_tutorial_1` print no "Node Graph out of Date".
+
+**Missing check boxes in Options.** vgui draws check boxes, radio buttons, scroll arrows,
+the combo box arrow and frame buttons with characters of the Windows Marlett symbol font.
+macOS has no Marlett, and `bl_gdi.c` substituted Arial, so check boxes showed the letters
+g/e/f/b and combo boxes a "u". This predates 12.0. Marlett fonts are now flagged at
+CreateFont: square cells, and the glyphs that vgui uses are drawn as shapes in a 13-unit
+em (`marlett_render`). Other characters are blank.
+- Verified: it builds, and the game creates Marlett at heights 12, 13 and 16.
+- Not verified: how the drawn glyphs look (Options cannot be opened headless).
+
+**Startup hang.** It happened again twice, at the same point: after `config.cfg` is read
+and before DirectSound starts. Both times the user's game was running at the same time.
+Eight more headless runs on an otherwise idle machine did not hang. `BL_WAIT_TRACE=1`
+(new) logs any infinite WaitForSingleObject still blocked after 5 s, with the handle and
+the guest backtrace, so the next hang shows what the main thread is waiting for.
+
+**Menu flicker.** Not reproduced headless. Consecutive menu frames differ only where
+the particles move. It needs a description from the user.
