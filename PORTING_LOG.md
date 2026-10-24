@@ -1237,7 +1237,7 @@ and runs three half-resolution passes: linear depth from the multisampled depth 
 GTAO with 2 slices of 4 steps and normals from neighbouring depths, and a 4x4
 depth-aware blur. The next pass on the back buffer starts by multiplying the result into
 the colour. Sky (depth 1) is left alone. `BL_AO=0|1|show` overrides the setting;
-`BL_AO_RADIUS` (48 world units) and `BL_AO_STRENGTH` (1) tune it. `BL_GPU_STATS=1`
+`BL_AO_RADIUS` (32 world units) and `BL_AO_STRENGTH` (0.6) tune it. `BL_GPU_STATS=1`
 prints the mean GPU time per frame.
 
 **Check box.** GameUI's Visual tab gets "Ambient Occlusion" under "Combat effects", the
@@ -1261,3 +1261,12 @@ menus can be driven without a window.
 - Not verified: the view model (no weapon was drawn in the test scenes), cost at Retina
   resolution, toggling from the in-game pause menu, and the user's own look in the
   window. Some streaking shows on nearby floors at grazing angles.
+
+**Toned down (2026-10-24).** In the window the user's on/off screenshots of the haven
+kitchen showed the first settings (radius 48, strength 1) darkening whole surfaces: the
+upper cabinets, ceiling and walls, not only corners. Measured on `sm_pawnshop_1` frame
+650, they made the picture 18% darker overall, and a quarter of it more than 31% darker.
+The defaults are now radius 32 and strength 0.6: 7% darker overall, half the pixels
+changed by under 3%, and contact shadows under furniture and in corners kept. Tried
+too: 24 / 0.7 (much the same) and 48 / 0.5 (9% darker, broader). Not verified: the
+user's view of the new defaults.

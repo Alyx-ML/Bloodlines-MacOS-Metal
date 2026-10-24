@@ -976,8 +976,8 @@ static void ensure_device(void)
     env_widescreen = !(getenv("BL_WIDESCREEN") && !strcmp(getenv("BL_WIDESCREEN"), "stretch"));
     if (msaa < 1 || ![mtl supportsTextureSampleCount:(NSUInteger)msaa]) msaa = 1;
     ao_settings();
-    env_ao_radius = getenv("BL_AO_RADIUS") ? (float)atof(getenv("BL_AO_RADIUS")) : 48;
-    env_ao_strength = getenv("BL_AO_STRENGTH") ? (float)atof(getenv("BL_AO_STRENGTH")) : 1;
+    env_ao_radius = getenv("BL_AO_RADIUS") ? (float)atof(getenv("BL_AO_RADIUS")) : 32;
+    env_ao_strength = getenv("BL_AO_STRENGTH") ? (float)atof(getenv("BL_AO_STRENGTH")) : 0.6f;
 }
 
 static id<MTLCommandBuffer> command_buffer(void)
@@ -1390,7 +1390,7 @@ static void stretch_draw(id<MTLTexture> a, const uint32_t sr[4], id<MTLTexture> 
 // 8 steps a side whose angles and offsets follow a 4x4 pattern; a depth-aware 4x4 filter
 // that averages the pattern out; and, at full resolution, a depth-aware upsample that
 // multiplies the image by the result. BL_AO=1 turns it on, BL_AO=show shows the
-// occlusion alone; BL_AO_RADIUS (world units, default 48) and BL_AO_STRENGTH (default 1)
+// occlusion alone; BL_AO_RADIUS (world units, default 32) and BL_AO_STRENGTH (default 0.6)
 // tune it.
 
 struct ao_params {
