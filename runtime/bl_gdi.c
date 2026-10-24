@@ -147,6 +147,9 @@ uint32_t bl_gdi_CreateFontA_c(uint32_t h, uint32_t w, uint32_t esc, uint32_t ori
         size = height * 100 / cell;
     }
     int bold = (int32_t)weight >= 600, ital = (italic & 0xff) != 0;
+    static int trace = -1;
+    if (trace < 0) trace = getenv("BL_FONT_TRACE") != NULL;
+    if (trace) fprintf(stderr, "[gdi] CreateFont \"%s\" height %d weight %u\n", name, height, weight);
     CTFontRef ct = make_font(name, size, bold, ital);
     pthread_mutex_lock(&lock);
     uint32_t handle = new_object(K_FONT);

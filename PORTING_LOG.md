@@ -983,3 +983,62 @@ Not verified:
 - In the window.
 - Other maps, and discipline or combat effects first seen mid-game.
 - The machine cost of 1431 cold compiles at startup on a Mac with fewer cores.
+
+## 2026-10-24 — Room reverb checked; menus at 4:3
+
+### Reverb
+- Nothing to add. The engine has no EAX code. Its room echo is Source's own software
+  DSP (`dsp_presets.txt`, the automatic `adsp_*` room detection), mixed into the
+  DirectSound buffer before it reaches our mixer, so it is already in the output.
+- No game module imports Miles' reverb or room calls (`AIL_set_3D_room_type` and so
+  on).
+- `BL_QI_TRACE=1` (new) logs every refused QueryInterface. A `+map sm_hub_1` run
+  refuses none, so nothing asks for IKsPropertySet (EAX).
+- Not verified by ear: that the DSP is audible in the window (`dsp_off 1` in the
+  console should remove it).
+- One headless `-window +map sm_hub_1` run with `BL_QI_TRACE` hung before its first
+  frames: all threads were waiting, at 0.8% CPU. Two reruns of the same command
+  finished normally. Not investigated further.
+
+### Menus at 4:3
+The main menu and loading screens are 4:3 layouts that the game stretches across a
+wider mode.
+- A frame counts as "no world view" when none of its perspective draws to the back
+  buffer has a camera away from the origin (a w-row translation of 0). The main menu's
+  smoke is drawn with a camera at the origin, as sky boxes are, while every in-game
+  frame has world draws with a translation.
+- Counts of draws with a camera away from the origin, per frame:
+
+  | screen | count |
+  |---|---|
+  | main menu | 0 |
+  | loading screens | 0 |
+  | character creation (`sp_genesisdevice_1`) | 11 |
+  | sm_hub_1 dialogue | 60 |
+  | sp_theatre | 109 |
+
+- When the previous frame had no world view, every draw to the back buffer is
+  narrowed to a centred 4:3 area through the Metal viewport and scissor
+  (`set_viewport` with a squeeze). The projection then gets no widescreen
+  correction. Black bars are drawn at present (`menu_bars`).
+- `bl_cocoa_set_squeeze` maps mouse positions back (and the controller's pointer
+  warp forward), so clicks land on what is drawn.
+- The first frame after the menu or a load still draws at 4:3, since the decision
+  comes from the frame before. `BL_WIDESCREEN=stretch` keeps the stretch.
+- Character creation keeps the full width.
+
+Verified headless at 1920x1080:
+- The main menu is 1440x1080 with bars, and its logo and item images in proportion.
+- The sm_hub_1 loading screen is pillarboxed.
+- In the map, frames are full width (the log says "full width" from the first world
+  frame).
+
+Not verified:
+- Clicking menu items in the window (the mouse mapping).
+- The in-game Esc menu, and other 2D-only screens.
+
+### Text size
+Not changed. GameUI and the HUD draw text with bitmap fonts, not GDI: the game creates
+one GDI font (Arial, -15) at both 1024x768 and 1920x1200. Larger dialogue text would
+need a change to how the game's 2D code draws those fonts. `BL_FONT_TRACE=1` (new)
+logs GDI font requests.

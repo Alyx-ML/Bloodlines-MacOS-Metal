@@ -193,6 +193,12 @@ static NSRect image_rect(void)
     return NSMakeRect((v.width - w) / 2, (v.height - h) / 2, w, h);
 }
 
+// Game x for a position in the drawn image, and back, with the menu squeeze.
+static float squeeze = 1;
+void bl_cocoa_set_squeeze(float s) { squeeze = s > 0 && s <= 1 ? s : 1; }
+static double unsqueeze_x(double x) { return client_w / 2.0 + (x - client_w / 2.0) / squeeze; }
+static double squeeze_x(double x) { return client_w / 2.0 + (x - client_w / 2.0) * squeeze; }
+
 void bl_cocoa_capture_mouse(int on)
 {
     if (!window || on == captured) return;
@@ -310,7 +316,7 @@ void bl_cocoa_motion(int dx, int dy)
         int32_t x, y;
         bl_window_get_cursor(game_hwnd, &x, &y);
         NSRect r = image_rect();
-        NSPoint p = NSMakePoint(r.origin.x + (x + 0.5) * r.size.width / client_w,
+        NSPoint p = NSMakePoint(r.origin.x + squeeze_x(x + 0.5) * r.size.width / client_w,
                                 NSMaxY(r) - (y + 0.5) * r.size.height / client_h);
         p = [window convertPointToScreen:[window.contentView convertPoint:p toView:nil]];
         CGWarpMouseCursorPosition(CGPointMake(p.x, NSMaxY(NSScreen.screens[0].frame) - p.y));
@@ -341,8 +347,9 @@ static void mouse(NSEvent *e)
         }
         bl_window_get_cursor(game_hwnd, &x, &y);
     } else {
-        x = (int32_t)((p.x - r.origin.x) * client_w / r.size.width);
+        x = (int32_t)unsqueeze_x((p.x - r.origin.x) * client_w / r.size.width);
         y = (int32_t)((NSMaxY(r) - p.y) * client_h / r.size.height);
+        x = x < 0 ? 0 : x >= (int32_t)client_w ? (int32_t)client_w - 1 : x;
         bl_window_set_cursor(game_hwnd, x, y);
     }
     uint32_t lp = (uint32_t)(x & 0xFFFF) | (uint32_t)(y & 0xFFFF) << 16;

@@ -80,7 +80,17 @@ uint32_t obj_release(struct obj *o)
 
 uint32_t bl_IUnknown_QueryInterface_c(uint32_t self, uint32_t riid, uint32_t out)
 {
-    (void)self, (void)riid;
+    (void)self;
+    // BL_QI_TRACE=1 logs each interface asked for and refused (EAX would show here as
+    // IKsPropertySet, 31EFAC30-515C-11D0-A9AA-00AA0061BE93).
+    static int trace = -1;
+    if (trace < 0) trace = getenv("BL_QI_TRACE") != NULL;
+    if (trace && riid) {
+        const uint8_t *g = bl_g2h(riid);
+        fprintf(stderr, "[com] QueryInterface %08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X refused\n",
+                *(const uint32_t *)g, *(const uint16_t *)(g + 4), *(const uint16_t *)(g + 6), g[8], g[9], g[10],
+                g[11], g[12], g[13], g[14], g[15]);
+    }
     if (out) G32(out) = 0;
     return E_NOINTERFACE;
 }

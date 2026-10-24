@@ -75,6 +75,9 @@ static double fps_max;  // frame cap with a window (BL_FPS_MAX, default 60; 0 = 
 static int env_pacing, env_pacing_stats;  // BL_PACING (default on), BL_PACING_STATS
 static int env_aniso;   // forced anisotropy (BL_ANISO, default 16)
 static int env_widescreen;  // correct the 4:3 projection on wider modes (BL_WIDESCREEN, default on)
+static int frame_has_3d, menu_frame;  // a perspective draw to the back buffer: this frame, the last
+static int last_3d;
+static float frame_squeeze = 1;       // menu draws this frame were narrowed to this share of the width
 static int msaa;        // samples for the back buffer and its depth (BL_MSAA, default 2; 1 = off)
 static int deep_color;  // 16-bit back buffer, 10-bit window (BL_DEEP_COLOR, default on)
 
@@ -1079,7 +1082,8 @@ void d3d_render_resize(uint32_t width, uint32_t height)
 }
 
 // Viewport and scissor for the bound target.
-static void set_viewport(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32_t tw, uint32_t th)
+// `squeeze` < 1 narrows everything horizontally about the target's centre (menus at 4:3).
+static void set_viewport(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32_t tw, uint32_t th, float squeeze)
 {
     const uint32_t *vp = s->viewport;
     static uint32_t full[6];
@@ -1089,7 +1093,9 @@ static void set_viewport(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uin
         full[2] = tw, full[3] = th, full[4] = vp[4], full[5] = vp[5];
         vp = full;
     }
-    [e setViewport:(MTLViewport){vp[0], vp[1], vp[2], vp[3], u2f(vp[4]), u2f(vp[5])}];
+    double cx = tw / 2.0;
+#define SQUEEZE(x) (squeeze < 1 ? cx + ((x) - cx) * squeeze : (x))
+    [e setViewport:(MTLViewport){SQUEEZE(vp[0]), vp[1], vp[2] * (squeeze < 1 ? squeeze : 1), vp[3], u2f(vp[4]), u2f(vp[5])}];
     int32_t x0 = (int32_t)vp[0], y0 = (int32_t)vp[1], x1 = x0 + (int32_t)vp[2], y1 = y0 + (int32_t)vp[3];
     if (s->rs[174]) {  // SCISSORTESTENABLE
         const int32_t *r = (const int32_t *)s->scissor;
@@ -1098,6 +1104,8 @@ static void set_viewport(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uin
         if (r[2] < x1) x1 = r[2];
         if (r[3] < y1) y1 = r[3];
     }
+    if (squeeze < 1) x0 = (int32_t)floor(SQUEEZE(x0)), x1 = (int32_t)ceil(SQUEEZE(x1));
+#undef SQUEEZE
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > (int32_t)tw) x1 = (int32_t)tw;
@@ -1454,7 +1462,6 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     [e setCullMode:rs[22] == 2 ? MTLCullModeFront : rs[22] == 3 ? MTLCullModeBack : MTLCullModeNone];
     [e setTriangleFillMode:rs[8] == 2 ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
     [e setDepthBias:u2f(rs[195]) * 16777215.0f slopeScale:u2f(rs[175]) clamp:0];
-    set_viewport(s, e, (uint32_t)rtt.width, (uint32_t)rtt.height);
 
     // Constants: the game's, with the shader's own definitions on top.
     float vc[256][4];
@@ -1494,8 +1501,24 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     // BL_WIDESCREEN=stretch keeps the game's own picture.
     vp.clip_y = 1;
     float aspect = s->viewport[3] ? (float)s->viewport[2] / (float)s->viewport[3] : 0;
-    if (env_widescreen && aspect > 4.0f / 3.0f + 0.01f && !(vs->ff_vertex && vs->ffv.positiont)) {
-        const float *w_row = vs->ff_vertex ? vc[3] : vc[11];
+    const float *w_row = vs->ff_vertex ? vc[3] : vc[11];
+    int perspective = !(vs->ff_vertex && vs->ffv.positiont) &&
+                      (w_row[0] != 0 || w_row[1] != 0 || w_row[2] != 0 || w_row[3] != 1);
+    int to_back_buffer = enc_color && enc_color == s->back_buffer;
+    // A world view has its camera away from the origin; the main menu's smoke is drawn
+    // with a camera at the origin (the w row has no translation), like a sky box.
+    if (perspective && to_back_buffer && fabsf(w_row[3]) > 1e-4f) frame_has_3d++;
+    // Screens with no world view (the main menu, loading screens) are the game's 4:3
+    // layouts stretched across a wider window. Their draws to the back buffer go to a
+    // centred 4:3 area instead, with black bars (menu_bars) and the mouse mapped to
+    // match (bl_cocoa_set_squeeze); the projection then needs no correction. Which kind
+    // of screen it is comes from the frame before. BL_WIDESCREEN=stretch keeps the
+    // stretch.
+    float squeeze = 1;
+    float target_aspect = rtt.height ? (float)rtt.width / (float)rtt.height : 0;
+    if (env_widescreen && menu_frame && to_back_buffer && target_aspect > 4.0f / 3.0f + 0.01f)
+        squeeze = (4.0f / 3.0f) / target_aspect, frame_squeeze = squeeze;
+    if (env_widescreen && aspect > 4.0f / 3.0f + 0.01f && perspective && squeeze == 1) {
         float proj = 0;
         if (vs->ff_vertex) {
             const float *p = (const float *)s->transform[3];
@@ -1505,9 +1528,9 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
             float ly = sqrtf(vc[9][0] * vc[9][0] + vc[9][1] * vc[9][1] + vc[9][2] * vc[9][2]);
             if (lx != 0) proj = ly / lx;
         }
-        int perspective = w_row[0] != 0 || w_row[1] != 0 || w_row[2] != 0 || w_row[3] != 1;
-        if (perspective && proj > 0 && aspect > proj * 1.01f) vp.clip_y = aspect / proj;
+        if (proj > 0 && aspect > proj * 1.01f) vp.clip_y = aspect / proj;
     }
+    set_viewport(s, e, (uint32_t)rtt.width, (uint32_t)rtt.height, squeeze);
     [e setVertexBytes:&vp length:sizeof vp atIndex:21];
 
     float pc[224][4];
@@ -1949,6 +1972,26 @@ static void present(id<CAMetalDrawable> drawable)
         [command_buffer() presentDrawable:drawable];
 }
 
+// Black bars either side of a menu narrowed to 4:3: the game's own clears and
+// backgrounds covered the whole width, so the bars may still hold an older frame.
+static void menu_bars(id<MTLTexture> t, float squeeze)
+{
+    end_pass();
+    static id<MTLTexture> black;
+    if (!black) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                     width:1 height:1 mipmapped:NO];
+        black = [mtl newTextureWithDescriptor:td];
+        uint32_t px = 0xFF000000;
+        [black replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&px bytesPerRow:4];
+    }
+    uint32_t bar = (uint32_t)floor(t.width * (1 - squeeze) / 2), one[4] = {0, 0, 1, 1};
+    if (!bar) return;
+    uint32_t left[4] = {0, 0, bar, (uint32_t)t.height}, right[4] = {(uint32_t)t.width - bar, 0, (uint32_t)t.width, (uint32_t)t.height};
+    stretch_draw(black, one, t, left, 0);
+    stretch_draw(black, one, t, right, 0);
+}
+
 void d3d_render_present(struct d3d_state *s)
 {
     ensure_device();
@@ -1956,6 +1999,16 @@ void d3d_render_present(struct d3d_state *s)
     frames++;
     struct obj *bb = s->back_buffer;
     id<MTLTexture> back = bb ? target_texture(bb) : nil;
+    if (back && frame_squeeze < 1) menu_bars(back, frame_squeeze);
+    static float shown_squeeze = 1;
+    if (frame_squeeze != shown_squeeze) {
+        shown_squeeze = frame_squeeze;
+        bl_cocoa_set_squeeze(frame_squeeze);
+        fprintf(stderr, "[d3d9] frame %lu: %s\n", frames, frame_squeeze < 1 ? "menu at 4:3" : "full width");
+    }
+    last_3d = frame_has_3d;
+    menu_frame = !frame_has_3d;
+    frame_has_3d = 0, frame_squeeze = 1;
     if (back && dump_this_frame(frames)) {
         const char *dir = getenv("BL_DUMP_DIR") ? getenv("BL_DUMP_DIR") : ".";
         char path[1024];
@@ -2002,7 +2055,7 @@ void d3d_render_present(struct d3d_state *s)
     }
     frame_build_ns = 0;
     if (frames == 1 || frames % 100 == 0)
-        fprintf(stderr, "[d3d9] frame %lu: %lu draws (%lu total)\n", frames, frame_draws, draws);
+        fprintf(stderr, "[d3d9] frame %lu: %lu draws (%lu total), %d perspective\n", frames, frame_draws, draws, last_3d);
     frame_draws = 0;
     if (max_frames >= 0 && (long)frames >= max_frames) {
         fprintf(stderr, "[d3d9] %lu frames presented, stopping (BL_MAX_FRAMES)\n", frames);
