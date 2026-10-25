@@ -13,3 +13,7 @@
 // when the game refills it.
 id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t stamp, uint32_t w, uint32_t h,
                                 uint32_t format, const uint8_t *data, uint32_t pitch, id<MTLTexture> *color);
+
+// A flat normal map (roughness 0.5) for character parts without one of their own (hair,
+// teeth, characters not in the list), so they get the same light as the rest.
+id<MTLTexture> bl_detail_flat(id<MTLDevice> dev);

@@ -2771,7 +2771,8 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
             s->texture[0]->width == 128 && s->texture[0]->height == 128)
             for (int i = 0; i < nel; i++)
                 if (el[i].usage == 1 || el[i].usage == 2) k->psv.skin = 2;
-        // A character's detail normal map (tex_detail.m), when one was made for its texture.
+        // A character's detail normal map (tex_detail.m), when one was made for its texture;
+        // a flat one otherwise (hair, teeth), for the same shine and light.
         detail_map = nil, detail_color = nil;
         struct obj *t0 = s->texture[0];
         if (k->psv.skin == 1 && env_detail > 0 && t0 && t0->type == OBJ_TEXTURE && t0->subs[0] && t0->subs[0]->mem) {
@@ -2779,7 +2780,8 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
             detail_map = bl_detail_normal(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
                                           t0->subs[0]->pitch, &color);
             detail_color = env_upscale_off ? nil : color;
-            k->psv.detail = detail_map != nil;
+            if (!detail_map) detail_map = bl_detail_flat(mtl);
+            k->psv.detail = 1;
             k->vsv.smooth_normal = k->psv.detail;
         }
     }

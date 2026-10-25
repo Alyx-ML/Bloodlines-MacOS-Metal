@@ -329,3 +329,17 @@ id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t sta
     cache[k] = @[result ? (id)result : [NSNull null], *color ? (id)*color : [NSNull null]];
     return result;
 }
+
+id<MTLTexture> bl_detail_flat(id<MTLDevice> dev)
+{
+    static id<MTLTexture> t;
+    if (!t) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                        width:1 height:1 mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        t = [dev newTextureWithDescriptor:td];
+        const uint8_t px[4] = {128, 128, 255, 128};  // straight up; roughness 0.5
+        [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:px bytesPerRow:4];
+    }
+    return t;
+}
