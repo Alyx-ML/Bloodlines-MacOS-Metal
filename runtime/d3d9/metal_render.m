@@ -50,6 +50,15 @@
 //                            options' check box ("show": the characters' pixels in red); BL_SSS_WIDTH (world units, default 0.8) and
 //                            BL_SSS_STRENGTH (0..1, default 0.8); BL_SSS_SHEEN the skin's shine
 //                            (default 3, 0 none)
+//   BL_SHADOWS=0|1           better character shadows (see the shadows section), over the options'
+//                            check box: BL_SHADOW_RES (atlas resolution, 1..4 times, default 4);
+//                            BL_PCSS=0|1|show (soft shadows, default on; "show": red the distance
+//                            to the caster, green the blockers found, blue the penumbra) with
+//                            BL_PCSS_SOFT (penumbra per world unit, 0.03), BL_PCSS_MAX (largest
+//                            penumbra, world units, 4), BL_PCSS_SEARCH (blocker search radius, 3);
+//                            BL_CONTACT=0|1|show (contact shadows, default on) with
+//                            BL_CONTACT_LENGTH (world units, 12) and BL_CONTACT_STRENGTH (0..1, 0.5);
+//                            BL_SHADOWS_AB=n turns the setting over every n frames (comparisons)
 //   BL_GPU_STATS=1           log the mean GPU time per frame every 100 frames
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
@@ -132,7 +141,22 @@ static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInte
 // The Visual options tab's check boxes (bl_vgui.c, read once a frame by bl_vgui_poll)
 // set the effects and save them in the registry; the environment, when set, wins over both.
 #define EFFECT_KEY "HKCU\\Software\\Troika\\Vampire\\Native"
-enum { BL_EFFECT_AO, BL_EFFECT_SSR, BL_EFFECT_SHARPEN, BL_EFFECT_HDR, BL_EFFECT_FOG, BL_EFFECT_SSS, BL_EFFECTS };
+enum { BL_EFFECT_AO, BL_EFFECT_SSR, BL_EFFECT_SHARPEN, BL_EFFECT_HDR, BL_EFFECT_FOG, BL_EFFECT_SSS, BL_EFFECT_SHADOWS,
+       BL_EFFECTS };
+static int env_shadows;  // the shadows section's switch
+// The shadows section (below the stretch copies): the atlas's scale, its receivers, contact shadows.
+static struct obj *shadow_atlas;
+static int is_shadow_atlas(const struct obj *tex);
+static int shadow_res_wanted(void);
+static int obj_scale(const struct obj *o);
+static MTLPixelFormat shadow_format_wanted(void);
+static void shadow_settings(void);
+static void shadow_frame_start(void);
+static int pcss_on(void);
+static void shadow_match_depth(struct obj *color, struct obj *depth);
+static int contact_on(void);
+static id<MTLTexture> contact_result;  // waiting to be multiplied in, like ao_result
+static void contact_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth);
 static const struct { const char *env, *value; int *on, *show; } effects[BL_EFFECTS] = {
     {"BL_AO", "AmbientOcclusion", &env_ao, &env_ao_show},
     {"BL_SSR", "Reflections", &env_ssr, &env_ssr_show},
@@ -140,6 +164,7 @@ static const struct { const char *env, *value; int *on, *show; } effects[BL_EFFE
     {"BL_HDR", "HDR", &env_hdr, NULL},
     {"BL_FOG", "VolumetricLight", &env_fog, NULL},
     {"BL_SSS", "SkinScattering", &env_sss, &env_sss_show},
+    {"BL_SHADOWS", "Shadows", &env_shadows, NULL},
 };
 static int effects_loaded, effect_forced[BL_EFFECTS];
 void bl_vgui_poll(void);
@@ -344,6 +369,13 @@ static id<MTLTexture> texture_of(struct obj *tex)
                       : tex->type == OBJ_VOLUMETEXTURE ? MTLTextureType3D : MTLTextureType2D;
         d.pixelFormat = rt ? target_format(tex->format) : tf.pf;
         d.width = tex->width, d.height = tex->height, d.depth = tex->type == OBJ_VOLUMETEXTURE ? tex->depth : 1;
+        tex->gpu_scale = 1;
+        if (rt && is_shadow_atlas(tex)) {
+            shadow_atlas = tex;
+            tex->gpu_scale = shadow_res_wanted();
+            d.width *= (NSUInteger)tex->gpu_scale, d.height *= (NSUInteger)tex->gpu_scale;
+            d.pixelFormat = shadow_format_wanted();
+        }
         d.mipmapLevelCount = tex->levels;
         d.usage = MTLTextureUsageShaderRead | (rt ? MTLTextureUsageRenderTarget : 0);
         d.storageMode = rt ? MTLStorageModePrivate : MTLStorageModeShared;
@@ -399,6 +431,7 @@ static id<MTLTexture> target_texture(struct obj *o)
         NSUInteger level = i % owner->levels, slice = i / owner->levels;
         t = [parent newTextureViewWithPixelFormat:parent.pixelFormat textureType:MTLTextureType2D
                                            levels:NSMakeRange(level, 1) slices:NSMakeRange(slice, 1)];
+        o->gpu_scale = owner->gpu_scale;
     } else {
         // The device's own colour surfaces (the back buffer) keep 16 bits per channel
         // with deep colour, so the game's many blended passes (lightmaps, fog, decals)
@@ -408,8 +441,8 @@ static id<MTLTexture> target_texture(struct obj *o)
         if (deep_color && pf == MTLPixelFormatBGRA8Unorm && owner && owner->type == OBJ_DEVICE)
             pf = MTLPixelFormatRGBA16Unorm;
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
-                                                                                     width:o->width
-                                                                                    height:o->height
+                                                                                     width:o->width * obj_scale(o)
+                                                                                    height:o->height * obj_scale(o)
                                                                                  mipmapped:NO];
         d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         d.storageMode = MTLStorageModePrivate;
@@ -1060,6 +1093,7 @@ static void ensure_device(void)
     env_sss_width = getenv("BL_SSS_WIDTH") ? (float)atof(getenv("BL_SSS_WIDTH")) : 0.8f;
     env_sss_strength = getenv("BL_SSS_STRENGTH") ? (float)atof(getenv("BL_SSS_STRENGTH")) : 0.8f;
     env_sss_sheen = getenv("BL_SSS_SHEEN") ? (float)atof(getenv("BL_SSS_SHEEN")) : 3;
+    shadow_settings();
 }
 
 static id<MTLCommandBuffer> command_buffer(void)
@@ -1131,6 +1165,7 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
     struct obj *color = s->render_target[0], *depth = s->depth_stencil;
     if (enc && enc_color == color && enc_depth == depth) return enc;
     end_pass();
+    shadow_match_depth(color, depth);
     if (color && color != s->back_buffer) last_offscreen_target = color;
     int samples = multisampled(color ? color : depth) ? msaa : 1;
     if (samples > 1 && color && depth && !multisampled(depth)) {
@@ -1178,7 +1213,8 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
     // The world view's passes on the back buffer also draw reflection info (post_run),
     // cleared with the frame's first one or with the colour; with skin scattering it also
     // marks what characters drew (d3d_shader_variant skin).
-    int info = (env_ssr || env_sss) && color && color == s->back_buffer && !menu_frame && view_state != 2;
+    int info = (env_ssr || env_sss || contact_on()) && color && color == s->back_buffer && !menu_frame &&
+               view_state != 2;
     if (info) {
         id<MTLTexture> ct = target_texture(color);
         MTLRenderPassColorAttachmentDescriptor *a = d.colorAttachments[1];
@@ -1197,9 +1233,11 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
     }
     enc = [command_buffer() renderCommandEncoderWithDescriptor:d];
     enc_color = color, enc_depth = depth, enc_samples = samples, enc_info = info;
-    int world_end = (post_result || ao_result) && color && color == s->back_buffer;
+    int world_end = (post_result || ao_result || contact_result) && color && color == s->back_buffer;
     if (post_result && color && color == s->back_buffer) post_apply(enc, target_texture(color), samples, depth != NULL);
     if (ao_result && color && color == s->back_buffer) ao_apply(enc, target_texture(color), samples, depth != NULL);
+    if (contact_result && color && color == s->back_buffer)
+        contact_apply(enc, target_texture(color), samples, depth != NULL);
     if (world_end && env_hdr) {
         // A copy of the finished world view, before the view model and HUD: what
         // hdr_present may brighten.
@@ -1241,6 +1279,7 @@ void d3d_render_free(struct obj *o)
     if (enc_color == o || enc_depth == o) end_pass();
     if (clear_color_target == o) clear_color_target = NULL;
     if (clear_depth_target == o) clear_depth_target = NULL;
+    if (shadow_atlas == o) shadow_atlas = NULL;
 }
 
 // Full screen when the game asks for it (no -window), unless BL_FULLSCREEN says otherwise.
@@ -1327,6 +1366,12 @@ static void set_viewport(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uin
         if (r[2] < x1) x1 = r[2];
         if (r[3] < y1) y1 = r[3];
     }
+    int sc = obj_scale(s->render_target[0]);
+    if (sc > 1) {  // the shadow atlas, drawn larger than the game made it
+        [e setViewport:(MTLViewport){(double)vp[0] * sc, (double)vp[1] * sc, (double)vp[2] * sc, (double)vp[3] * sc,
+                                     u2f(vp[4]), u2f(vp[5])}];
+        x0 *= sc, y0 *= sc, x1 *= sc, y1 *= sc;
+    }
     if (squeeze < 1) x0 = (int32_t)floor(SQUEEZE(x0)), x1 = (int32_t)ceil(SQUEEZE(x1));
 #undef SQUEEZE
     if (x0 < 0) x0 = 0;
@@ -1343,6 +1388,9 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
     ensure_device();
     struct obj *rt = s->render_target[0], *ds = s->depth_stencil;
     if (!rt) return;
+    if (draw_stats && (long)frames >= draw_stats_frame && (long)frames < draw_stats_frame + draw_stats_count)
+        fprintf(stderr, "[clear] rt %ux%u count %u flags %#x color %#x vp %u,%u %ux%u\n", rt->width, rt->height, count, flags,
+                color, s->viewport[0], s->viewport[1], s->viewport[2], s->viewport[3]);
     // A depth clear after a view (a sky box drawn first) starts over: the occlusion is
     // for the view drawn after it.
     if ((flags & 2) && ds && view_state == 1) view_state = 0;
@@ -1350,6 +1398,7 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
     int full = count == 0 && vp[0] == 0 && vp[1] == 0 && vp[2] >= rt->width && vp[3] >= rt->height &&
                (!s->rs[174] || (s->scissor[0] == 0 && s->scissor[1] == 0 && s->scissor[2] >= rt->width &&
                                 s->scissor[3] >= rt->height));
+    if (rt->owner && rt->owner == shadow_atlas && pcss_on()) color &= 0xFFFFFF;  // alpha: no caster (shadows)
     MTLClearColor cc = MTLClearColorMake((color >> 16 & 255) / 255.0, (color >> 8 & 255) / 255.0,
                                          (color & 255) / 255.0, (color >> 24) / 255.0);
     if (full) {
@@ -1413,6 +1462,8 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
             if (r[2] < x1) x1 = r[2];
             if (r[3] < y1) y1 = r[3];
         }
+        int sc = obj_scale(rt);
+        x0 *= sc, y0 *= sc, x1 *= sc, y1 *= sc;
         if (x0 < 0) x0 = 0;
         if (y0 < 0) y0 = 0;
         if (x1 > (int32_t)t.width) x1 = (int32_t)t.width;
@@ -1533,6 +1584,206 @@ static void stretch_draw(id<MTLTexture> a, const uint32_t sr[4], id<MTLTexture> 
     [e setFragmentSamplerState:samp[linear] atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
+}
+
+// --- shadows -----------------------------------------------------------------------------
+//
+// Bloodlines draws the shadows of characters and moving props into one 1024x1024 render
+// target, each caster in a 128x128 or 256x256 viewport seen from its light, and then
+// projects that atlas onto the surfaces under them, which darken by it. With BL_SHADOWS
+// (the options' "Shadows" box):
+//  - the atlas's Metal texture is BL_SHADOW_RES times the size (default 4). Draws into it
+//    get their viewports, scissors and clears scaled to match (set_viewport,
+//    d3d_render_clear); the receivers sample it with normalized coordinates and need no
+//    change. A change of the setting redraws the old contents into the new texture.
+//  - percentage-closer soft shadows where the receivers read the atlas (BL_PCSS, default
+//    on): crisp where a shadow meets its caster, softer further from it. The receivers'
+//    pixel shaders average five taps around the shadow's texel; their variant
+//    shadow_receiver turns those reads into one lookup, bl_shadow_soft in d3d9_shader.c.
+//    That needs the casters' depth, which the atlas does not keep: casters (variant
+//    shadow_caster) write 1 - depth to the atlas's alpha, which the receivers never
+//    write out, keeping the nearest (blend MAX); the atlas's clears leave alpha at 0.
+//    Each caster's light-space depth row comes from its draw's constants, per 128-texel
+//    cell of the atlas it covers (shadow_cells). Cells shared by small casters (blobs,
+//    distant characters), casters drawn with a perspective projection and cells not seen
+//    yet keep the game's own lookup.
+static int env_shadow_res = 4, env_pcss = 1, env_pcss_show, env_contact = 1, env_contact_show;
+static float env_pcss_soft = 0.03f, env_pcss_max = 4, env_pcss_search = 3;
+static float env_contact_length = 12, env_contact_strength = 0.5f;
+static struct d3d_shadow_cell shadow_cells[64];
+
+static int is_shadow_atlas(const struct obj *tex)
+{
+    return tex && tex->type == OBJ_TEXTURE && (tex->usage & 1) && tex->width == 1024 && tex->height == 1024 &&
+           tex->format == 21;  // A8R8G8B8
+}
+
+static int shadow_res_wanted(void) { return env_shadows ? env_shadow_res : 1; }
+
+// With shadows the atlas keeps 16 bits a channel: its alpha holds the casters' depth, whose
+// range is thousands of world units.
+static MTLPixelFormat shadow_format_wanted(void)
+{
+    return env_shadows ? MTLPixelFormatRGBA16Unorm : MTLPixelFormatBGRA8Unorm;
+}
+
+static int obj_scale(const struct obj *o) { return o && o->gpu_scale > 1 ? o->gpu_scale : 1; }
+
+static void shadow_settings(void)
+{
+    const char *r = getenv("BL_SHADOW_RES");
+    if (r) env_shadow_res = atoi(r);
+    env_shadow_res = env_shadow_res < 1 ? 1 : env_shadow_res > 4 ? 4 : env_shadow_res;
+    if (getenv("BL_PCSS")) env_pcss = atoi(getenv("BL_PCSS")) != 0 || !strcmp(getenv("BL_PCSS"), "show");
+    env_pcss_show = getenv("BL_PCSS") && !strcmp(getenv("BL_PCSS"), "show");
+    if (env_pcss_show) env_pcss = 1;
+    if (getenv("BL_PCSS_SOFT")) env_pcss_soft = (float)atof(getenv("BL_PCSS_SOFT"));
+    if (getenv("BL_PCSS_MAX")) env_pcss_max = (float)atof(getenv("BL_PCSS_MAX"));
+    if (getenv("BL_PCSS_SEARCH")) env_pcss_search = (float)atof(getenv("BL_PCSS_SEARCH"));
+    const char *c = getenv("BL_CONTACT");
+    if (c) env_contact = atoi(c) != 0 || !strcmp(c, "show"), env_contact_show = !strcmp(c, "show");
+    if (getenv("BL_CONTACT_LENGTH")) env_contact_length = (float)atof(getenv("BL_CONTACT_LENGTH"));
+    if (getenv("BL_CONTACT_STRENGTH")) env_contact_strength = (float)atof(getenv("BL_CONTACT_STRENGTH"));
+    env_contact_strength = env_contact_strength < 0 ? 0 : env_contact_strength > 1 ? 1 : env_contact_strength;
+}
+
+static int pcss_on(void) { return env_shadows && env_pcss && shadow_atlas; }
+static int contact_on(void) { return env_shadows && env_contact; }
+
+static int draws_to_atlas(const struct d3d_state *s)
+{
+    return shadow_atlas && s->render_target[0] && s->render_target[0]->owner == shadow_atlas;
+}
+
+// The shader variant and blending of casters and receivers (setup_draw).
+static void shadow_variant(const struct d3d_state *s, BLShader *ps, struct pipe_key *k)
+{
+    if (!pcss_on()) return;
+    if (draws_to_atlas(s)) {
+        if (!s->vs) return;
+        // Alpha keeps whichever of depth and 1 - depth is larger nearer the light: the
+        // game's shadow projections have depth growing up or down. (Lights are above.)
+        k->psv.shadow_caster = u2f(s->vs_f[10][2]) > 0 ? 2 : 1;
+        k->write_mask |= 8;
+        if (!k->blend[0]) k->blend[0] = 1, k->blend[1] = 2, k->blend[2] = 1, k->blend[3] = 1;  // ONE, ZERO, ADD
+        k->blend[4] = 2, k->blend[5] = 2, k->blend[6] = 5;  // alpha: ONE, ONE, MAX
+        return;
+    }
+    if (!ps->code) return;
+    for (uint32_t i = 0; i < 8; i++)
+        if ((ps->info.sampler_mask & (1u << i)) && s->texture[i] == shadow_atlas) k->psv.shadow_receiver |= 1u << i;
+}
+
+static int invert4(const float m[4][4], float out[4][4])
+{
+    float a[4][8];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 8; j++) a[i][j] = j < 4 ? m[i][j] : (j - 4 == i);
+    for (int c = 0; c < 4; c++) {
+        int p = c;
+        for (int i = c + 1; i < 4; i++)
+            if (fabsf(a[i][c]) > fabsf(a[p][c])) p = i;
+        if (fabsf(a[p][c]) < 1e-12f) return 0;
+        for (int j = 0; j < 8; j++) {
+            float t = a[c][j];
+            a[c][j] = a[p][j], a[p][j] = t;
+        }
+        float d = 1 / a[c][c];
+        for (int j = 0; j < 8; j++) a[c][j] *= d;
+        for (int i = 0; i < 4; i++) {
+            if (i == c) continue;
+            float f = a[i][c];
+            for (int j = 0; j < 8; j++) a[i][j] -= f * a[c][j];
+        }
+    }
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) out[i][j] = a[i][j + 4];
+    return 1;
+}
+
+// After the constants (`r`: the rows taking world positions to clip space): a caster
+// notes its cells, a receiver gets the lookup's parameters.
+static void shadow_draw(const struct d3d_state *s, id<MTLRenderCommandEncoder> e, const struct pipe_key *k,
+                        const float (*r)[4], const struct d3d_vs_params *vp)
+{
+    const uint32_t *v = s->viewport;
+    if (draws_to_atlas(s)) {
+        float aw = (float)shadow_atlas->width, ah = (float)shadow_atlas->height;
+        float lz = sqrtf(r[2][0] * r[2][0] + r[2][1] * r[2][1] + r[2][2] * r[2][2]);
+        float lx = sqrtf(r[0][0] * r[0][0] + r[0][1] * r[0][1] + r[0][2] * r[0][2]);
+        int ortho = fabsf(r[3][0]) + fabsf(r[3][1]) + fabsf(r[3][2]) < 1e-6f && fabsf(r[3][3] - 1) < 1e-4f;
+        struct d3d_shadow_cell c = {
+            {r[2][0], r[2][1], r[2][2], r[2][3]},
+            {v[0] / aw, v[1] / ah, (v[0] + v[2]) / aw, (v[1] + v[3]) / ah},
+            {lz > 0 ? 1 / lz : 0, lx * 0.5f * v[2] / aw, ortho && lz > 0 && s->vs && v[2] >= 128 && v[3] >= 128,
+             r[2][2] > 0}};
+        for (uint32_t y = v[1] / 128; y < 8 && y * 128 < v[1] + v[3]; y++)
+            for (uint32_t x = v[0] / 128; x < 8 && x * 128 < v[0] + v[2]; x++) shadow_cells[y * 8 + x] = c;
+        return;
+    }
+    if (!k->psv.shadow_receiver) return;
+    struct d3d_shadow_params p;
+    memset(&p, 0, sizeof p);
+    if (!invert4(r, p.inv)) return;  // shadow_cells' k.z stays: the game's lookup below
+    p.vp[0] = (float)v[0], p.vp[1] = (float)v[1];
+    p.vp[2] = v[2] ? 1.0f / v[2] : 0, p.vp[3] = v[3] ? 1.0f / v[3] : 0;
+    p.ndc[0] = vp->clip_y, p.ndc[1] = vp->inv_viewport[0], p.ndc[2] = vp->inv_viewport[1], p.ndc[3] = env_pcss_soft;
+    p.lim[0] = 0.75f / shadow_atlas->width, p.lim[1] = env_pcss_max, p.lim[2] = env_pcss_search;
+    p.lim[3] = 0.5f / (shadow_atlas->width * (float)obj_scale(shadow_atlas));
+    memcpy(p.cell, shadow_cells, sizeof p.cell);
+    p.show[0] = (float)env_pcss_show;
+    [e setFragmentBytes:&p length:sizeof p atIndex:2];
+}
+
+// Once a frame, between frames: the atlas at the scale the setting asks for.
+static void shadow_frame_start(void)
+{
+    // BL_SHADOWS_AB=n: the setting flips every n frames (before/after pictures and timings).
+    static long ab = -1;
+    if (ab < 0) ab = getenv("BL_SHADOWS_AB") ? atol(getenv("BL_SHADOWS_AB")) : 0;
+    if (ab > 0 && ((long)frames + 1) % ab == 0) {
+        env_shadows = !env_shadows;
+        fprintf(stderr, "[shadows] %s at frame %lu\n", env_shadows ? "on" : "off", frames + 1);
+    }
+    struct obj *t = shadow_atlas;
+    if (!t || !t->gpu || (obj_scale(t) == shadow_res_wanted() &&
+                          ((__bridge id<MTLTexture>)t->gpu).pixelFormat == shadow_format_wanted()))
+        return;
+    end_pass();
+    id<MTLTexture> old = (__bridge id<MTLTexture>)t->gpu;
+    for (uint32_t i = 0; i < t->nsubs; i++) d3d_render_free(t->subs[i]);
+    d3d_render_free(t);  // `old` keeps the texture until it is copied
+    id<MTLTexture> n = texture_of(t);
+    uint32_t sr[4] = {0, 0, (uint32_t)old.width, (uint32_t)old.height}, dr[4] = {0, 0, (uint32_t)n.width, (uint32_t)n.height};
+    stretch_draw(old, sr, n, dr, 1);
+    fprintf(stderr, "[shadows] atlas now %lux%lu\n", (unsigned long)n.width, (unsigned long)n.height);
+}
+
+// The depth surface the game draws the atlas with is scaled with it: a pass covers only
+// what all its targets cover.
+static void shadow_match_depth(struct obj *color, struct obj *depth)
+{
+    // The atlas's Metal texture, and the scale its levels take from it, may not be made
+    // yet: the scale it will have.
+    int sc = color && color->owner && is_shadow_atlas(color->owner) ? shadow_res_wanted() : obj_scale(color);
+    if (!color || !depth || sc == obj_scale(depth) || depth->width != color->width ||
+        depth->height != color->height || (depth->owner && depth->owner->type == OBJ_DEVICE))
+        return;
+    if (depth->gpu) {
+        id t = (__bridge_transfer id)depth->gpu;  // released when t goes out of scope
+        (void)t;
+        depth->gpu = NULL;
+    }
+    depth->gpu_scale = sc;
+}
+
+// Whether a draw samples the atlas: a shadow receiver.
+static int draw_reads_atlas(const struct d3d_state *s)
+{
+    if (!shadow_atlas) return 0;
+    for (int i = 0; i < 8; i++)
+        if (s->texture[i] == shadow_atlas) return 1;
+    return 0;
 }
 
 // --- ambient occlusion -------------------------------------------------------------------
@@ -1716,7 +1967,7 @@ static void note_projection(const float r8[4], const float r9[4], const float r1
 // world view).
 static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h)
 {
-    static id<MTLTexture> t[15];
+    static id<MTLTexture> t[17];
     if (!t[i] || t[i].width != w || t[i].height != h || t[i].pixelFormat != pf) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h
                                                                                  mipmapped:NO];
@@ -2467,6 +2718,160 @@ static void skin_run(id<MTLTexture> color, id<MTLTexture> z, NSUInteger hw, NSUI
     p->skin = env_sss_show ? 2 : 1;
 }
 
+// --- contact shadows -----------------------------------------------------------------------
+//
+// Part of BL_SHADOWS (BL_CONTACT, default on): the small, sharp shadows where a character
+// touches a surface or itself, which the atlas is too coarse for. At half resolution
+// after the ambient occlusion's view depth: from each pixel, 16 steps towards the light
+// that gives it the most (view_lights, the light's share of all of them), up to
+// BL_CONTACT_LENGTH world units; the first step behind something drawn, at most that far
+// behind, is in shadow, fading with the step's distance. Only characters (marked in the
+// reflection info, d3d_shader_variant skin) cast or receive them: the map's own shadows
+// are baked into its lightmaps already. The result is filtered like the occlusion and
+// multiplied in at full resolution (contact_apply); BL_CONTACT_STRENGTH (0..1, default 0.5)
+// is the most it darkens, BL_CONTACT=show shows it alone.
+
+struct contact_params {
+    float full[2], half[2];
+    float p00, p11;
+    float length, strength;
+    float nlights, pad;
+};
+
+static NSString *const contact_source =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct CP { float2 full, hsize; float p00, p11, length, strength, nlights, pad; };\n"
+     "struct FL { float4 pos, color, dir, att; };\n"  // struct fog_light
+     "struct V { float4 pos [[position]]; };\n"
+     "vertex V contact_vs(uint id [[vertex_id]]) {\n"
+     "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
+     "static float3 vpos(constant CP &a, texture2d<float> zt, int2 p) {\n"
+     "    p = clamp(p, int2(0), int2(a.hsize) - 1);\n"
+     "    float w = zt.read(uint2(p)).x;\n"
+     "    if (w <= 0.0) w = 1e6;\n"
+     "    float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.hsize.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.hsize.y);\n"
+     "    return float3(ndc.x * w / a.p00, ndc.y * w / a.p11, w); }\n"
+     // A character's pixel: the reflection info's alpha is -1 or -2 there.
+     "static bool person(constant CP &a, texture2d<float> info, int2 p) {\n"
+     "    return info.read(uint2(min(p * 2, int2(a.full) - 1))).w < -0.5; }\n"
+     "static float ign(float2 p) { return fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715)))); }\n"
+     "fragment float contact_main(V in [[stage_in]], texture2d<float> zt [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
+     "                            constant CP &a [[buffer(0)]], constant FL *L [[buffer(1)]]) {\n"
+     "    int2 p = int2(in.pos.xy);\n"
+     "    float w = zt.read(uint2(p)).x;\n"
+     "    if (w <= 0.0) return 1.0;\n"
+     "    float3 P = vpos(a, zt, p);\n"
+     "    float3 l = vpos(a, zt, p - int2(1, 0)), r = vpos(a, zt, p + int2(1, 0));\n"
+     "    float3 u = vpos(a, zt, p - int2(0, 1)), b = vpos(a, zt, p + int2(0, 1));\n"
+     "    float3 dx = abs(r.z - P.z) < abs(P.z - l.z) ? r - P : P - l;\n"
+     "    float3 dy = abs(b.z - P.z) < abs(P.z - u.z) ? b - P : P - u;\n"
+     "    float3 N = normalize(cross(dx, dy));\n"
+     "    if (dot(N, P) > 0.0) N = -N;\n"
+     // The light that gives this pixel the most, and its share.
+     "    const float3 lw = float3(0.2126, 0.7152, 0.0722);\n"
+     "    float best = 0.0, total = 0.0; float3 bl = 0.0, bv = 0.0;\n"
+     "    for (int k = 0; k < int(a.nlights); k++) {\n"
+     "        float3 v = L[k].pos.xyz - P;\n"
+     "        float d2 = max(dot(v, v), 64.0), d = sqrt(d2);\n"
+     "        float3 ld = v / d;\n"
+     "        float e = 1.0 / (L[k].att.x + L[k].att.y * d + L[k].att.z * d2);\n"
+     "        if (L[k].pos.w > 0.0) { float x = d / L[k].pos.w; e *= saturate(1.0 - x * x * x * x); }\n"
+     "        if (dot(L[k].dir.xyz, L[k].dir.xyz) > 0.25) {\n"
+     "            float cs = dot(-ld, L[k].dir.xyz), inner = L[k].color.w, outer = L[k].dir.w;\n"
+     "            if (cs <= outer) continue;\n"
+     "            if (cs < inner) e *= (cs - outer) / max(inner - outer, 1e-4);\n"
+     "        }\n"
+     "        float li = dot(L[k].color.rgb, lw) * e * saturate(dot(N, ld) + 0.1);\n"
+     "        total += li;\n"
+     "        if (li > best) best = li, bl = ld, bv = v;\n"
+     "    }\n"
+     "    if (best <= 0.0) return 1.0;\n"
+     "    bool me = person(a, info, p);\n"
+     "    float len = min(a.length, length(bv) * 0.9);\n"
+     "    float bias = 0.3 + 0.004 * w, thick = max(a.length, 0.02 * w);\n"
+     "    float3 O = P + N * (0.002 * w);\n"
+     "    float j = ign(float2(p)), occ = 0.0;\n"
+     "    const int STEPS = 16;\n"
+     "    for (int i = 0; i < STEPS; i++) {\n"
+     "        float t = (float(i) + j) / float(STEPS);\n"
+     "        float3 Q = O + bl * (len * t);\n"
+     "        if (Q.z <= 1.0) break;\n"
+     "        float2 ndc = float2(Q.x * a.p00, Q.y * a.p11) / Q.z;\n"
+     "        float2 q = float2(ndc.x + 1.0, 1.0 - ndc.y) * 0.5 * a.hsize;\n"
+     "        if (any(q < 0.0) || any(q >= a.hsize)) break;\n"
+     "        int2 qi = int2(q);\n"
+     "        if (all(qi == p)) continue;\n"
+     "        float zs = zt.read(uint2(qi)).x;\n"
+     "        if (zs <= 0.0) continue;\n"
+     "        float diff = Q.z - zs;\n"
+     "        if (diff > bias && diff < thick && (me || person(a, info, qi))) { occ = 1.0 - t * t; break; }\n"
+     "    }\n"
+     "    return 1.0 - a.strength * occ * best / total; }\n";
+
+static id<MTLRenderPipelineState> contact_pipeline(void)
+{
+    static id<MTLRenderPipelineState> p;
+    if (p) return p;
+    NSError *error = nil;
+    id<MTLLibrary> lib = [mtl newLibraryWithSource:contact_source options:nil error:&error];
+    if (!lib) bl_fatal("contact shadow shader: %s", error.localizedDescription.UTF8String);
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [lib newFunctionWithName:@"contact_vs"];
+    d.fragmentFunction = [lib newFunctionWithName:@"contact_main"];
+    d.colorAttachments[0].pixelFormat = MTLPixelFormatR16Float;
+    p = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!p) bl_fatal("contact shadow pipeline: %s", error.localizedDescription.UTF8String);
+    return p;
+}
+
+static struct ao_params contact_result_params;
+
+// From post_run, with the half-resolution view depth z (ao_pass kind 0) and its parameters.
+static void contact_run(id<MTLTexture> color, id<MTLTexture> z, const struct ao_params *ap)
+{
+    int n = view_lights();
+    if (!n) return;
+    struct contact_params c = {{ap->full[0], ap->full[1]}, {ap->half[0], ap->half[1]}, ap->p00, ap->p11,
+                               env_contact_length, env_contact_strength, (float)n, 0};
+    NSUInteger hw = (NSUInteger)ap->half[0], hh = (NSUInteger)ap->half[1];
+    id<MTLTexture> raw = ao_texture(15, MTLPixelFormatR16Float, hw, hh);
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = raw;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:contact_pipeline()];
+    [e setFragmentTexture:z atIndex:0];
+    [e setFragmentTexture:info_texture(color, 1) atIndex:1];
+    [e setFragmentBytes:&c length:sizeof c atIndex:0];
+    [e setFragmentBytes:frame_lights length:sizeof frame_lights[0] * (size_t)n atIndex:1];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    // The occlusion's depth-aware filter, then its multiply at full strength.
+    id<MTLTexture> soft = ao_texture(16, MTLPixelFormatRG32Float, hw, hh);
+    ao_pass(2, 0, soft, raw, z, ap);
+    contact_result = soft, contact_result_params = *ap;
+    contact_result_params.strength = 1;
+}
+
+// Called by pass() for a new pass on the back buffer, after ao_apply.
+static void contact_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth)
+{
+    MTLPixelFormat df = has_depth ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
+    [e setRenderPipelineState:ao_pipeline(env_contact_show ? 4 : 3, 0, color.pixelFormat, samples, df)];
+    static id<MTLDepthStencilState> none;
+    if (!none) none = [mtl newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
+    [e setDepthStencilState:none];
+    [e setCullMode:MTLCullModeNone];
+    [e setViewport:(MTLViewport){0, 0, color.width, color.height, 0, 1}];
+    [e setScissorRect:(MTLScissorRect){0, 0, color.width, color.height}];
+    [e setFragmentTexture:contact_result atIndex:0];
+    [e setFragmentBytes:&contact_result_params length:sizeof contact_result_params atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    contact_result = nil;
+}
+
 // --- the world view's end ----------------------------------------------------------------
 
 // What the game's next pass on the back buffer draws first: post_apply (its copy of the
@@ -2489,11 +2894,12 @@ static void post_run(struct d3d_state *s)
     if (depth.width != color.width || depth.height != color.height) return;
     NSUInteger hw = (color.width + 1) / 2, hh = (color.height + 1) / 2;
     int reflect = env_ssr && info_frame == frames, skin = env_sss && info_frame == frames;
+    int contact = contact_on() && info_frame == frames;
     id<MTLTexture> z = ao_texture(0, MTLPixelFormatR32Float, hw, hh);
     struct ao_params a = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, view_proj.alpha,
                           view_proj.beta, view_proj.p00, view_proj.p11, env_ao_radius,
                           1 / (env_ao_radius * env_ao_radius), 0.2f * (float)hh, env_ao_strength};
-    if (env_ao || reflect || env_fog || skin) ao_pass(0, samples > 1, z, depth, nil, &a);
+    if (env_ao || reflect || env_fog || skin || contact) ao_pass(0, samples > 1, z, depth, nil, &a);
     if (env_ao) {
         id<MTLTexture> raw = ao_texture(1, MTLPixelFormatR16Float, hw, hh);
         id<MTLTexture> soft = ao_texture(2, MTLPixelFormatRG32Float, hw, hh);
@@ -2501,6 +2907,7 @@ static void post_run(struct d3d_state *s)
         ao_pass(2, 0, soft, raw, z, &a);
         ao_result = soft, ao_result_params = a;
     }
+    if (contact) contact_run(color, z, &a);
     if (!reflect && !env_sharpen && !env_tonemap && !env_hdr && !env_fog && !skin) return;
     post_base = ao_texture(3, color.pixelFormat, color.width, color.height);
     id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
@@ -2676,7 +3083,7 @@ static void log_draw(struct d3d_state *s, const char *what, uint32_t type, uint3
 // shine they and their roughness maps give skin and cloth, BL_SHINE, default 4; light
 // with a direction across them, BL_CHARLIGHT, 0 to 1, default 1): the map
 // for the draw setup_draw is on, bound at [[texture(15)]] with the camera and the map's
-// lights at [[buffer(2)]] (d3d9_shader.c ps_detail).
+// lights at [[buffer(3)]] (d3d9_shader.c ps_detail).
 static id<MTLTexture> detail_map, detail_color;  // detail_color: the upscaled colour texture, or nil
 static int view_lights(void);
 static void detail_bind(id<MTLRenderCommandEncoder> e)
@@ -2692,7 +3099,7 @@ static void detail_bind(id<MTLRenderCommandEncoder> e)
     dl[1][2] = env_detail_strength, dl[1][3] = (float)n;
     for (int i = 0; i < n; i++) memcpy(dl[2 + 4 * i], &frame_lights[i], sizeof frame_lights[i]);
     dl[2 + 4 * 8][0] = env_shine, dl[2 + 4 * 8][1] = env_charlight;
-    [e setFragmentBytes:dl length:sizeof dl atIndex:2];
+    [e setFragmentBytes:dl length:sizeof dl atIndex:3];
     [e setFragmentTexture:detail_map atIndex:15];
 }
 static uint32_t draw_prims;  // the draw setup_draw is for: its primitives
@@ -2749,6 +3156,7 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         }
     }
     k->write_mask = rs[168] & 15;
+    shadow_variant(s, ps, k);
     k->point = type == 1;
     k->samples = (uint8_t)enc_samples;
     // Alpha-tested cut-outs (fences, foliage, hair) get soft edges from the samples.
@@ -2760,17 +3168,18 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     if (enc_info) {
         k->info = !rs[27] && (rs[168] & 7) && !(ps->info.color_outputs & 2) ? 2 : 1;
         k->psv.reflection_info = k->info == 2;
-        // Characters: skinned, their vertices carrying blend weights or bone indices.
-        if (env_sss && k->info == 2 && s->vs)
+        // Characters: skinned, their vertices carrying blend weights or bone indices. Contact
+        // shadows alone only need them marked (skin 2).
+        if ((env_sss || contact_on()) && k->info == 2 && s->vs)
             for (int i = 0; i < 16; i++)
                 if ((vs->info.input_mask & (1u << i)) && (vs->info.input_usage[i] == 1 || vs->info.input_usage[i] == 2))
-                    k->psv.skin = 1;
+                    k->psv.skin = env_sss ? 1 : 2;
         // Eyeballs: a few dozen triangles with a 128x128 colour texture, in a character's
         // vertex layout (with bone weights or indices, though their shader reads neither).
         if (env_sss && env_sss_eyes && k->info == 2 && draw_prims <= 64 && s->texture[0] &&
             s->texture[0]->width == 128 && s->texture[0]->height == 128)
             for (int i = 0; i < nel; i++)
-                if (el[i].usage == 1 || el[i].usage == 2) k->psv.skin = 2;
+                if (el[i].usage == 1 || el[i].usage == 2) k->psv.skin = 3;
         // A character's detail normal map (tex_detail.m), when one was made for its texture;
         // a flat one otherwise (hair, teeth), for the same shine and light.
         detail_map = nil, detail_color = nil;
@@ -2826,8 +3235,9 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         if (vs->info.defis[i].reg < 16) memcpy(vp.i[vs->info.defis[i].reg], vs->info.defis[i].value, 16);
     for (int i = 0; i < vs->info.ndefbs; i++)
         if (vs->info.defbs[i].reg < 16) vp.b[vs->info.defbs[i].reg] = vs->info.defbs[i].value;
-    vp.inv_viewport[0] = s->viewport[2] ? 1.0f / s->viewport[2] : 0;
-    vp.inv_viewport[1] = s->viewport[3] ? 1.0f / s->viewport[3] : 0;
+    float vsc = (float)obj_scale(s->render_target[0]);  // half a pixel of what is drawn
+    vp.inv_viewport[0] = s->viewport[2] ? 1.0f / (s->viewport[2] * vsc) : 0;
+    vp.inv_viewport[1] = s->viewport[3] ? 1.0f / (s->viewport[3] * vsc) : 0;
     // The game projects 3D views for a 4:3 screen whatever the resolution, so wider
     // modes come out stretched sideways. Perspective draws whose projection aspect is
     // narrower than the viewport are scaled up vertically to undo it (the view keeps
@@ -2910,6 +3320,7 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     }
     [e setFragmentBytes:&pp length:sizeof pp atIndex:1];
     if (k->psv.detail) detail_bind(e);
+    shadow_draw(s, e, k, vs->ff_vertex ? (const float(*)[4])vc : (const float(*)[4])vc + 8, &vp);
 
     for (uint32_t i = 0; i < D3D_SHADER_MAX_SAMPLERS; i++) {
         if (!(ps->info.sampler_mask & (1u << i))) continue;
@@ -2993,7 +3404,13 @@ void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
     }
     const char *dd = env_draw_dump;
     static int dumped_by_prims;
-    int dump = dd && (dd[0] == 'p' ? (long)frames == draw_stats_frame &&
+    static int dumped_shadow, dumped_caster;
+    int dump = dd && !strcmp(dd, "shadow")
+                   ? (long)frames == draw_stats_frame &&
+                         ((draw_reads_atlas(s) && !dumped_shadow++) ||
+                          (s->render_target[0] && s->render_target[0]->owner == shadow_atlas && !dumped_caster++))
+                   :
+               dd && (dd[0] == 'p' ? (long)frames == draw_stats_frame &&
                                          (uint32_t)atol(dd + 1) == count &&
                                          ++dumped_by_prims == (strchr(dd, ':') ? atoi(strchr(dd, ':') + 1) : 1)
                                    : listed(dd, draws));
@@ -3228,7 +3645,9 @@ static int dump_this_frame(unsigned long n)
 void d3d_render_read_back(struct obj *rt)
 {
     // GetRenderTargetData: the guest copy of a render target after GPU rendering.
-    if (!rt->gpu || !rt->mem || target_format(rt->format) != MTLPixelFormatBGRA8Unorm) return;
+    if (!rt->gpu || !rt->mem || target_format(rt->format) != MTLPixelFormatBGRA8Unorm || obj_scale(rt) > 1 ||
+        ((__bridge id<MTLTexture>)rt->gpu).pixelFormat != MTLPixelFormatBGRA8Unorm)  // the shadow atlas (shadows)
+        return;
     end_pass();
     id<MTLBuffer> b = read_target((__bridge id<MTLTexture>)rt->gpu);
     for (uint32_t y = 0; y < rt->height; y++)
@@ -3241,12 +3660,13 @@ static void next_frame(void)
     static int gpu_stats = -1;
     if (gpu_stats < 0) gpu_stats = getenv("BL_GPU_STATS") != NULL;
     int stats = gpu_stats;
+    unsigned long frame = frames;
     [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer> b) {
       if (stats) {  // BL_GPU_STATS=1: mean GPU time per frame, every 100 frames
           static double sum;
           static int n;
           sum += b.GPUEndTime - b.GPUStartTime;
-          if (++n == 100) fprintf(stderr, "[gpu] %.2f ms a frame\n", sum * 10), sum = 0, n = 0;
+          if (++n == 100) fprintf(stderr, "[gpu] %.2f ms a frame (to frame %lu)\n", sum * 10, frame), sum = 0, n = 0;
       }
       dispatch_semaphore_signal(sem);
     }];
@@ -3381,6 +3801,7 @@ void d3d_render_present(struct d3d_state *s)
     }
     view_state = 0, ao_result = nil, post_result = 0;
     flush_clears(s);
+    shadow_frame_start();
     frames++;
     bl_cocoa_script_input(frames, game_window);
     struct obj *bb = s->back_buffer;
@@ -3411,6 +3832,18 @@ void d3d_render_present(struct d3d_state *s)
             write_png(read_target(pv), back.width, back.height, path);
         }
         id<MTLTexture> off = last_offscreen_target ? target_texture(last_offscreen_target) : nil;
+        if (off && off.pixelFormat == MTLPixelFormatRGBA16Unorm) {  // the shadow atlas (shadows)
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                          width:off.width
+                                                                                         height:off.height
+                                                                                      mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> c = [mtl newTextureWithDescriptor:td];
+            uint32_t r[4] = {0, 0, (uint32_t)off.width, (uint32_t)off.height};
+            stretch_draw(off, r, c, r, 0);
+            off = c;
+        }
         if (off && off.pixelFormat == MTLPixelFormatBGRA8Unorm) {
             snprintf(path, sizeof path, "%s/frame_%lu_rt.png", dir, frames);
             write_png(read_target(off), off.width, off.height, path);
@@ -3565,8 +3998,14 @@ void d3d_render_stretch(struct obj *src, uint32_t src_rect, struct obj *dst, uin
         return;
     }
     uint32_t sr[4] = {0, 0, (uint32_t)a.width, (uint32_t)a.height}, dr[4] = {0, 0, (uint32_t)b.width, (uint32_t)b.height};
-    if (src_rect) memcpy(sr, bl_g2h(src_rect), 16);
-    if (dst_rect) memcpy(dr, bl_g2h(dst_rect), 16);
+    if (src_rect) {
+        memcpy(sr, bl_g2h(src_rect), 16);
+        for (int i = 0; i < 4; i++) sr[i] *= (uint32_t)obj_scale(src);
+    }
+    if (dst_rect) {
+        memcpy(dr, bl_g2h(dst_rect), 16);
+        for (int i = 0; i < 4; i++) dr[i] *= (uint32_t)obj_scale(dst);
+    }
     if (multisampled(dst)) dst->ms_stale = 1;  // written outside its multisampled copy
     if (sr[2] - sr[0] != dr[2] - dr[0] || sr[3] - sr[1] != dr[3] - dr[1]) {
         stretch_draw(a, sr, b, dr, filter != 1);  // D3DTEXF_POINT is 1; NONE and LINEAR filter

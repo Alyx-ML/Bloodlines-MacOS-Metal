@@ -43,8 +43,8 @@ void bl_vgui_GetCursorLine_c(_cpu *cpu)
 }
 
 // COptionsSubVisual, the Visual tab of the options dialog, gets "Ambient Occlusion",
-// "Reflections", "Sharpening", "HDR", "Volumetric Light" and "Skin Scattering" check
-// boxes under "Combat effects". Like the tab's other
+// "Reflections", "Sharpening", "HDR", "Volumetric Light", "Skin Scattering" and "Shadows"
+// check boxes under "Combat effects". Like the tab's other
 // settings they take effect as soon as they are clicked: bl_vgui_poll, once a frame,
 // passes a change to the renderer, which saves it (bl_effect_enabled, bl_effect_set in
 // metal_render.m). The page's OnResetData (0x1001bd30) is replaced to create the boxes:
@@ -66,10 +66,10 @@ void bl_effect_set(int effect, int on);
 
 // In the order of the renderer's effects (BL_EFFECT_* in metal_render.m).
 static const char *const box_names[] = { "AmbientOcclusion", "Reflections", "Sharpening",
-                                         "HDR", "VolumetricLight", "SkinScattering" };
+                                         "HDR", "VolumetricLight", "SkinScattering", "Shadows" };
 static const char *const box_texts[] = { "Ambient Occlusion", "Reflections", "Sharpening",
-                                         "HDR", "Volumetric Light", "Skin Scattering" };
-#define NBOXES 6
+                                         "HDR", "Volumetric Light", "Skin Scattering", "Shadows" };
+#define NBOXES 7
 static uint32_t box_page, boxes[NBOXES];
 
 static uint32_t call_this(void *cpu, const void *fn, uint32_t self, int nargs, const uint32_t *args)
@@ -87,11 +87,12 @@ static uint32_t vcall(void *cpu, uint32_t self, uint32_t slot, int nargs, const 
 // The boxes go where optionssubvisual.res leaves room, in its units (scaled to the
 // screen like the rest: "Combat effects" is 28 tall there): "Ambient Occlusion" just
 // below "Combat effects" (336,160 360x28), the others in a column to the right of the
-// "Shadow count" slider, from level with it down to "Ambient Occlusion". In the page's
+// "Shadow count" slider, from level with it down to one below "Ambient Occlusion". In the page's
 // Copperplate font.
 // From Combat effects: x, y, width (0: Combat effects' own).
 static const int box_place[NBOXES][3] = { { 0, 28, 248 },     { 248, -84, 240 }, { 248, -56, 240 },
-                                           { 248, -28, 240 }, { 248, 0, 240 },   { 248, 28, 240 } };
+                                           { 248, -28, 240 }, { 248, 0, 240 },   { 248, 28, 240 },
+                                           { 248, 56, 240 } };
 static void make_boxes(void *cpu, uint32_t page)
 {
     static uint32_t names[NBOXES], texts[NBOXES], out;

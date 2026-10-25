@@ -43,15 +43,39 @@ struct d3d_shader_variant {
     uint8_t reflection_info;
     // Pixel, with reflection_info: a character (metal_render.m skin_run) writes
     // [[color(1)]] as its light alone (the colour texture read as white) and -1, or
-    // without a colour texture 0 0 0 -2. 2: an eyeball, 0 0 0 -3 (for its highlight).
+    // without a colour texture 0 0 0 -2. Skin 2 only marks the character: 0 0 0 -2 always.
+    // 3: an eyeball, 0 0 0 -3 (for its highlight).
     uint8_t skin;
     // With skin 1: a normal map for the colour texture at [[texture(15)]] and the
-    // camera and lights at [[buffer(2)]] (metal_render.m detail_lights): the light is
+    // camera and lights at [[buffer(3)]] (metal_render.m detail_lights): the light is
     // scaled by how the map's bumps turn towards the lights (tex_detail.m).
     uint8_t detail;
     // Vertex: also output the clip-space step to the position nudged along the normal
     // (BLVSOut.bln), the smooth normal detail maps are laid on.
     uint8_t smooth_normal;
+    // Pixel: samplers (bit n) that read the shadow atlas (metal_render.m, shadows). Their
+    // reads become one soft-shadow lookup, bl_shadow_soft, with its parameters (struct
+    // d3d_shadow_params) in [[buffer(2)]].
+    uint8_t shadow_receiver;
+    // Pixel: a shadow caster drawn into the atlas. Its alpha becomes 1 - depth, how near
+    // to the light the caster is, which those lookups read.
+    uint8_t shadow_caster;
+};
+
+// Soft shadows from the atlas (variant shadow_receiver): the atlas is seen as 8x8 cells
+// of 128 texels, each pointing at the caster drawn over it.
+struct d3d_shadow_cell {
+    float z[4];     // the caster's light-space depth row: depth = dot(z.xyz, world) + z.w
+    float rect[4];  // its viewport in the atlas, in texture coordinates (x0, y0, x1, y1)
+    float k[4];     // world units per unit of depth, texture units per world unit, 1 if set, 0
+};
+struct d3d_shadow_params {
+    float inv[4][4];  // the receiver's clip space to world, as rows
+    float vp[4];      // its viewport: x, y, 1/width, 1/height
+    float ndc[4];     // clip_y, half-pixel offsets x and y, penumbra per world unit of distance
+    float lim[4];     // smallest penumbra (texture units), largest and search radius (world units), texel
+    float show[4];    // x: 1 shows the blocker distance (red, 64 units), blockers found (green), penumbra (blue)
+    struct d3d_shadow_cell cell[64];
 };
 
 // Pixel shader samplers that read a reflection cubemap: cube samplers whose result is
