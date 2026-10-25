@@ -1704,3 +1704,25 @@ player's machine from their own game files (`BL_HAIR_MESH`, default on; 0 off).
   lit as with skin scattering off, with a little more shape; frame 820, further away,
   unchanged. Not verified: other characters and maps, a window run by the user, and the
   cost of up to 64 lights per character pixel (not measured).
+
+## 2026-10-25: props smoothed (BL_PROP_TESS)
+
+- Props had faceted round shapes (the asylum's bar tables, 12-sided). The characters'
+  GPU smoothing (Phong tessellation) can't simply be turned on for them: their round
+  shapes end in sharp rims, where corners share a position but not a normal, and plain
+  Phong opens gaps there or, turned off at those corners, leaves the rim faceted.
+- New `prop_smooth.c`: once per mesh on the CPU, each triangle split into BL_TESS^2 and
+  its points moved three quarters of the way onto Phong's curve, with each corner's
+  point projected onto every surface meeting there (an orthonormal basis of the
+  normals at that position, clustered within about 25 degrees). It is the same from
+  either side of an edge, so there are no gaps, a rim curves along its length and stays
+  sharp, and a box stays a box. All vertex elements are interpolated (blend indices
+  and packed normals taken from the nearest corner), and the game's shaders draw the
+  result. `metal_render.m` `prop_swap_for`: world-view draws to the back buffer whose
+  vertex shader reads no bone weights, with no lightmap coordinates (the map itself),
+  static vertex buffers, 8 to 20,000 triangles; skipped where nothing moves more than a
+  thousandth of a triangle; at most 768 MB in all.
+- Verified: one headless run, sm_asylum_1 frame 780 (`BL_TAA=1`): 16 props smoothed
+  (7 MB), the bar stools' seats and bases rounder, with no gaps or other faults seen.
+  Then the user's own window run: the round bar tables up close, smooth with no gaps.
+  Not verified: other maps, the time it adds at map load, and frame rate.

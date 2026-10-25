@@ -61,6 +61,7 @@
 //   BL_TAA_JITTER=n          the temporal anti-aliasing's offset (pixels, default 0.5; see the TAA
 //                            section), negative flips it for MetalFX
 //   BL_GPU_STATS=1          log the mean GPU time per frame every 100 frames
+//   BL_PROP_TESS=0|1         props split and rounded like characters (BL_TESS per edge; default on)
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
@@ -76,6 +77,7 @@
 
 #include "bl_bsp.h"
 #import "tex_detail.h"
+#include "prop_smooth.h"
 #include "bl_cocoa.h"
 #include "bl_win32.h"
 #include "d3d9_shader.h"
@@ -96,6 +98,7 @@ static float env_hair_root = 1.0f;    // BL_HAIR_ROOT: hair darker where it lies
 static float env_hair_glow = 1.0f;    // BL_HAIR_GLOW: light through hair from behind
 static int env_hair_mesh = 1;         // BL_HAIR_MESH=0: the game's own hair, not the strips made for it
 static int env_tess = 3;            // BL_TESS: characters' triangles split this many times per edge, rounded (0 off)
+static int env_prop_tess = 1;       // BL_PROP_TESS: props' too (prop_swap_for)
 static int env_upscale_off;  // BL_UPSCALE=0: the game's own colour textures for characters
 static int env_sss_eyes = 1;  // BL_SSS_EYES=0: no eye highlights
 static int enc_info;                       // and whether it draws reflection info (info_texture)
@@ -1085,6 +1088,7 @@ static void ensure_device(void)
     env_hair_u = getenv("BL_HAIR_U") && atoi(getenv("BL_HAIR_U"));
     if (getenv("BL_HAIR_FADE")) env_hair_fade = (float)atof(getenv("BL_HAIR_FADE"));
     if (getenv("BL_TESS")) env_tess = atoi(getenv("BL_TESS"));
+    if (getenv("BL_PROP_TESS")) env_prop_tess = atoi(getenv("BL_PROP_TESS"));
     if (getenv("BL_HAIR_SOFT")) env_hair_soft = (float)atof(getenv("BL_HAIR_SOFT"));
     if (getenv("BL_HAIR_STRANDS")) env_hair_strands = (float)atof(getenv("BL_HAIR_STRANDS"));
     if (getenv("BL_HAIR_ROOT")) env_hair_root = (float)atof(getenv("BL_HAIR_ROOT"));
@@ -4021,6 +4025,109 @@ static struct hair_swap *hair_swap_for(struct d3d_state *s, struct element *el, 
     return hs;
 }
 
+// Props smoothed (prop_smooth.c, BL_PROP_TESS): the world view's rigid models (no bones in
+// their vertex shader, no lightmap coordinates: props, not the map's own surfaces), drawn
+// split into BL_TESS segments per edge and rounded, by the game's own shaders. Made once
+// per mesh on the CPU, from its vertex buffers (static ones only) and index range; NULL
+// for anything else, or where nothing would move (boxes, flat panels).
+struct prop_swap {
+    id<MTLBuffer> vb[16], ib;  // per stream, in its own layout; triangles
+    uint32_t nidx;
+};
+static struct prop_swap *prop_swap;  // the draw's, while d3d_render_draw draws it
+static NSMutableDictionary<NSData *, NSValue *> *prop_swaps;
+static size_t prop_bytes;  // all of them, held to PROP_MAX_BYTES
+#define PROP_MAX_BYTES ((size_t)768 << 20)
+
+static struct prop_swap *prop_swap_for(struct d3d_state *s, struct element *el, int nel, uint32_t start,
+                                       uint32_t count, int32_t base_vertex)
+{
+    if (!env_prop_tess || env_tess < 2 || view_state != 1 || !s->vs || !s->indices || !s->render_target[0] ||
+        s->render_target[0] != s->back_buffer || count < 8 || count > 20000 || nel > 32)
+        return NULL;
+    BLShader *vs = shader_of(s->vs);
+    for (int i = 0; i < 16; i++)
+        if ((vs->info.input_mask & (1u << i)) && (vs->info.input_usage[i] == 1 || vs->info.input_usage[i] == 2))
+            return NULL;
+    struct prop_elem pel[32];
+    int has_pos = 0, has_nrm = 0;
+    struct {
+        void *vb[16];
+        uint32_t off[16], stride[16], rewrites[16];
+        void *ib;
+        uint32_t start, count, sample[16];
+        int32_t base;
+        int split;
+    } key;
+    memset(&key, 0, sizeof key);
+    for (int i = 0; i < nel; i++) {
+        int b = el[i].stream;
+        if (b >= 16 || el[i].usage == 9 || (el[i].usage == 5 && el[i].index > 0)) return NULL;  // lightmapped: the map
+        if (el[i].usage == 0 && el[i].index == 0 && el[i].type == 2) has_pos = 1;
+        if (el[i].usage == 3 && el[i].index == 0 && el[i].type == 2) has_nrm = 1;
+        pel[i] = (struct prop_elem){el[i].stream, el[i].offset, el[i].type, el[i].usage, el[i].index};
+        struct obj *v = s->stream[b];
+        if (!v || !v->mem || (v->usage & 0x200) || v->rewrites >= 8 || v->dirty || !s->stream_stride[b]) return NULL;
+        key.vb[b] = v, key.off[b] = s->stream_offset[b], key.stride[b] = s->stream_stride[b];
+        key.rewrites[b] = (uint32_t)v->rewrites;
+    }
+    if (!has_pos || !has_nrm) return NULL;
+    struct obj *ibo = s->indices;
+    int is32 = ibo->format == 102;  // D3DFMT_INDEX32
+    uint32_t isz = is32 ? 4 : 2, ni = count * 3;
+    if (!ibo->mem || (uint64_t)start * isz + (uint64_t)ni * isz > ibo->size) return NULL;
+    const uint8_t *ip = (const uint8_t *)bl_g2h(ibo->mem) + (size_t)start * isz;
+#define IDX(i) (is32 ? ((const uint32_t *)ip)[i] : ((const uint16_t *)ip)[i])
+    // Index buffers are read per draw, with no note of rewrites: a sample of this range
+    // in the key stands for its contents.
+    for (int i = 0; i < 16; i++) key.sample[i] = IDX((uint32_t)i * (ni - 1) / 15);
+    key.ib = ibo, key.start = start, key.count = count, key.base = base_vertex, key.split = env_tess;
+    NSData *kd = [NSData dataWithBytes:&key length:sizeof key];
+    if (!prop_swaps) prop_swaps = [NSMutableDictionary new];
+    NSValue *hit = prop_swaps[kd];
+    if (hit) {
+        struct prop_swap *p = hit.pointerValue;
+        return p->nidx ? p : NULL;
+    }
+    struct prop_swap *p = calloc(1, sizeof *p);
+    prop_swaps[kd] = [NSValue valueWithPointer:p];
+    uint32_t *idx = malloc(sizeof *idx * ni);
+    if (!idx) return NULL;
+    for (uint32_t i = 0; i < ni; i++) idx[i] = (uint32_t)(base_vertex + (int32_t)IDX(i));
+#undef IDX
+    struct prop_in in = {.el = pel, .nel = nel, .idx = idx, .ntris = count, .split = env_tess};
+    for (int i = 0; i < nel; i++) {
+        int b = el[i].stream;
+        struct obj *v = s->stream[b];
+        uint32_t off = s->stream_offset[b], st = s->stream_stride[b];
+        in.data[b] = (const uint8_t *)bl_g2h(v->mem) + off;
+        in.stride[b] = st, in.nverts[b] = v->size > off ? (v->size - off) / st : 0;
+    }
+    struct prop_out o;
+    int r = prop_smooth(&in, &o);
+    free(idx);
+    static int logged;
+    size_t bytes = (size_t)o.nidx * 4;
+    for (int b = 0; b < 16; b++)
+        if (o.data[b]) bytes += (size_t)o.nverts * in.stride[b];
+    // Moved less than a thousandth of a triangle: flat, nothing to gain.
+    if (r == 0 && o.moved > 1e-3f && prop_bytes + bytes <= PROP_MAX_BYTES) {
+        for (int b = 0; b < 16; b++)
+            if (o.data[b])
+                p->vb[b] = [mtl newBufferWithBytes:o.data[b] length:(NSUInteger)o.nverts * in.stride[b]
+                                           options:MTLResourceStorageModeShared];
+        p->ib = [mtl newBufferWithBytes:o.idx length:(NSUInteger)o.nidx * 4 options:MTLResourceStorageModeShared];
+        p->nidx = o.nidx;
+        prop_bytes += bytes;
+        if (logged++ < 40)
+            fprintf(stderr, "[metal] prop smoothed: %u triangles into %u, %u corners on sharp edges, moved up to %.1f%% (%zu MB in all)\n",
+                    count, o.nidx / 3, o.sharp, 100 * o.moved, prop_bytes >> 20);
+    } else if (r == 0 && prop_bytes + bytes > PROP_MAX_BYTES)
+        LOG_ONCE("[metal] props: %zu MB smoothed, no more\n", prop_bytes >> 20);
+    prop_smooth_free(&o);
+    return p->nidx ? p : NULL;
+}
+
 static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, uint32_t min_index, uint32_t nverts,
                         uint32_t start, uint32_t count, int indexed);
 
@@ -4030,13 +4137,17 @@ void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
     (void)unused0, (void)unused1;
     ensure_device();
     struct hair_swap *hs = NULL;
+    struct prop_swap *ps = NULL;
     if (indexed && type == 4) {
         struct element el[64];
         int nel = vertex_elements(s, el, 64);
         hs = hair_swap_for(s, el, nel, start, count, base_vertex);
+        if (!hs) ps = prop_swap_for(s, el, nel, start, count, base_vertex);
     }
     if (!hs) {
+        prop_swap = ps;
         render_draw(s, type, base_vertex, min_index, nverts, start, count, indexed);
+        prop_swap = NULL;
         return;
     }
     if (!hs->nidx) {  // nothing of it kept
@@ -4084,7 +4195,7 @@ static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex,
     id<MTLRenderCommandEncoder> e = pass(s);
     struct pipe_key k;
     draw_prims = count;
-    draw_tess = env_tess > 1 && indexed && type == 4 && count <= TESS_MAX_PATCHES && s->indices && !hair_swap;
+    draw_tess = env_tess > 1 && indexed && type == 4 && count <= TESS_MAX_PATCHES && s->indices && !hair_swap && !prop_swap;
     int ok = setup_draw(s, e, type, el, nel, &k);
     draw_tess = 0;
     if (!ok) return;
@@ -4202,6 +4313,10 @@ static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex,
             [e setVertexBuffer:hair_swap->vb offset:0 atIndex:(NSUInteger)b];
             continue;
         }
+        if (prop_swap && prop_swap->vb[b]) {
+            [e setVertexBuffer:prop_swap->vb[b] offset:0 atIndex:(NSUInteger)b];
+            continue;
+        }
         src[b] = stream_data(s->stream[b], s->stream_offset[b], s->stream_stride[b], first, nv, &rebased);
         if (!src[b].buf) {
             LOG_ONCE("[metal] draw without a vertex buffer on stream %d\n", b);
@@ -4250,6 +4365,7 @@ static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex,
         ib = hair_swap->ib, io = 0, it = MTLIndexTypeUInt32, ic = hair_swap->nidx;
         if (hair_swap->vb) bv = 0;
     }
+    if (prop_swap) ib = prop_swap->ib, io = 0, it = MTLIndexTypeUInt32, ic = prop_swap->nidx, bv = 0;
     for (int pass = 0; pass < 2; pass++) {
         if (pass) {  // hair's blended pass
             if (!k.psv.hair || !hair_soft_on() || !s->rs[15]) break;
