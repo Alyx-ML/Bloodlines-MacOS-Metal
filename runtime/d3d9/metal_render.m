@@ -31,7 +31,7 @@
 //   BL_PACING_STATS=1        log how many refreshes apart frames reach the screen
 //   BL_FULLSCREEN=0|1        start in a window or full screen (default: what the game asks for)
 //   BL_WIDESCREEN=stretch    keep the game's 4:3 projection on wider modes (default: corrected)
-//   BL_MSAA=n                multisampling of the back buffer and its depth buffer (default 2, 1 = off)
+//   BL_MSAA=n                multisampling of the back buffer and its depth buffer (default 4, 1 = off)
 //   BL_ANISO=n               anisotropic filtering for filtered mipmapped textures (default 16, 1 = off)
 //   BL_AO=0|1|show           ambient occlusion (see post_run), over the options' check box;
 //                            BL_AO_RADIUS, BL_AO_STRENGTH tune it
@@ -64,6 +64,7 @@
 #include <string.h>
 
 #include "bl_bsp.h"
+#import "tex_detail.h"
 #include "bl_cocoa.h"
 #include "bl_win32.h"
 #include "d3d9_shader.h"
@@ -74,6 +75,11 @@ static id<MTLCommandQueue> queue;
 static id<MTLCommandBuffer> cmd;
 static id<MTLRenderCommandEncoder> enc;
 static struct obj *enc_color, *enc_depth;  // targets of the open pass
+static int env_detail = -1;  // see detail_bind
+static float env_detail_strength = 1.0f, env_shine = 4.0f, env_charlight = 1.0f;
+static int env_upscale_off;  // BL_UPSCALE=0: the game's own colour textures for characters
+static int env_sss_eyes = 1;  // BL_SSS_EYES=0: no eye highlights
+static int env_edges_off;  // BL_EDGES=0: plain alpha to coverage
 static int enc_samples = 1;                // and its sample count
 static int enc_info;                       // and whether it draws reflection info (info_texture)
 #define INFO_FORMAT MTLPixelFormatRGBA16Float
@@ -101,7 +107,7 @@ static int env_widescreen;  // correct the 4:3 projection on wider modes (BL_WID
 static int frame_has_3d, menu_frame;  // a perspective draw to the back buffer: this frame, the last
 static int last_3d;
 static float frame_squeeze = 1;       // menu draws this frame were narrowed to this share of the width
-static int msaa;        // samples for the back buffer and its depth (BL_MSAA, default 2; 1 = off)
+static int msaa;        // samples for the back buffer and its depth (BL_MSAA, default 4; 1 = off)
 static int deep_color;  // 16-bit back buffer, 10-bit window (BL_DEEP_COLOR, default on)
 
 // Effects at the end of the world view, before the view model and HUD (post_run):
@@ -1020,7 +1026,7 @@ static void ensure_device(void)
     env_shader_early = !(getenv("BL_SHADER_EARLY") && !strcmp(getenv("BL_SHADER_EARLY"), "0"));
     env_aniso = getenv("BL_ANISO") ? atoi(getenv("BL_ANISO")) : 16;
     env_aniso = env_aniso < 1 ? 1 : env_aniso > 16 ? 16 : env_aniso;
-    msaa = getenv("BL_MSAA") ? atoi(getenv("BL_MSAA")) : 2;
+    msaa = getenv("BL_MSAA") ? atoi(getenv("BL_MSAA")) : 4;
     deep_color = !(getenv("BL_DEEP_COLOR") && !strcmp(getenv("BL_DEEP_COLOR"), "0"));
     env_widescreen = !(getenv("BL_WIDESCREEN") && !strcmp(getenv("BL_WIDESCREEN"), "stretch"));
     if (msaa < 1 || ![mtl supportsTextureSampleCount:(NSUInteger)msaa]) msaa = 1;
@@ -1038,6 +1044,13 @@ static void ensure_device(void)
                   : !strcmp(tm, "pbr")  ? 3
                   : !strcmp(tm, "pbrx") ? 4
                                         : 0;
+    env_detail = !(getenv("BL_DETAIL") && !strcmp(getenv("BL_DETAIL"), "0"));
+    if (getenv("BL_DETAIL_STRENGTH")) env_detail_strength = (float)atof(getenv("BL_DETAIL_STRENGTH"));
+    if (getenv("BL_SHINE")) env_shine = (float)atof(getenv("BL_SHINE"));
+    if (getenv("BL_CHARLIGHT")) env_charlight = (float)atof(getenv("BL_CHARLIGHT"));
+    env_upscale_off = getenv("BL_UPSCALE") && !strcmp(getenv("BL_UPSCALE"), "0");
+    env_sss_eyes = !(getenv("BL_SSS_EYES") && !strcmp(getenv("BL_SSS_EYES"), "0"));
+    env_edges_off = getenv("BL_EDGES") && !strcmp(getenv("BL_EDGES"), "0");
     env_tonemap_expand = getenv("BL_TONEMAP_EXPAND") ? (float)atof(getenv("BL_TONEMAP_EXPAND")) : 0.8f;
     env_hdr_peak = getenv("BL_HDR_PEAK") ? (float)atof(getenv("BL_HDR_PEAK")) : 4;
     env_hdr_knee = getenv("BL_HDR_KNEE") ? (float)atof(getenv("BL_HDR_KNEE")) : 0.05f;
@@ -2208,6 +2221,44 @@ static NSString *const fx_source =
      // Pass 1 (across) blurs the light alone (src: the reflection info); pass 2 (down)
      // blurs pass 1, then multiplies the blurred light by the skin's own colour (the
      // picture divided by its unblurred light), so the texture stays sharp.
+     // Eyes: the eyeball's shape from depth (half resolution, from neighbours on the
+     // eyeball too), a small catchlight from a light up and to the left of the camera, as
+     // in film, the map's lights as tight highlights and a faint wet sheen. All scaled
+     // by how lit the eye is (its own brightness, the white of an eye being about 0.6).
+     "static float4 eye_shine(constant FP &a, texture2d<float> zt, texture2d<float> info, int2 p, float4 o,\n"
+     "                        constant FL *L) {\n"
+     "    int2 h = p / 2, fm = int2(a.full) - 1;\n"
+     "    float3 P0 = hpos(a, zt, h);\n"
+     "    if (P0.z <= 0.0) return o;\n"
+     "    bool e[4]; float3 q[4];\n"
+     "    for (int i = 0; i < 4; i++) {\n"
+     "        int2 d = int2(i == 0 ? 1 : i == 1 ? -1 : 0, i == 2 ? 1 : i == 3 ? -1 : 0);\n"
+     "        float w = info.read(uint2(clamp((h + d) * 2, int2(0), fm))).w;\n"
+     "        q[i] = hpos(a, zt, h + d), e[i] = w < -2.5 && w > -3.5 && abs(q[i].z - P0.z) < 0.02 * P0.z + 0.5;\n"
+     "    }\n"
+     "    float3 dx = e[0] && e[1] ? q[0] - q[1] : e[0] ? q[0] - P0 : e[1] ? P0 - q[1] : float3(1.0, 0.0, 0.0);\n"
+     "    float3 dy = e[2] && e[3] ? q[2] - q[3] : e[2] ? q[2] - P0 : e[3] ? P0 - q[3] : float3(0.0, 1.0, 0.0);\n"
+     "    float3 N = normalize(cross(dx, dy));\n"
+     "    float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.full.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.full.y);\n"
+     "    float3 P = float3(ndc.x * P0.z / a.p00, ndc.y * P0.z / a.p11, P0.z), V = -normalize(P);\n"
+     "    if (dot(N, V) < 0.0) N = -N;\n"
+     "    const float3 lw = float3(0.2126, 0.7152, 0.0722);\n"
+     "    float lit = clamp(dot(o.rgb, lw) / 0.6, 0.15, 1.5);\n"
+     "    float3 lc = normalize(V + float3(-0.35, 0.45, 0.0));\n"
+     "    float nc = saturate(dot(N, normalize(lc + V)));\n"
+     "    float3 add = float3(1.0, 0.97, 0.92) * (pow(nc, 400.0) * 1.2 + pow(nc, 40.0) * 0.05);\n"
+     "    float3 sp = 0.0; float E = 0.0;\n"
+     "    for (int k = 0; k < int(a.nlights); k++) {\n"
+     "        float3 v = L[k].pos.xyz - P;\n"
+     "        float d2 = max(dot(v, v), 64.0), d = sqrt(d2);\n"
+     "        float3 l = v / d;\n"
+     "        float li = dot(L[k].color.rgb, lw) / (L[k].att.x + L[k].att.y * d + L[k].att.z * d2);\n"
+     "        E += li;\n"
+     "        float nh = saturate(dot(N, normalize(l + V)));\n"
+     "        sp += L[k].color.rgb / max(dot(L[k].color.rgb, lw), 1e-4) * li * pow(nh, 300.0) * 2.0;\n"
+     "    }\n"
+     "    if (E > 1e-6) add += sp / E;\n"
+     "    return float4(saturate(o.rgb + lit * add), o.a); }\n"
      "fragment float4 skin_blur(V in [[stage_in]], texture2d<float> src [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
      "                          texture2d<float> zt [[texture(2)]], texture2d<float> orig [[texture(3)]],\n"
      "                          texture2d<float> nt [[texture(4)]], constant FP &a [[buffer(0)]],\n"
@@ -2215,6 +2266,7 @@ static NSString *const fx_source =
      "    int2 p = int2(in.pos.xy), m = int2(a.full) - 1;\n"
      "    float4 f = info.read(uint2(p)), c = src.read(uint2(p));\n"
      "    bool fin = a.final > 0.5;\n"
+     "    if (f.w < -2.5 && f.w > -3.5) return fin ? eye_shine(a, zt, info, p, orig.read(uint2(p)), L) : c;\n"
      "    if (f.w > -0.5 || f.w < -1.5) return fin ? orig.read(uint2(p)) : c;\n"
      "    float w = zt.read(uint2(clamp(p / 2, int2(0), int2(a.hsize) - 1))).x;\n"
      "    float3 s = c.rgb, ws = 1.0;\n"
@@ -2251,7 +2303,7 @@ static NSString *const fx_source =
      // turns away from the camera.
      "    constexpr sampler ls(filter::linear, address::clamp_to_edge);\n"
      "    float4 nn = nt.sample(ls, (float2(p) + 0.5) / a.full);\n"
-     "    if (a.sheen > 0.0 && nn.w > 0.5 && tone > 0.0) {\n"
+     "    if (a.sheen > 0.0 && nn.w > 0.5 && tone > 0.0 && f.w > -1.1) {\n"
      "        float3 N = normalize(nn.xyz);\n"
      "        float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.full.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.full.y);\n"
      "        float3 P = float3(ndc.x * w / a.p00, ndc.y * w / a.p11, w), V = -normalize(P);\n"
@@ -2620,6 +2672,30 @@ static void log_draw(struct d3d_state *s, const char *what, uint32_t type, uint3
 }
 
 // Everything a draw needs except vertex and index data; returns 0 if it cannot draw.
+// Characters' detail normal maps (BL_DETAIL=0 off; BL_DETAIL_STRENGTH, default 1; the
+// shine they and their roughness maps give skin and cloth, BL_SHINE, default 4; light
+// with a direction across them, BL_CHARLIGHT, 0 to 1, default 1): the map
+// for the draw setup_draw is on, bound at [[texture(15)]] with the camera and the map's
+// lights at [[buffer(2)]] (d3d9_shader.c ps_detail).
+static id<MTLTexture> detail_map, detail_color;  // detail_color: the upscaled colour texture, or nil
+static int view_lights(void);
+static void detail_bind(id<MTLRenderCommandEncoder> e)
+{
+    // 0: depth and projection; 1: 1 / target size, bump strength, light count; then four
+    // per light (struct fog_light: position and range, colour and spot's inner cosine,
+    // spot direction and outer cosine, falloff); last: the shine's strength.
+    float dl[2 + 4 * 8 + 1][4] = {{view_proj.alpha, view_proj.beta, view_proj.p00, view_proj.p11}};
+    id<MTLTexture> rt = enc_color ? target_texture(enc_color) : nil;
+    int n = env_sss_sheen >= 0 ? view_lights() : 0;
+    if (n > 8) n = 8;
+    dl[1][0] = rt ? 1.0f / (float)rt.width : 0, dl[1][1] = rt ? 1.0f / (float)rt.height : 0;
+    dl[1][2] = env_detail_strength, dl[1][3] = (float)n;
+    for (int i = 0; i < n; i++) memcpy(dl[2 + 4 * i], &frame_lights[i], sizeof frame_lights[i]);
+    dl[2 + 4 * 8][0] = env_shine, dl[2 + 4 * 8][1] = env_charlight;
+    [e setFragmentBytes:dl length:sizeof dl atIndex:2];
+    [e setFragmentTexture:detail_map atIndex:15];
+}
+static uint32_t draw_prims;  // the draw setup_draw is for: its primitives
 static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32_t type, struct element *el, int nel,
                       struct pipe_key *k)
 {
@@ -2689,6 +2765,23 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
             for (int i = 0; i < 16; i++)
                 if ((vs->info.input_mask & (1u << i)) && (vs->info.input_usage[i] == 1 || vs->info.input_usage[i] == 2))
                     k->psv.skin = 1;
+        // Eyeballs: a few dozen triangles with a 128x128 colour texture, in a character's
+        // vertex layout (with bone weights or indices, though their shader reads neither).
+        if (env_sss && env_sss_eyes && k->info == 2 && draw_prims <= 64 && s->texture[0] &&
+            s->texture[0]->width == 128 && s->texture[0]->height == 128)
+            for (int i = 0; i < nel; i++)
+                if (el[i].usage == 1 || el[i].usage == 2) k->psv.skin = 2;
+        // A character's detail normal map (tex_detail.m), when one was made for its texture.
+        detail_map = nil, detail_color = nil;
+        struct obj *t0 = s->texture[0];
+        if (k->psv.skin == 1 && env_detail > 0 && t0 && t0->type == OBJ_TEXTURE && t0->subs[0] && t0->subs[0]->mem) {
+            id<MTLTexture> color = nil;
+            detail_map = bl_detail_normal(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
+                                          t0->subs[0]->pitch, &color);
+            detail_color = env_upscale_off ? nil : color;
+            k->psv.detail = detail_map != nil;
+            k->vsv.smooth_normal = k->psv.detail;
+        }
     }
 
     id<MTLFunction> vf = shader_function(vs, &k->vsv), pf = shader_function(ps, &k->psv);
@@ -2804,6 +2897,7 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     }
     pp.alpha_func = rs[15] ? rs[25] : 8;  // ALPHATESTENABLE, ALPHAFUNC
     pp.alpha_ref = (rs[24] & 255) / 255.0f;
+    pp.edge = k->alpha_to_coverage && !env_edges_off;
     if (rs[28]) {  // FOGENABLE
         uint32_t c = rs[34];
         pp.fog_color[0] = (c >> 16 & 255) / 255.0f, pp.fog_color[1] = (c >> 8 & 255) / 255.0f;
@@ -2813,12 +2907,14 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         pp.fog_start = u2f(rs[36]), pp.fog_end = u2f(rs[37]), pp.fog_density = u2f(rs[38]);
     }
     [e setFragmentBytes:&pp length:sizeof pp atIndex:1];
+    if (k->psv.detail) detail_bind(e);
 
     for (uint32_t i = 0; i < D3D_SHADER_MAX_SAMPLERS; i++) {
         if (!(ps->info.sampler_mask & (1u << i))) continue;
         struct obj *t = s->texture[i];
         id<MTLTexture> mt = t ? texture_of(t) : dummy_texture(k->psv.tex_kind[i]);
         if (tex_kind_of(t) != k->psv.tex_kind[i]) mt = dummy_texture(k->psv.tex_kind[i]);
+        if (i == 0 && k->psv.detail && detail_color) mt = detail_color;
         [e setFragmentTexture:mt atIndex:i];
         [e setFragmentSamplerState:sampler_state(s->ss[i], mt.mipmapLevelCount > 1) atIndex:i];
     }
@@ -2868,6 +2964,7 @@ void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
     post_before_draw(s, el, nel);
     id<MTLRenderCommandEncoder> e = pass(s);
     struct pipe_key k;
+    draw_prims = count;
     if (!setup_draw(s, e, type, el, nel, &k)) return;
     if (env_tex_stats && (long)frames == draw_stats_frame) {
         // debugging: brightness of each plain 32-bit texture the frame samples, once per texture
@@ -3036,6 +3133,7 @@ void d3d_render_draw_up(struct d3d_state *s, uint32_t type, uint32_t min_index, 
     // UP draws read stream 0 with the given stride.
     uint32_t saved_stride = s->stream_stride[0];
     s->stream_stride[0] = stride;
+    draw_prims = count;
     int ok = setup_draw(s, e, type, el, nel, &k);
     s->stream_stride[0] = saved_stride;
     if (!ok) return;

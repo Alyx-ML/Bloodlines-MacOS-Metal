@@ -56,6 +56,7 @@ void bl_vgui_GetCursorLine_c(_cpu *cpu)
 // sliders. The box is a plain vgui::CheckButton (0xfc bytes): SetFont at vtable +0x1d8,
 // GetFont at +0x1dc, SetSelected(bool) at +0x23c; IsSelected() reads the byte at +0xba.
 #include "bl_vm.h"
+#include <math.h>
 
 extern char GameUI_operator_new[], GameUI_CheckButton_ctor[], GameUI_Panel_SetPos[], GameUI_Panel_GetPos[],
     GameUI_Panel_SetSize[], GameUI_Panel_GetSize[], GameUI_PropertyPage_dtor[], GameUI_SubVisual_Update[],
@@ -85,11 +86,12 @@ static uint32_t vcall(void *cpu, uint32_t self, uint32_t slot, int nargs, const 
 
 // The boxes go where optionssubvisual.res leaves room, in its units (scaled to the
 // screen like the rest: "Combat effects" is 28 tall there): "Ambient Occlusion" just
-// below "Combat effects" (336,160 360x28) and the size of it, the others beside the
-// "Particles" slider (340,216 180x80). In the page's Copperplate font.
+// below "Combat effects" (336,160 360x28), the others in a column to the right of the
+// "Shadow count" slider, from level with it down to "Ambient Occlusion". In the page's
+// Copperplate font.
 // From Combat effects: x, y, width (0: Combat effects' own).
-static const int box_place[NBOXES][3] = { { 0, 28, 0 },      { 224, 56, 240 },  { 224, 84, 240 },
-                                           { 224, 112, 240 }, { 224, 140, 240 }, { 224, 168, 240 } };
+static const int box_place[NBOXES][3] = { { 0, 28, 248 },     { 248, -84, 240 }, { 248, -56, 240 },
+                                           { 248, -28, 240 }, { 248, 0, 240 },   { 248, 28, 240 } };
 static void make_boxes(void *cpu, uint32_t page)
 {
     static uint32_t names[NBOXES], texts[NBOXES], out;
@@ -111,7 +113,8 @@ static void make_boxes(void *cpu, uint32_t page)
         if (!box) return;
         uint32_t a[3] = { page, names[i], texts[i] };
         call_this(cpu, GameUI_CheckButton_ctor, box, 3, a);
-        uint32_t at[2] = { pos[0] + (uint32_t)(box_place[i][0] * k + 0.5), pos[1] + (uint32_t)(box_place[i][1] * k + 0.5) };
+        uint32_t at[2] = { pos[0] + (uint32_t)(int32_t)floor(box_place[i][0] * k + 0.5),
+                           pos[1] + (uint32_t)(int32_t)floor(box_place[i][1] * k + 0.5) };
         uint32_t wh[2] = { box_place[i][2] ? (uint32_t)(box_place[i][2] * k + 0.5) : sz[0], sz[1] };
         call_this(cpu, GameUI_Panel_SetPos, box, 2, at);
         call_this(cpu, GameUI_Panel_SetSize, box, 2, wh);

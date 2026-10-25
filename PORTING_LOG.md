@@ -1402,3 +1402,45 @@ the Visual options (`bl_vgui.c`: "HDR", "Volumetric Light", "Skin Scattering").
   with the lamps downtown.
 - Not verified: other levels' characters, the look in motion, GPU time of skin
   scattering on its own, Metal API validation with the new passes.
+
+## 2026-10-25 — 4x MSAA, sharp cut-out edges, options layout, character detail and lighting
+
+- **4x MSAA** by default (`BL_MSAA`, was 2).
+- **Cut-out edges.** Alpha-tested draws (hair, fences, foliage) with alpha to coverage
+  place the edge from how fast alpha changes across the pixel (`ps_alpha_and_fog`, the
+  `edge` parameter), so the samples give a smooth, sharp edge instead of a dithered
+  one. `BL_EDGES=0` off.
+- **Options page.** The Visual check boxes sit in a column beside Shadow Count so none
+  is cut off (`bl_vgui.c`).
+- **Character textures from the player's own game.** `tools/tex_extract.py` reads the
+  character textures out of the VPKs (Unofficial Patch's loose files first) into
+  `build/textures/characters` (git-ignored: the game's art), with an 8x8 colour
+  signature each. `tools/tex_normals.py`, run with chaiNNer's Python, makes a normal map
+  and a roughness map for each NPC and player texture (1005, hair, eyes, teeth, lenses
+  and gore left out) with PBRify_Remix's models, which the player downloads. At draw
+  time `tex_detail.m` recognises the game's texture by size and signature (mean
+  difference under 0.01) and binds the maps.
+- **Smooth normals.** Normal mapping without stored tangents took the surface from the
+  triangle and showed every facet of the low-poly faces. Detail draws now run the vertex
+  shader twice, the second time on the position nudged along the model's normal through
+  the same bones, and the step between the two is the smooth normal. The maps keep only
+  their middle detail: the broad slopes the model guessed from the painted shading
+  fought the mesh, and the finest grain looked like concrete.
+- **Shine.** GGX specular with the roughness map (skin's 2.8% head on, Schlick Fresnel)
+  and a soft "Charlie" sheen on rough cloth, from the map's lights, scaled to the game's
+  own light there. Characters shone this way are marked -1.25 so the skin pass adds no
+  second shine. `BL_SHINE` (default 4, 0 off).
+- **Light with a direction.** The game lights characters per vertex, mostly from an even
+  ambient, so faces looked flat. The light is shared out again per pixel: a third even,
+  the rest by how the surface faces each nearby light, with a little wrap for skin; the
+  same on average. `BL_CHARLIGHT` (0 to 1, default 1).
+- **Upscaled faces, tried and stopped.** `tools/tex_upscale.py` (PBRify's 4x DAT
+  upscaler) and the swap in `tex_detail.m` (`BL_UPSCALE=0` off) work, but at talking
+  distance the sharper texture is hardly visible; only 7 were made.
+
+- Verified (M4 Pro, 1920x1080, headless, no audio): `sm_asylum_1`, Jeanette's dialog
+  close-up with each effect off and on; no triangle facets at 4x bump strength; the
+  maps load for the Asylum's characters and the player's.
+- Not verified: other levels, the look in motion, lights behind walls (not tested for
+  occlusion yet, so a light in the next room can light a character), hair (still the
+  game's flat light), GPU cost of the doubled vertex shader.

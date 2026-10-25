@@ -43,8 +43,15 @@ struct d3d_shader_variant {
     uint8_t reflection_info;
     // Pixel, with reflection_info: a character (metal_render.m skin_run) writes
     // [[color(1)]] as its light alone (the colour texture read as white) and -1, or
-    // without a colour texture 0 0 0 -2.
+    // without a colour texture 0 0 0 -2. 2: an eyeball, 0 0 0 -3 (for its highlight).
     uint8_t skin;
+    // With skin 1: a normal map for the colour texture at [[texture(15)]] and the
+    // camera and lights at [[buffer(2)]] (metal_render.m detail_lights): the light is
+    // scaled by how the map's bumps turn towards the lights (tex_detail.m).
+    uint8_t detail;
+    // Vertex: also output the clip-space step to the position nudged along the normal
+    // (BLVSOut.bln), the smooth normal detail maps are laid on.
+    uint8_t smooth_normal;
 };
 
 // Pixel shader samplers that read a reflection cubemap: cube samplers whose result is
@@ -75,7 +82,8 @@ struct d3d_ps_params {
     uint32_t fog_mode;        // 0 off, 1 vertex (oFog), 2 linear, 3 exp, 4 exp2 (per pixel)
     float alpha_ref;
     uint32_t alpha_func;      // D3DCMPFUNC; 8 (ALWAYS) when alpha test is off
-    float pad[2];
+    float edge;               // 1: alpha to coverage, the cut-out's edge from its alpha's slope
+    float pad;
 };
 
 // Fixed-function pixel stages (draws with no pixel shader): the texture stage states

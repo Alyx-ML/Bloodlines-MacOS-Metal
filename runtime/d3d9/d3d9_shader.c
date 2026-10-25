@@ -268,6 +268,7 @@ struct gen {
     // Skin (variant skin): stage 0, the colour texture, read as white for now (its alpha
     // kept, which may mask the shine).
     int white_base;
+    char base_coord[96];  // what stage 0's 2D texture is read with (for the detail normal map)
 };
 
 static const char comp[] = "xyzw";
@@ -451,6 +452,7 @@ static void sample(struct gen *g, uint32_t stage, const char *coord, const char 
         snprintf(buf, len, "float4(1.0, 1.0, 1.0, tex0.sample(smp0, (%s).xy%s).w)", coord, extra ? extra : "");
         return;
     }
+    if (stage == 0 && k == D3D_TEX_2D && !g->base_coord[0]) snprintf(g->base_coord, sizeof g->base_coord, "%s", coord);
     snprintf(buf, len, "tex%u.sample(smp%u, (%s).%s%s)", stage, stage, coord, k == D3D_TEX_2D ? "xy" : "xyz",
              extra ? extra : "");
 }
@@ -469,13 +471,14 @@ static const char *const header =
     "using namespace metal;\n"
     "struct BLVSParams { int4 i[16]; uint b[16]; float2 inv_viewport; float clip_y; float pad; };\n"
     "struct BLPSParams { int4 i[16]; uint b[16]; float4 bumpenv[8]; float4 bumpenv_l[8]; float4 fog_color;\n"
-    "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float2 pad; };\n"
+    "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float edge, pad; };\n"
     "struct BLVSOut {\n"
     "    float4 pos [[position]]; float psize [[point_size]];\n"
     "    float4 d0 [[user(d0)]]; float4 d1 [[user(d1)]];\n"
     "    float4 t0 [[user(t0)]]; float4 t1 [[user(t1)]]; float4 t2 [[user(t2)]]; float4 t3 [[user(t3)]];\n"
     "    float4 t4 [[user(t4)]]; float4 t5 [[user(t5)]]; float4 t6 [[user(t6)]]; float4 t7 [[user(t7)]];\n"
     "    float fog [[user(fog)]]; float fogz [[user(fogz)]];\n"
+    "    float4 bln [[user(bln)]];\n"
     "};\n"
     "struct BLPSIn {\n"
     "    float4 pos [[position]];\n"
@@ -483,6 +486,7 @@ static const char *const header =
     "    float4 t0 [[user(t0)]]; float4 t1 [[user(t1)]]; float4 t2 [[user(t2)]]; float4 t3 [[user(t3)]];\n"
     "    float4 t4 [[user(t4)]]; float4 t5 [[user(t5)]]; float4 t6 [[user(t6)]]; float4 t7 [[user(t7)]];\n"
     "    float fog [[user(fog)]]; float fogz [[user(fogz)]];\n"
+    "    float4 bln [[user(bln)]];\n"
     "};\n"
     "static inline float4 bl_c(constant float4 *c, int i, int n) { return uint(i) < uint(n) ? c[i] : float4(0.0); }\n"
     "static inline float4 bl_lit(float4 s) {\n"
@@ -773,11 +777,103 @@ static int gen_body(struct gen *g)
     return r;
 }
 
+// A character's detail normal map: the surface's view-space position from the pixel's
+// distance (bl_dl[0]: z, w the projection's scales; bl_dl[1]: 1 / target size,
+// strength, light count), its tangent frame from how position and texture
+// coordinates change across the pixel ("normal mapping without precomputed tangents"),
+// laid on the model's smooth normal. The light (oc0 and _l together, so the skin pass's colour
+// stays the texture's) is scaled by how far the bumps tilt towards the map's lights
+// (bl_dl[2 + 4k] to [5 + 4k]: metal_render.m's struct fog_light), and the shine added
+// (bl_dl[34].x its strength; the map's alpha is the roughness), and the light given a direction.
+static void ps_detail(struct out *o, const char *coord)
+{
+    line(o, "{");
+    o->indent++;
+    line(o, "constexpr sampler bl_ds(filter::linear, mip_filter::linear, address::repeat);");
+    // Distance from the rasteriser's 1/w: the depth, near 1 up close, has too few bits left
+    // for its change across a pixel.
+    line(o, "float _zw = 1.0 / in.pos.w;");
+    line(o, "float2 _ndc = float2(in.pos.x * bl_dl[1].x * 2.0 - 1.0, 1.0 - in.pos.y * bl_dl[1].y * 2.0);");
+    line(o, "float3 _P = float3(_ndc.x * _zw / bl_dl[0].z, _ndc.y * _zw / bl_dl[0].w, _zw);");
+    line(o, "float2 _uv = (%s).xy;", coord);
+    line(o, "float3 _px = dfdx(_P), _py = dfdy(_P); float2 _ux = dfdx(_uv), _uy = dfdy(_uv);");
+    line(o, "float3 _N = normalize(cross(_px, _py));");
+    line(o, "if (dot(_N, _P) > 0.0) _N = -_N;");
+    line(o, "float3 _r1 = cross(_py, _N), _r2 = cross(_N, _px);");
+    line(o, "float3 _T = _r1 * _ux.x + _r2 * _uy.x, _B = _r1 * _ux.y + _r2 * _uy.y;");
+    // The model's smooth normal from the vertex shader (in.bln, a clip-space step), or
+    // the triangle's.
+    line(o, "float3 _Ns = float3(in.bln.x / bl_dl[0].z, in.bln.y / bl_dl[0].w, in.bln.w);");
+    line(o, "_Ns = dot(_Ns, _Ns) > 1e-12 ? normalize(_Ns) : _N;");
+    line(o, "_T = normalize(_T - _Ns * dot(_T, _Ns) + 1e-12); _B = normalize(_B - _Ns * dot(_B, _Ns) + 1e-12);");
+    line(o, "float3 _nm = bl_dn.sample(bl_ds, _uv).xyz * 2.0 - 1.0;");
+    line(o, "float3 _n = normalize(_T * _nm.x - _B * _nm.y + _Ns * max(_nm.z, 0.05));");
+    // Half-Lambert light on the bumps over the same on the smooth surface: 1 where the
+    // map is flat, so the game's own lighting is kept and only the bumps are added.
+    // The shine, from the same lights (each its share of the game's light here, so it
+    // follows the game's lighting): GGX specular with the roughness map's roughness
+    // (skin's 2.8% head on, Schlick's Fresnel), and on rough cloth a soft sheen at the
+    // edges ("Charlie" sheen), tinted by the cloth's colour.
+    line(o, "float4 _ms = bl_dn.sample(bl_ds, _uv);");
+    line(o, "float _rg = clamp(_ms.w, 0.22, 1.0), _a2 = _rg * _rg * _rg * _rg;");
+    line(o, "float _cloth = smoothstep(0.6, 0.85, _rg);");
+    line(o, "float3 _V = -normalize(_P); float _nv = saturate(dot(_n, _V)) + 1e-4;");
+    line(o, "float _f = 0.0, _E = 0.0, _S = 0.0, _Sh = 0.0, _Et = 0.0, _Dl = 0.0;");
+    line(o, "for (int _k = 0; _k < int(bl_dl[1].w); _k++) {");
+    line(o, "    float4 _lp = bl_dl[2 + 4 * _k], _lc = bl_dl[3 + 4 * _k], _ld = bl_dl[4 + 4 * _k], _at = bl_dl[5 + 4 * _k];");
+    line(o, "    float3 _v = _lp.xyz - _P;");
+    line(o, "    float _d2 = max(dot(_v, _v), 64.0), _dd = sqrt(_d2);");
+    line(o, "    float3 _L = _v / _dd;");
+    line(o, "    float _e = dot(_lc.xyz, float3(0.2126, 0.7152, 0.0722)) / (_at.x + _at.y * _dd + _at.z * _d2);");
+    line(o, "    if (_lp.w > 0.0) { float _x = _dd / _lp.w; _e *= saturate(1.0 - _x * _x * _x * _x); }");
+    line(o, "    if (dot(_ld.xyz, _ld.xyz) > 0.25) {");
+    line(o, "        float _cs = dot(-_L, _ld.xyz);");
+    line(o, "        _e *= _cs <= _ld.w ? 0.0 : saturate((_cs - _ld.w) / max(_lc.w - _ld.w, 1e-4));");
+    line(o, "    }");
+    line(o, "    _E += _e * (dot(_Ns, _L) * 0.5 + 0.5), _f += _e * (dot(_n, _L) * 0.5 + 0.5);");
+    line(o, "    _Et += _e, _Dl += _e * saturate((dot(_n, _L) + 0.2) / 1.2);");
+    line(o, "    float _nl = saturate(dot(_n, _L));");
+    line(o, "    if (_nl <= 0.0 || _e <= 0.0) continue;");
+    line(o, "    float3 _H = normalize(_L + _V);");
+    line(o, "    float _nh = saturate(dot(_n, _H)), _vh = saturate(dot(_V, _H));");
+    line(o, "    float _dn = _nh * _nh * (_a2 - 1.0) + 1.0, _D = _a2 / (3.14159 * _dn * _dn);");
+    line(o, "    float _vis = 0.5 / (_nl * sqrt(_nv * _nv * (1.0 - _a2) + _a2) + _nv * sqrt(_nl * _nl * (1.0 - _a2) + _a2));");
+    line(o, "    float _F = 0.028 + 0.972 * pow(1.0 - _vh, 5.0);");
+    line(o, "    _S += _e * _D * _vis * _F * _nl;");
+    line(o, "    float _sr = 1.0 / max(_rg * _rg, 0.05), _sn = sqrt(saturate(1.0 - _nh * _nh));");
+    line(o, "    _Sh += _e * (2.0 + _sr) * pow(_sn, _sr) / 6.28318 / (4.0 * (_nl + _nv - _nl * _nv)) * _nl;");
+    line(o, "}");
+    line(o, "float _q = _E > 1e-6 ? clamp(1.0 + 2.0 * bl_dl[1].z * (_f / _E - 1.0), 0.6, 1.5) : 1.0;");
+    // Light with a direction (bl_dl[34].y its strength): the game lights characters per
+    // vertex, mostly from an even ambient, so faces look flat. Its light here is shared
+    // out again per pixel: a third stays even, the rest by how the surface (smooth
+    // normal and bumps) faces each light, with a little wrap for skin's soft edge. The
+    // same on average, brighter towards the lights and darker away from them.
+    line(o, "if (_Et > 1e-6 && bl_dl[34].y > 0.0) {");
+    line(o, "    float _amb = 0.35 * _Et;");
+    line(o, "    _q = mix(_q, clamp((_amb + _Dl) / (_amb + 0.5 * _Et), 0.35, 1.8), saturate(bl_dl[34].y));");
+    line(o, "}");
+    line(o, "if (_E > 1e-6 && bl_dl[34].x > 0.0) {");
+    line(o, "    float3 _alb = clamp(oc0.xyz / max(_l, float3(1e-3)), 0.0, 1.0);");
+    line(o, "    float3 _sh = _l * (3.14159 * bl_dl[34].x / _E) * (_S * (1.0 - 0.7 * _cloth) + 0.35 * _cloth * _Sh * _alb);");
+    line(o, "    oc0.xyz += min(_sh, float3(1.0));");
+    line(o, "}");
+    line(o, "oc0.xyz *= _q; _l *= _q;");
+    o->indent--;
+    line(o, "}");
+}
+
 // Alpha test and fog on oc0, as the fixed-function back end does after any pixel shader.
 // _fog: the share of the colour the fog leaves.
 static void ps_alpha_and_fog(struct out *o)
 {
-    line(o, "if (!bl_cmp(p.alpha_func, oc0.w, p.alpha_ref)) discard_fragment();");
+    // With alpha to coverage (p.edge), a "greater" test's edge is placed from how fast
+    // alpha changes across the pixel, so the samples cover it in proportion: a smooth,
+    // sharp edge instead of a jagged one, or a dithered one from plain coverage.
+    line(o, "if (p.edge > 0.5 && (p.alpha_func == 5 || p.alpha_func == 7) && p.alpha_ref > 0.002) {");
+    line(o, "    oc0.w = saturate((oc0.w - p.alpha_ref) / max(fwidth(oc0.w), 1e-4) + 0.5);");
+    line(o, "    if (oc0.w <= 0.0) discard_fragment();");
+    line(o, "} else if (!bl_cmp(p.alpha_func, oc0.w, p.alpha_ref)) discard_fragment();");
     line(o, "float _fog = 1.0;");
     line(o, "if (p.fog_mode != 0) {");
     line(o, "    float z = in.fogz, f = in.fog;");
@@ -836,7 +932,31 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         line(o, "float4 opos = 0, ofog = float4(1.0), opts = float4(1.0), od0 = float4(1.0), od1 = 0;");
         line(o, "float4 ot0 = 0, ot1 = 0, ot2 = 0, ot3 = 0, ot4 = 0, ot5 = 0, ot6 = 0, ot7 = 0;");
         if (gen_body(&g)) goto failed;
+        // A smooth normal (v->smooth_normal): the body again on the position nudged along
+        // the model's normal, through the same bones; the step between the two clip
+        // positions is the normal (ps_detail).
+        int vp = -1, vn = -1;
+        for (int i = 0; v && v->smooth_normal && i < D3D_SHADER_MAX_INPUTS; i++)
+            if ((g.info.input_mask & (1u << i)) && !g.info.input_index[i] && v->input_kind[i] == D3D_IN_FLOAT) {
+                if (g.info.input_usage[i] == 0) vp = i;
+                if (g.info.input_usage[i] == 3) vn = i;
+            }
+        line(o, "float4 _p1 = opos, _p2 = opos;");
+        if (vp >= 0 && vn >= 0) {
+            line(o, "float4 _vp = v%d + float4(normalize(v%d.xyz + 1e-9) * 0.5, 0.0);", vp, vn);
+            line(o, "{");
+            line(o, "float4 v%d = _vp;", vp);
+            line(o, "float4 r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0, r8 = 0, r9 = 0, r10 = 0, "
+                    "r11 = 0, r12 = 0, r13 = 0, r14 = 0, r15 = 0;");
+            line(o, "int4 a0 = 0; int aL = 0;");
+            line(o, "float4 opos = 0, ofog = float4(1.0), opts = float4(1.0), od0 = float4(1.0), od1 = 0;");
+            line(o, "float4 ot0 = 0, ot1 = 0, ot2 = 0, ot3 = 0, ot4 = 0, ot5 = 0, ot6 = 0, ot7 = 0;");
+            if (start(&g.ps, code, err, errlen) || gen_body(&g)) goto failed;
+            line(o, "_p2 = opos;");
+            line(o, "}");
+        }
         line(o, "BLVSOut out;");
+        line(o, "out.bln = _p2 - _p1; out.bln.y *= p.clip_y;");
         // D3D9 samples pixel centers at integer window coordinates, Metal at +0.5.
         line(o, "out.pos = opos;");
         line(o, "out.pos.y *= p.clip_y;");
@@ -867,6 +987,9 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
             if (g.info.sampler_mask & (1u << i))
                 put(o, ",\n                         %s tex%u [[texture(%u)]], sampler smp%u [[sampler(%u)]]",
                     tex_type(tex_kind(&g, i)), i, i, i, i);
+        int detail = info && v->skin == 1 && v->detail && (g.info.sampler_mask & 1);
+        if (detail)
+            put(o, ",\n                         texture2d<float> bl_dn [[texture(15)]], constant float4 *bl_dl [[buffer(2)]]");
         put(o, ") {\n");
         o->indent = 1;
         if (g.env) {
@@ -888,7 +1011,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
             start(&g.ps, code, err, errlen);
             g.env_value = 0;
         }
-        int skin = info && v->skin && (g.info.sampler_mask & 1);
+        int skin = info && v->skin == 1 && (g.info.sampler_mask & 1);
         if (skin) {
             // The body again with the colour texture white: the light alone (_l), for the
             // light under the skin (metal_render.m skin_run).
@@ -906,15 +1029,18 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
             start(&g.ps, code, err, errlen);
         }
         ps_locals(&g);
+        g.base_coord[0] = 0;
         if (gen_body(&g)) goto failed;
         if (g.ps.major == 1) line(o, "oc0 = r0;");
         if (g.env) line(o, "float3 _d = oc0.xyz - _e0, _w = _e1 - _e0;");
+        if (detail && skin && g.base_coord[0]) ps_detail(o, g.base_coord);
         ps_alpha_and_fog(o);
         line(o, "BLPSOut out;");
         for (int i = 0; i < 4; i++)
             if (g.info.color_outputs & (1u << i)) line(o, "out.c%d = oc%d;", i, i);
-        if (skin) line(o, "out.c1 = float4(max(_l, 0.0), -1.0);");
-        else if (info && v->skin) line(o, "out.c1 = float4(0.0, 0.0, 0.0, -2.0);");
+        // -1.25: shone here (ps_detail), so the skin pass does not add its own shine.
+        if (skin) line(o, "out.c1 = float4(max(_l, 0.0), %s);", detail && g.base_coord[0] ? "-1.25" : "-1.0");
+        else if (info && v->skin) line(o, v->skin == 2 ? "out.c1 = float4(0.0, 0.0, 0.0, -3.0);" : "out.c1 = float4(0.0, 0.0, 0.0, -2.0);");
         else if (info && g.env) line(o, "out.c1 = float4(_d * _fog, (_w.x + _w.y + _w.z) * _fog / 3.0);");
         else if (info) line(o, "out.c1 = 0;");
         if (g.info.writes_depth) line(o, "out.depth = odepth;");
@@ -1048,7 +1174,7 @@ char *d3d_ff_ps_msl(const struct d3d_ff_ps *k, const struct d3d_shader_variant *
     ps_alpha_and_fog(o);
     line(o, "BLPSOut out;");
     line(o, "out.c0 = oc0;");
-    if (info) line(o, v->skin ? "out.c1 = float4(0.0, 0.0, 0.0, -2.0);" : "out.c1 = 0;");
+    if (info) line(o, v->skin == 2 ? "out.c1 = float4(0.0, 0.0, 0.0, -3.0);" : v->skin ? "out.c1 = float4(0.0, 0.0, 0.0, -2.0);" : "out.c1 = 0;");
     line(o, "return out;");
     put(o, "}\n");
     return o->s;
@@ -1095,7 +1221,7 @@ char *d3d_ff_vs_msl(const struct d3d_ff_vs *k, char *err, int errlen)
         if (k->tex_mask & (1u << n)) line(o, "out.t%d = in.v%d;", n, 3 + n);
         else line(o, "out.t%d = 0;", n);
     }
-    line(o, "out.fog = 1.0; out.fogz = out.pos.w;");
+    line(o, "out.fog = 1.0; out.fogz = out.pos.w; out.bln = 0;");
     line(o, "return out;");
     put(o, "}\n");
     return o->s;
