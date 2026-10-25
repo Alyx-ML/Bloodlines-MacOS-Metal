@@ -447,6 +447,10 @@ static void sample(struct gen *g, uint32_t stage, const char *coord, const char 
         return;
     }
     int k = tex_kind(g, stage);
+    if (g->v && stage < 8 && (g->v->shadow_receiver & (1u << stage)) && k == D3D_TEX_2D) {
+        snprintf(buf, len, "bl_shadow_once(_sh, _shd, tex%u, smp%u, (%s).xy, in.pos, sp)", stage, stage, coord);
+        return;
+    }
     if (g->white_base && stage == 0 && k == D3D_TEX_2D) {
         snprintf(buf, len, "float4(1.0, 1.0, 1.0, tex0.sample(smp0, (%s).xy%s).w)", coord, extra ? extra : "");
         return;
@@ -496,6 +500,52 @@ static const char *const header =
     "static inline bool bl_cmp(uint f, float a, float b) {\n"
     "    switch (f) { case 1: return false; case 2: return a < b; case 3: return a == b; case 4: return a <= b;\n"
     "    case 5: return a > b; case 6: return a != b; case 7: return a >= b; default: return true; }\n"
+    "}\n";
+
+// Soft shadows (variant shadow_receiver; metal_render.m, shadows): percentage-closer
+// soft shadows from the atlas. The receiver's world position comes back from its pixel's
+// depth; the cell under the texture coordinate gives the caster's light-space depth row
+// and size. A blocker search (24 point taps) averages the depth of the casters around, the
+// penumbra grows with the distance from them, and 24 filtered taps over a disc of that
+// size give the shadow (a fixed pattern: turning it per pixel showed as grain, with no
+// temporal filter to smooth it). Taps stay inside the caster's own viewport.
+static const char *const shadow_msl =
+    "struct BLShadowCell { float4 z, rect, k; };\n"
+    "struct BLShadowParams { float4 inv[4]; float4 vp, ndc, lim, show; BLShadowCell cell[64]; };\n"
+    "static float4 bl_shadow_soft(texture2d<float> t, sampler s, float2 uv, float4 fpos, constant BLShadowParams &sp) {\n"
+    "    int2 ci = clamp(int2(floor(uv * 8.0)), int2(0), int2(7));\n"
+    "    BLShadowCell cl = sp.cell[ci.y * 8 + ci.x];\n"
+    "    if (cl.k.z == 0.0) return t.sample(s, uv);\n"
+    "    float2 m = float2((fpos.x - sp.vp.x) * sp.vp.z * 2.0 - 1.0, 1.0 - (fpos.y - sp.vp.y) * sp.vp.w * 2.0);\n"
+    "    float4 h = float4(m.x - sp.ndc.y, (m.y + sp.ndc.z) / sp.ndc.x, fpos.z, 1.0);\n"
+    "    float4 w = float4(dot(sp.inv[0], h), dot(sp.inv[1], h), dot(sp.inv[2], h), dot(sp.inv[3], h));\n"
+    "    float zr = dot(cl.z.xyz, w.xyz / w.w) + cl.z.w;\n"
+    "    float2 lo = cl.rect.xy + sp.lim.w, hi = cl.rect.zw - sp.lim.w;\n"
+    "    constexpr sampler ns(filter::nearest, address::clamp_to_edge);  // depths do not filter\n"
+    "    constexpr sampler ls(filter::linear, address::clamp_to_edge);\n"
+    "    float zb = 0.0, nb = 0.0, rs = sp.lim.z * cl.k.y;\n"
+    "    for (int i = 0; i < 24; i++) {\n"
+    "        float d = sqrt(float(i) / 24.0), b = float(i) * 2.3999632;\n"
+    "        float2 o = float2(cos(b), sin(b)) * d;\n"
+    "        float4 c = t.sample(ns, clamp(uv + o * rs, lo, hi), level(0.0));\n"
+    "        if (max(c.x, max(c.y, c.z)) > 0.002) { zb += cl.k.w > 0.5 ? c.w : 1.0 - c.w; nb += 1.0; }\n"
+    "    }\n"
+    "    if (nb == 0.0) return sp.show.x > 0.0 ? float4(0.0, 0.0, 1.0, 0.0) : t.sample(s, uv);\n"
+    "    float dist = abs(zr - zb / nb) * cl.k.x;\n"
+    "    float pen = max(min(dist * sp.ndc.w, sp.lim.y) * cl.k.y, sp.lim.x);\n"
+    "    if (sp.show.x > 0.0) return float4(saturate(dist / 64.0), nb / 24.0, saturate(pen * 100.0), 0.0);\n"
+    "    float4 sum = 0.0;\n"
+    "    for (int i = 0; i < 24; i++) {\n"
+    "        float d = sqrt((float(i) + 0.5) / 24.0), b = float(i) * 2.3999632;\n"
+    "        float2 o = float2(cos(b), sin(b)) * d;\n"
+    "        sum += t.sample(ls, clamp(uv + o * pen, lo, hi), level(0.0));\n"
+    "    }\n"
+    "    return sum / 24.0;\n"
+    "}\n"
+    "static inline float4 bl_shadow_once(thread float4 &sh, thread bool &done, texture2d<float> t, sampler s, float2 uv,\n"
+    "                                    float4 fpos, constant BLShadowParams &sp) {\n"
+    "    if (!done) sh = bl_shadow_soft(t, s, uv, fpos, sp), done = true;\n"
+    "    return sh;\n"
     "}\n";
 
 static int gen_body(struct gen *g)
@@ -802,6 +852,7 @@ static void ps_locals(struct gen *g)
         line(o, "float4 t0 = in.t0, t1 = in.t1, t2 = in.t2, t3 = in.t3, t4 = in.t4, t5 = in.t5, t6 = in.t6, "
                 "t7 = in.t7;");
     line(o, "float4 oc0 = 0, oc1 = 0, oc2 = 0, oc3 = 0; float odepth = in.pos.z; float3 _m = 0;");
+    if (g->v && g->v->shadow_receiver) line(o, "float4 _sh = 0; bool _shd = false;");
 }
 
 char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, char *err, int errlen)
@@ -814,6 +865,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
     struct out *o = &g.o;
     if (g.ps.pixel && !g.info.color_outputs) g.info.color_outputs = 1;
     put(o, "%s", header);
+    if (g.ps.pixel && v && v->shadow_receiver) put(o, "%s", shadow_msl);
     if (!g.ps.pixel) {
         if (g.info.input_mask) put(o, "struct BLVSIn {\n");
         for (int i = 0; i < D3D_SHADER_MAX_INPUTS; i++) {
@@ -867,6 +919,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
             if (g.info.sampler_mask & (1u << i))
                 put(o, ",\n                         %s tex%u [[texture(%u)]], sampler smp%u [[sampler(%u)]]",
                     tex_type(tex_kind(&g, i)), i, i, i, i);
+        if (v && v->shadow_receiver) put(o, ",\n                         constant BLShadowParams &sp [[buffer(2)]]");
         put(o, ") {\n");
         o->indent = 1;
         if (g.env) {
@@ -888,7 +941,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
             start(&g.ps, code, err, errlen);
             g.env_value = 0;
         }
-        int skin = info && v->skin && (g.info.sampler_mask & 1);
+        int skin = info && v->skin == 1 && (g.info.sampler_mask & 1);
         if (skin) {
             // The body again with the colour texture white: the light alone (_l), for the
             // light under the skin (metal_render.m skin_run).
@@ -910,6 +963,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (g.ps.major == 1) line(o, "oc0 = r0;");
         if (g.env) line(o, "float3 _d = oc0.xyz - _e0, _w = _e1 - _e0;");
         ps_alpha_and_fog(o);
+        if (v && v->shadow_caster) line(o, v->shadow_caster == 2 ? "oc0.w = in.pos.z;" : "oc0.w = 1.0 - in.pos.z;");
         line(o, "BLPSOut out;");
         for (int i = 0; i < 4; i++)
             if (g.info.color_outputs & (1u << i)) line(o, "out.c%d = oc%d;", i, i);
@@ -1046,6 +1100,7 @@ char *d3d_ff_ps_msl(const struct d3d_ff_ps *k, const struct d3d_shader_variant *
     if (getenv("BL_FF_HIGHLIGHT")) line(o, "cur.xyz = float3(1.0, 0.0, 1.0);");  // debugging: show these draws
     line(o, "float4 oc0 = cur;");
     ps_alpha_and_fog(o);
+    if (v && v->shadow_caster) line(o, v->shadow_caster == 2 ? "oc0.w = in.pos.z;" : "oc0.w = 1.0 - in.pos.z;");
     line(o, "BLPSOut out;");
     line(o, "out.c0 = oc0;");
     if (info) line(o, v->skin ? "out.c1 = float4(0.0, 0.0, 0.0, -2.0);" : "out.c1 = 0;");

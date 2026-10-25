@@ -1402,3 +1402,65 @@ the Visual options (`bl_vgui.c`: "HDR", "Volumetric Light", "Skin Scattering").
   with the lamps downtown.
 - Not verified: other levels' characters, the look in motion, GPU time of skin
   scattering on its own, Metal API validation with the new passes.
+
+## 2026-10-25 — Better character shadows
+
+A new "Shadows" check box in the Visual options (`BL_SHADOWS`, off by default) turns on
+three changes to the shadows that characters and moving props cast. All the code is in
+the shadows section and the contact shadows section of `metal_render.m`.
+
+- **Sharper shadow atlas.** The game draws every caster into one 1024x1024 render
+  target. With shadows on, its Metal texture is `BL_SHADOW_RES` times the size
+  (default 4, so 4096x4096). Viewports, scissors, clears and stretch copies into it are
+  scaled to match (`struct obj` field `gpu_scale`), and its paired depth surface is
+  resized to the same scale (`shadow_match_depth`). Receivers read it with normalized
+  coordinates, so they need no change. Flipping the setting mid-game redraws the old
+  contents into the new texture.
+- **Soft shadows (PCSS).** Default on, `BL_PCSS=0` turns them off. The shadows are
+  crisp where they meet the caster and softer further away.
+  - Casters write their light-space depth into the atlas's alpha, which is 16 bits a
+    channel with shadows on (variant `shadow_caster`).
+  - Receivers' atlas reads become one lookup (variant `shadow_receiver`,
+    `bl_shadow_soft` in `d3d9_shader.c`): a 24-tap blocker search, then 24 filtered
+    taps over a penumbra sized by the distance to the blocker.
+  - Tuning: `BL_PCSS_SOFT`, `BL_PCSS_MAX`, `BL_PCSS_SEARCH`; `BL_PCSS=show` shows the
+    lookup's inputs.
+- **Contact shadows.** Default on, `BL_CONTACT=0` turns them off. This is a half
+  resolution pass after the ambient occlusion's depth.
+  - Each pixel marches 16 steps towards the light that gives it the most, up to
+    `BL_CONTACT_LENGTH` world units (default 12).
+  - Only characters cast or receive them, so baked lightmap shadows are never darkened
+    twice. Characters are marked in the reflection info: variant `skin` 2 marks them
+    without the skin pass.
+  - The result is filtered with the AO filter and multiplied in. `BL_CONTACT_STRENGTH`
+    (default 0.5) sets how much it darkens; `BL_CONTACT=show` shows the result alone.
+- `BL_SHADOWS_AB=n` flips the setting every n frames, for comparing pictures and timings
+  within one run. `BL_GPU_STATS` lines now say which frame they end at.
+- Fixed while testing: the atlas's depth surface could keep the old size for its first
+  pass. Metal validation caught this as a scissor larger than the pass.
+
+GPU time (`BL_GPU_STATS`, sm_asylum_1, Jeanette's dialog close-up, 1920x1080, M4 Pro,
+mean of 100-frame windows, shadows switched every 200 frames in the same run):
+
+| setting | ms a frame |
+|---|---|
+| shadows off | about 2.9–3.5 |
+| atlas only (`BL_SHADOW_RES=1`, `BL_PCSS=0`, `BL_CONTACT=0`) | about 2.8–3.1 (no change) |
+| 4x atlas plus PCSS, no contact | about 4.0–4.6 |
+| everything on | about 5.0–6.0 |
+
+The windows vary by up to 1 ms from run to run.
+
+- Verified: Metal API validation is clean with shadows on from the start, and with the
+  setting flipped off, on and off again. Headless captures of `sm_asylum_1` show the
+  shadows working. Contact shadows are subtle: under the feet and where the arms meet
+  the body.
+- Not verified:
+  - The options page with the 7th box. Its place, (224, 196) from "Combat effects", was
+    not seen on screen.
+  - Other levels and the look in motion.
+  - With `BL_SSR` on and `BL_SSS` off, contact shadows mark characters in the
+    reflection info, which keeps the cubemap on characters instead of screen-space
+    reflections.
+  - The cost of contact shadows in the close-up, about 1–1.5 ms, has not been
+    optimized.
