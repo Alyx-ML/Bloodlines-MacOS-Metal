@@ -60,7 +60,6 @@ Options (environment variables):
 | --- | --- |
 | `BL_WINDOW=1` | open a window (otherwise headless) |
 | `BL_FULLSCREEN=0/1` | start in a window or full screen; Cmd+Ctrl+F toggles |
-| `BL_MSAA=n` | multisampling, default 2, 1 = off |
 | `BL_ANISO=n` | anisotropic filtering, default 16, 1 = off |
 | `BL_FPS_MAX=n` | frame cap, default 60 (the game's physics expect it) |
 | `BL_SHADER_EARLY=0` | compile shaders only when a draw first needs them; by default they compile in the background when the game creates them |

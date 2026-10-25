@@ -31,7 +31,6 @@
 //   BL_PACING_STATS=1        log how many refreshes apart frames reach the screen
 //   BL_FULLSCREEN=0|1        start in a window or full screen (default: what the game asks for)
 //   BL_WIDESCREEN=stretch    keep the game's 4:3 projection on wider modes (default: corrected)
-//   BL_MSAA=n                multisampling of the back buffer and its depth buffer (default 4, 1 = off)
 //   BL_ANISO=n               anisotropic filtering for filtered mipmapped textures (default 16, 1 = off)
 //   BL_AO=0|1|show           ambient occlusion (see post_run), over the options' check box;
 //                            BL_AO_RADIUS, BL_AO_STRENGTH tune it
@@ -59,10 +58,13 @@
 //                            BL_CONTACT=0|1|show (contact shadows, default on) with
 //                            BL_CONTACT_LENGTH (world units, 12) and BL_CONTACT_STRENGTH (0..1, 0.5);
 //                            BL_SHADOWS_AB=n turns the setting over every n frames (comparisons)
-//   BL_GPU_STATS=1           log the mean GPU time per frame every 100 frames
+//   BL_TAA_JITTER=n          the temporal anti-aliasing's offset (pixels, default 0.5; see the TAA
+//                            section), negative flips it for MetalFX
+//   BL_GPU_STATS=1          log the mean GPU time per frame every 100 frames
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #import <QuartzCore/CAMetalLayer.h>
 
 #include <math.h>
@@ -85,11 +87,17 @@ static id<MTLCommandBuffer> cmd;
 static id<MTLRenderCommandEncoder> enc;
 static struct obj *enc_color, *enc_depth;  // targets of the open pass
 static int env_detail = -1;  // see detail_bind
-static float env_detail_strength = 1.0f, env_shine = 4.0f, env_charlight = 1.0f;
+static float env_detail_strength = 1.0f, env_shine = 4.0f, env_charlight = 1.0f, env_charlight_min = 0.8f;
+static int env_hair_u;  // BL_HAIR_U=1: hair strands run along the textures' u, not v
+static float env_hair_fade = 1.0f;  // BL_HAIR_FADE: hair's soft edge, world units (0 off)
+static float env_hair_soft = 0.75f;   // BL_HAIR_SOFT: hair drawn solid above this alpha, blended below (0 off)
+static float env_hair_strands = 1.0f; // BL_HAIR_STRANDS: strength of hair's strand pattern
+static float env_hair_root = 1.0f;    // BL_HAIR_ROOT: hair darker where it lies on the head
+static float env_hair_glow = 1.0f;    // BL_HAIR_GLOW: light through hair from behind
+static int env_hair_mesh = 1;         // BL_HAIR_MESH=0: the game's own hair, not the strips made for it
+static int env_tess = 3;            // BL_TESS: characters' triangles split this many times per edge, rounded (0 off)
 static int env_upscale_off;  // BL_UPSCALE=0: the game's own colour textures for characters
 static int env_sss_eyes = 1;  // BL_SSS_EYES=0: no eye highlights
-static int env_edges_off;  // BL_EDGES=0: plain alpha to coverage
-static int enc_samples = 1;                // and its sample count
 static int enc_info;                       // and whether it draws reflection info (info_texture)
 #define INFO_FORMAT MTLPixelFormatRGBA16Float
 static CAMetalLayer *layer;
@@ -116,7 +124,6 @@ static int env_widescreen;  // correct the 4:3 projection on wider modes (BL_WID
 static int frame_has_3d, menu_frame;  // a perspective draw to the back buffer: this frame, the last
 static int last_3d;
 static float frame_squeeze = 1;       // menu draws this frame were narrowed to this share of the width
-static int msaa;        // samples for the back buffer and its depth (BL_MSAA, default 4; 1 = off)
 static int deep_color;  // 16-bit back buffer, 10-bit window (BL_DEEP_COLOR, default on)
 
 // Effects at the end of the world view, before the view model and HUD (post_run):
@@ -134,9 +141,19 @@ static struct { float alpha, beta, p00, p11; } view_proj;
 static float view_rows[3][4];
 static id<MTLTexture> ao_result;  // waiting to be multiplied in at the next pass on the back buffer
 static int post_result;           // reflections or sharpening waiting for that pass too
-static void ao_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth);
-static void post_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth);
+static void ao_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int has_depth);
+static void post_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int has_depth);
 static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h);
+
+// Temporal anti-aliasing (the TAA section): the world view's offset this frame, in pixels
+// (y down), and whether post_run left motion vectors for the next pass on the back buffer.
+static float taa_jitter[2];
+static int taa_pending;
+static void taa_note_camera(const float r8[4], const float r9[4], const float r10[4], const float r11[4], float clip_y);
+static void taa_forget_camera(void);
+static int taa_motion(id<MTLTexture> depth, NSUInteger w, NSUInteger h);
+static void taa_resolve(id<MTLTexture> color);
+static void taa_frame_end(void);
 
 // The Visual options tab's check boxes (bl_vgui.c, read once a frame by bl_vgui_poll)
 // set the effects and save them in the registry; the environment, when set, wins over both.
@@ -156,7 +173,7 @@ static int pcss_on(void);
 static void shadow_match_depth(struct obj *color, struct obj *depth);
 static int contact_on(void);
 static id<MTLTexture> contact_result;  // waiting to be multiplied in, like ao_result
-static void contact_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth);
+static void contact_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int has_depth);
 static const struct { const char *env, *value; int *on, *show; } effects[BL_EFFECTS] = {
     {"BL_AO", "AmbientOcclusion", &env_ao, &env_ao_show},
     {"BL_SSR", "Reflections", &env_ssr, &env_ssr_show},
@@ -453,31 +470,6 @@ static id<MTLTexture> target_texture(struct obj *o)
     return t;
 }
 
-// Multisampling covers the device's own surfaces: the back buffer and the automatic
-// depth buffer. Passes on them draw into a multisampled copy and resolve into the
-// surface's texture at the end, so everything that reads the surface sees the
-// resolved image. Other render targets (shadows, reflections) stay single-sampled.
-static int multisampled(struct obj *o) { return msaa > 1 && o && o->owner && o->owner->type == OBJ_DEVICE; }
-
-static id<MTLTexture> ms_texture(struct obj *o)
-{
-    if (o->gpu_ms) return (__bridge id<MTLTexture>)o->gpu_ms;
-    id<MTLTexture> single = target_texture(o);
-    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:single.pixelFormat
-                                                                                 width:o->width
-                                                                                height:o->height
-                                                                             mipmapped:NO];
-    d.textureType = MTLTextureType2DMultisample;
-    d.sampleCount = (NSUInteger)msaa;
-    d.usage = MTLTextureUsageRenderTarget | (is_depth_format(o->format) ? MTLTextureUsageShaderRead : 0);  // post_run reads depth
-    d.storageMode = MTLStorageModePrivate;
-    id<MTLTexture> t = [mtl newTextureWithDescriptor:d];
-    t.label = [NSString stringWithFormat:@"surface %ux%u fmt %u x%d", o->width, o->height, o->format, msaa];
-    o->gpu_ms = (__bridge_retained void *)t;
-    o->ms_stale = 1;  // whatever the surface holds is not in the new copy
-    return t;
-}
-
 // --- shaders -----------------------------------------------------------------------
 
 // One D3DVERTEXELEMENT9.
@@ -703,9 +695,8 @@ void d3d_render_shader_created(struct obj *o)
 }
 
 // Internal shaders: partial clears.
-static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelFormat depth, uint32_t mask,
-                                                 int samples, int info);
-static id<MTLRenderPipelineState> stretch_pipeline(MTLPixelFormat color, int samples);
+static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelFormat depth, uint32_t mask, int info);
+static id<MTLRenderPipelineState> stretch_pipeline(MTLPixelFormat color);
 
 // --- vertex input --------------------------------------------------------------------
 
@@ -786,7 +777,6 @@ struct pipe_key {
     uint16_t stride[17];
     uint8_t constant[17];
     uint8_t point;
-    uint8_t samples, alpha_to_coverage;
     uint8_t info;  // reflection info attachment: 0 none, 1 kept, 2 written
 };
 
@@ -871,9 +861,18 @@ static id<MTLRenderPipelineState> pipeline(struct pipe_key *k, id<MTLFunction> v
             vd.layouts[b].stride = k->stride[b] ? k->stride[b] : 16;
         } else {
             vd.layouts[b].stride = k->stride[b];
+            if (k->vsv.tess) vd.layouts[b].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
         }
     }
     d.vertexDescriptor = vd;
+    if (k->vsv.tess) {  // draw_patches
+        d.tessellationPartitionMode = MTLTessellationPartitionModeInteger;
+        d.maxTessellationFactor = 16;
+        d.tessellationFactorFormat = MTLTessellationFactorFormatHalf;
+        d.tessellationFactorStepFunction = MTLTessellationFactorStepFunctionPerPatch;
+        d.tessellationControlPointIndexType = MTLTessellationControlPointIndexTypeUInt32;
+        d.tessellationOutputWindingOrder = MTLWindingCounterClockwise;  // as the corners come, by test
+    }
     d.colorAttachments[0].pixelFormat = (MTLPixelFormat)k->color_format;
     if (k->color_format) {
         MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[0];
@@ -898,8 +897,6 @@ static id<MTLRenderPipelineState> pipeline(struct pipe_key *k, id<MTLFunction> v
     d.depthAttachmentPixelFormat = (MTLPixelFormat)k->depth_format;
     d.stencilAttachmentPixelFormat = (MTLPixelFormat)k->depth_format;
     d.inputPrimitiveTopology = k->point ? MTLPrimitiveTopologyClassPoint : MTLPrimitiveTopologyClassUnspecified;
-    d.rasterSampleCount = k->samples ? k->samples : 1;
-    d.alphaToCoverageEnabled = k->alpha_to_coverage != 0;
     NSError *error = nil;
     uint64_t t0 = now_ns();
     p = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
@@ -913,13 +910,18 @@ static id<MTLRenderPipelineState> pipeline(struct pipe_key *k, id<MTLFunction> v
     return p;
 }
 
+// Hair in two passes (env_hair_soft): first solid where its alpha is high, writing
+// depth, then blended where it is lower (2 while setup_draw sets up that one), so its
+// thin edges fade smoothly instead of being cut out.
+static int hair_pass;
+
 static id<MTLDepthStencilState> depth_state(struct d3d_state *s, int has_depth)
 {
     const uint32_t *rs = s->rs;
     uint32_t k[16] = {0};
     if (has_depth) {
         k[0] = rs[7] ? 1 : 0;           // ZENABLE
-        k[1] = rs[14];                  // ZWRITEENABLE
+        k[1] = rs[14] && hair_pass < 2;  // ZWRITEENABLE; not hair's blended passes
         k[2] = rs[23];                  // ZFUNC
         k[3] = rs[52];                  // STENCILENABLE
         if (k[3]) {
@@ -1059,10 +1061,8 @@ static void ensure_device(void)
     env_shader_early = !(getenv("BL_SHADER_EARLY") && !strcmp(getenv("BL_SHADER_EARLY"), "0"));
     env_aniso = getenv("BL_ANISO") ? atoi(getenv("BL_ANISO")) : 16;
     env_aniso = env_aniso < 1 ? 1 : env_aniso > 16 ? 16 : env_aniso;
-    msaa = getenv("BL_MSAA") ? atoi(getenv("BL_MSAA")) : 4;
     deep_color = !(getenv("BL_DEEP_COLOR") && !strcmp(getenv("BL_DEEP_COLOR"), "0"));
     env_widescreen = !(getenv("BL_WIDESCREEN") && !strcmp(getenv("BL_WIDESCREEN"), "stretch"));
-    if (msaa < 1 || ![mtl supportsTextureSampleCount:(NSUInteger)msaa]) msaa = 1;
     effect_settings();
     env_ao_radius = getenv("BL_AO_RADIUS") ? (float)atof(getenv("BL_AO_RADIUS")) : 32;
     env_ao_strength = getenv("BL_AO_STRENGTH") ? (float)atof(getenv("BL_AO_STRENGTH")) : 0.6f;
@@ -1081,9 +1081,18 @@ static void ensure_device(void)
     if (getenv("BL_DETAIL_STRENGTH")) env_detail_strength = (float)atof(getenv("BL_DETAIL_STRENGTH"));
     if (getenv("BL_SHINE")) env_shine = (float)atof(getenv("BL_SHINE"));
     if (getenv("BL_CHARLIGHT")) env_charlight = (float)atof(getenv("BL_CHARLIGHT"));
+    if (getenv("BL_CHARLIGHT_MIN")) env_charlight_min = (float)atof(getenv("BL_CHARLIGHT_MIN"));
+    env_hair_u = getenv("BL_HAIR_U") && atoi(getenv("BL_HAIR_U"));
+    if (getenv("BL_HAIR_FADE")) env_hair_fade = (float)atof(getenv("BL_HAIR_FADE"));
+    if (getenv("BL_TESS")) env_tess = atoi(getenv("BL_TESS"));
+    if (getenv("BL_HAIR_SOFT")) env_hair_soft = (float)atof(getenv("BL_HAIR_SOFT"));
+    if (getenv("BL_HAIR_STRANDS")) env_hair_strands = (float)atof(getenv("BL_HAIR_STRANDS"));
+    if (getenv("BL_HAIR_ROOT")) env_hair_root = (float)atof(getenv("BL_HAIR_ROOT"));
+    if (getenv("BL_HAIR_GLOW")) env_hair_glow = (float)atof(getenv("BL_HAIR_GLOW"));
+    if (getenv("BL_HAIR_MESH")) env_hair_mesh = atoi(getenv("BL_HAIR_MESH"));
+    if (env_tess > 16) env_tess = 16;
     env_upscale_off = getenv("BL_UPSCALE") && !strcmp(getenv("BL_UPSCALE"), "0");
     env_sss_eyes = !(getenv("BL_SSS_EYES") && !strcmp(getenv("BL_SSS_EYES"), "0"));
-    env_edges_off = getenv("BL_EDGES") && !strcmp(getenv("BL_EDGES"), "0");
     env_tonemap_expand = getenv("BL_TONEMAP_EXPAND") ? (float)atof(getenv("BL_TONEMAP_EXPAND")) : 0.8f;
     env_hdr_peak = getenv("BL_HDR_PEAK") ? (float)atof(getenv("BL_HDR_PEAK")) : 4;
     env_hdr_knee = getenv("BL_HDR_KNEE") ? (float)atof(getenv("BL_HDR_KNEE")) : 0.05f;
@@ -1116,45 +1125,22 @@ static void write_png(id<MTLBuffer> b, NSUInteger w, NSUInteger h, const char *p
 static struct obj *last_offscreen_target;  // for BL_DUMP_FRAME: the last non-back-buffer color target
 
 // Reflection info drawn by the world view's shaders (d3d_shader_variant reflection_info),
-// the back buffer's size: the resolved texture, or with samples > 1 the multisampled one.
+// the back buffer's size.
 static unsigned long info_frame = ~0ul;  // the frame it was last drawn in
-static id<MTLTexture> info_texture(id<MTLTexture> color, int samples)
+static id<MTLTexture> info_texture(id<MTLTexture> color)
 {
-    static id<MTLTexture> t[2];
-    int ms = samples > 1;
-    if (!t[ms] || t[ms].width != color.width || t[ms].height != color.height || (int)t[ms].sampleCount != samples) {
+    static id<MTLTexture> t;
+    if (!t || t.width != color.width || t.height != color.height) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:INFO_FORMAT
                                                                                      width:color.width
                                                                                     height:color.height
                                                                                  mipmapped:NO];
-        if (ms) td.textureType = MTLTextureType2DMultisample, td.sampleCount = (NSUInteger)samples;
-        td.usage = MTLTextureUsageRenderTarget | (ms ? 0 : MTLTextureUsageShaderRead);
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         td.storageMode = MTLStorageModePrivate;
-        t[ms] = [mtl newTextureWithDescriptor:td];
-        t[ms].label = @"reflection info";
+        t = [mtl newTextureWithDescriptor:td];
+        t.label = @"reflection info";
     }
-    return t[ms];
-}
-
-// Copies a surface's texture into its multisampled copy, after something other than a
-// multisampled pass wrote it (StretchRect, a pass that could not be multisampled).
-static void restore_ms(struct obj *o, id<MTLTexture> ms)
-{
-    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-    rp.colorAttachments[0].texture = ms;
-    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
-    [e setRenderPipelineState:stretch_pipeline(ms.pixelFormat, (int)ms.sampleCount)];
-    [e setViewport:(MTLViewport){0, 0, ms.width, ms.height, 0, 1}];
-    float p[4] = {0, 0, 1, 1};
-    [e setVertexBytes:p length:sizeof p atIndex:0];
-    [e setFragmentTexture:target_texture(o) atIndex:0];
-    static id<MTLSamplerState> nearest;
-    if (!nearest) nearest = [mtl newSamplerStateWithDescriptor:[MTLSamplerDescriptor new]];
-    [e setFragmentSamplerState:nearest atIndex:0];
-    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-    [e endEncoding];
+    return t;
 }
 
 static id<MTLTexture> hdr_world;
@@ -1167,25 +1153,10 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
     end_pass();
     shadow_match_depth(color, depth);
     if (color && color != s->back_buffer) last_offscreen_target = color;
-    int samples = multisampled(color ? color : depth) ? msaa : 1;
-    if (samples > 1 && color && depth && !multisampled(depth)) {
-        LOG_ONCE("[metal] back buffer with a depth surface of its own: not multisampled\n");
-        samples = 1;
-    }
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
     if (color) {
-        if (samples > 1) {
-            id<MTLTexture> ms = ms_texture(color);
-            if (color->ms_stale && clear_color_target != color) restore_ms(color, ms);
-            color->ms_stale = 0;
-            d.colorAttachments[0].texture = ms;
-            d.colorAttachments[0].resolveTexture = target_texture(color);
-            d.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
-        } else {
-            d.colorAttachments[0].texture = target_texture(color);
-            d.colorAttachments[0].storeAction = MTLStoreActionStore;
-            if (multisampled(color)) color->ms_stale = 1;
-        }
+        d.colorAttachments[0].texture = target_texture(color);
+        d.colorAttachments[0].storeAction = MTLStoreActionStore;
         if (clear_color_target == color) {
             d.colorAttachments[0].loadAction = MTLLoadActionClear;
             d.colorAttachments[0].clearColor = clear_color;
@@ -1195,7 +1166,7 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
         }
     }
     if (depth) {
-        id<MTLTexture> t = samples > 1 ? ms_texture(depth) : target_texture(depth);
+        id<MTLTexture> t = target_texture(depth);
         d.depthAttachment.texture = t;
         d.stencilAttachment.texture = t;
         d.depthAttachment.storeAction = d.stencilAttachment.storeAction = MTLStoreActionStore;
@@ -1218,26 +1189,31 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
     if (info) {
         id<MTLTexture> ct = target_texture(color);
         MTLRenderPassColorAttachmentDescriptor *a = d.colorAttachments[1];
-        if (samples > 1) {
-            a.texture = info_texture(ct, samples);
-            a.resolveTexture = info_texture(ct, 1);
-            a.storeAction = MTLStoreActionStoreAndMultisampleResolve;
-        } else {
-            a.texture = info_texture(ct, 1);
-            a.storeAction = MTLStoreActionStore;
-        }
+        a.texture = info_texture(ct);
+        a.storeAction = MTLStoreActionStore;
         int fresh = info_frame != frames || d.colorAttachments[0].loadAction == MTLLoadActionClear;
         a.loadAction = fresh ? MTLLoadActionClear : MTLLoadActionLoad;
         a.clearColor = MTLClearColorMake(0, 0, 0, 0);
         info_frame = frames;
     }
     enc = [command_buffer() renderCommandEncoderWithDescriptor:d];
-    enc_color = color, enc_depth = depth, enc_samples = samples, enc_info = info;
+    enc_color = color, enc_depth = depth, enc_info = info;
     int world_end = (post_result || ao_result || contact_result) && color && color == s->back_buffer;
-    if (post_result && color && color == s->back_buffer) post_apply(enc, target_texture(color), samples, depth != NULL);
-    if (ao_result && color && color == s->back_buffer) ao_apply(enc, target_texture(color), samples, depth != NULL);
+    if (post_result && color && color == s->back_buffer) post_apply(enc, target_texture(color), depth != NULL);
+    if (ao_result && color && color == s->back_buffer) ao_apply(enc, target_texture(color), depth != NULL);
     if (contact_result && color && color == s->back_buffer)
-        contact_apply(enc, target_texture(color), samples, depth != NULL);
+        contact_apply(enc, target_texture(color), depth != NULL);
+    if (taa_pending && color && color == s->back_buffer) {
+        // The world view with its effects drawn in, before the view model and HUD:
+        // through the temporal scaler and back.
+        [enc endEncoding];
+        taa_resolve(target_texture(color));
+        taa_pending = 0;
+        d.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        d.depthAttachment.loadAction = d.stencilAttachment.loadAction = MTLLoadActionLoad;
+        if (info) d.colorAttachments[1].loadAction = MTLLoadActionLoad;
+        enc = [command_buffer() renderCommandEncoderWithDescriptor:d];
+    }
     if (world_end && env_hdr) {
         // A copy of the finished world view, before the view model and HUD: what
         // hdr_present may brighten.
@@ -1267,11 +1243,6 @@ static void flush_clears(struct d3d_state *s)
 
 void d3d_render_free(struct obj *o)
 {
-    if (o->gpu_ms) {
-        id m = (__bridge_transfer id)o->gpu_ms;
-        (void)m;
-        o->gpu_ms = NULL;
-    }
     if (!o->gpu) return;
     id t = (__bridge_transfer id)o->gpu;  // released when t goes out of scope
     (void)t;
@@ -1394,6 +1365,7 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
     // A depth clear after a view (a sky box drawn first) starts over: the occlusion is
     // for the view drawn after it.
     if ((flags & 2) && ds && view_state == 1) view_state = 0;
+    if ((flags & 2) && ds && rt == s->back_buffer && view_state != 2) taa_forget_camera();
     const uint32_t *vp = s->viewport;
     int full = count == 0 && vp[0] == 0 && vp[1] == 0 && vp[2] >= rt->width && vp[3] >= rt->height &&
                (!s->rs[174] || (s->scissor[0] == 0 && s->scissor[1] == 0 && s->scissor[2] >= rt->width &&
@@ -1418,7 +1390,7 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
     MTLPixelFormat dfmt = ds ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
     uint32_t mask = (flags & 1 ? 1u : 0u) | (flags & 2 && ds ? 2u : 0u) | (flags & 4 && ds ? 4u : 0u);
     if (!mask) return;
-    [e setRenderPipelineState:clear_pipeline(t.pixelFormat, dfmt, mask, enc_samples, enc_info)];
+    [e setRenderPipelineState:clear_pipeline(t.pixelFormat, dfmt, mask, enc_info)];
     static NSMutableDictionary *clear_depth_states;
     if (!clear_depth_states) clear_depth_states = [NSMutableDictionary new];
     NSNumber *dk = @(mask);
@@ -1474,8 +1446,7 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
     }
 }
 
-static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelFormat depth, uint32_t mask,
-                                                 int samples, int info)
+static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelFormat depth, uint32_t mask, int info)
 {
     static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *cache;
     static id<MTLLibrary> lib;
@@ -1494,8 +1465,7 @@ static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelF
         lib = [mtl newLibraryWithSource:src options:nil error:&error];
         if (!lib) bl_fatal("clear shader: %s", error.localizedDescription.UTF8String);
     }
-    NSString *key = [NSString stringWithFormat:@"%lu/%lu/%u/%d/%d", (unsigned long)color, (unsigned long)depth, mask,
-                                               samples, info];
+    NSString *key = [NSString stringWithFormat:@"%lu/%lu/%u/%d", (unsigned long)color, (unsigned long)depth, mask, info];
     id<MTLRenderPipelineState> p = cache[key];
     if (p) return p;
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
@@ -1504,7 +1474,6 @@ static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelF
     d.colorAttachments[0].pixelFormat = color;
     d.colorAttachments[0].writeMask = mask & 1 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
     if (info) d.colorAttachments[1].pixelFormat = INFO_FORMAT, d.colorAttachments[1].writeMask = MTLColorWriteMaskNone;
-    d.rasterSampleCount = (NSUInteger)samples;
     d.depthAttachmentPixelFormat = depth;
     d.stencilAttachmentPixelFormat = depth;
     NSError *error = nil;
@@ -1516,7 +1485,7 @@ static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelF
 
 // Scaled StretchRect: one triangle covering the destination rectangle (set as the
 // viewport) samples the source rectangle. p = {u0, v0, u1, v1} in normalized coordinates.
-static id<MTLRenderPipelineState> stretch_pipeline(MTLPixelFormat color, int samples)
+static id<MTLRenderPipelineState> stretch_pipeline(MTLPixelFormat color)
 {
     static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *cache;
     static id<MTLLibrary> lib;
@@ -1535,14 +1504,13 @@ static id<MTLRenderPipelineState> stretch_pipeline(MTLPixelFormat color, int sam
         lib = [mtl newLibraryWithSource:src options:nil error:&error];
         if (!lib) bl_fatal("stretch shader: %s", error.localizedDescription.UTF8String);
     }
-    NSNumber *key = @(color * 64 + (NSUInteger)samples);
+    NSNumber *key = @(color);
     id<MTLRenderPipelineState> p = cache[key];
     if (p) return p;
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [lib newFunctionWithName:@"stretch_vs"];
     d.fragmentFunction = [lib newFunctionWithName:@"stretch_fs"];
     d.colorAttachments[0].pixelFormat = color;
-    d.rasterSampleCount = (NSUInteger)samples;
     NSError *error = nil;
     p = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
     if (!p) bl_fatal("stretch pipeline: %s", error.localizedDescription.UTF8String);
@@ -1569,7 +1537,7 @@ static void stretch_draw(id<MTLTexture> a, const uint32_t sr[4], id<MTLTexture> 
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
-    [e setRenderPipelineState:stretch_pipeline(b.pixelFormat, 1)];
+    [e setRenderPipelineState:stretch_pipeline(b.pixelFormat)];
     [e setViewport:(MTLViewport){dr[0], dr[1], dr[2] - dr[0], dr[3] - dr[1], 0, 1}];
     float p[4] = {(float)sr[0] / a.width, (float)sr[1] / a.height, (float)sr[2] / a.width, (float)sr[3] / a.height};
     [e setVertexBytes:p length:sizeof p atIndex:0];
@@ -1814,14 +1782,10 @@ static NSString *const ao_source =
      "struct V { float4 pos [[position]]; };\n"
      "vertex V ao_vs(uint id [[vertex_id]]) {\n"
      "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
-     "static float rd(depth2d_ms<float> t, uint2 p) { return t.read(p, 0); }\n"
-     "static float rd(depth2d<float> t, uint2 p) { return t.read(p); }\n"
      // View depth, 0 for the sky (cleared depth) and anything not drawn.
      "static float lin(constant AOP &a, float d) { return d >= 0.99999 || d <= 0.0 ? 0.0 : a.beta / (d - a.alpha); }\n"
-     "fragment float ao_depth_ms(V in [[stage_in]], depth2d_ms<float> dt [[texture(0)]], constant AOP &a [[buffer(0)]]) {\n"
-     "    uint2 p = min(uint2(in.pos.xy) * 2, uint2(a.full) - 1); return lin(a, rd(dt, p)); }\n"
      "fragment float ao_depth(V in [[stage_in]], depth2d<float> dt [[texture(0)]], constant AOP &a [[buffer(0)]]) {\n"
-     "    uint2 p = min(uint2(in.pos.xy) * 2, uint2(a.full) - 1); return lin(a, rd(dt, p)); }\n"
+     "    uint2 p = min(uint2(in.pos.xy) * 2, uint2(a.full) - 1); return lin(a, dt.read(p)); }\n"
      "static float3 vpos(constant AOP &a, texture2d<float> zt, int2 p) {\n"
      "    p = clamp(p, int2(0), int2(a.hsize) - 1);\n"
      "    float w = zt.read(uint2(p)).x;\n"
@@ -1896,11 +1860,10 @@ static NSString *const ao_source =
      "    float o = mix(1.0, ao.sample(s, in.pos.xy / a.full).x, a.strength);\n"
      "    return float4(o, o, o, 1.0); }\n";
 
-// kind 0: view depth (from the depth buffer, multisampled or not); 1: occlusion;
+// kind 0: view depth (from the depth buffer); 1: occlusion;
 // 2: filter; 3: multiply into the image; 4: show the occlusion alone. Kinds 3 and 4 draw
 // in the game's pass, with its depth attachment (`depth`).
-static id<MTLRenderPipelineState> ao_pipeline(int kind, int ms_depth, MTLPixelFormat color, int samples,
-                                              MTLPixelFormat depth)
+static id<MTLRenderPipelineState> ao_pipeline(int kind, MTLPixelFormat color, MTLPixelFormat depth)
 {
     static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *cache;
     static id<MTLLibrary> lib;
@@ -1910,18 +1873,14 @@ static id<MTLRenderPipelineState> ao_pipeline(int kind, int ms_depth, MTLPixelFo
         lib = [mtl newLibraryWithSource:ao_source options:nil error:&error];
         if (!lib) bl_fatal("ambient occlusion shader: %s", error.localizedDescription.UTF8String);
     }
-    NSString *key = [NSString stringWithFormat:@"%d/%d/%lu/%d/%lu", kind, ms_depth, (unsigned long)color, samples,
-                                               (unsigned long)depth];
+    NSString *key = [NSString stringWithFormat:@"%d/%lu/%lu", kind, (unsigned long)color, (unsigned long)depth];
     id<MTLRenderPipelineState> p = cache[key];
     if (p) return p;
     static NSString *const names[] = {@"ao_depth", @"ao_main", @"ao_blur", @"ao_apply", @"ao_apply"};
-    NSString *fs = names[kind];
-    if (ms_depth && kind == 0) fs = [fs stringByAppendingString:@"_ms"];
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [lib newFunctionWithName:@"ao_vs"];
-    d.fragmentFunction = [lib newFunctionWithName:fs];
+    d.fragmentFunction = [lib newFunctionWithName:names[kind]];
     d.colorAttachments[0].pixelFormat = color;
-    d.rasterSampleCount = (NSUInteger)samples;
     d.depthAttachmentPixelFormat = depth;
     d.stencilAttachmentPixelFormat = depth;
     if (kind == 3) {  // image *= occlusion; alpha kept
@@ -1967,7 +1926,7 @@ static void note_projection(const float r8[4], const float r9[4], const float r1
 // world view).
 static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h)
 {
-    static id<MTLTexture> t[17];
+    static id<MTLTexture> t[19];
     if (!t[i] || t[i].width != w || t[i].height != h || t[i].pixelFormat != pf) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h
                                                                                  mipmapped:NO];
@@ -1979,7 +1938,7 @@ static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInte
 }
 
 // One full-screen pass of ao_pipeline `kind` into `target`.
-static void ao_pass(int kind, int ms_depth, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTexture> t1,
+static void ao_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTexture> t1,
                     const struct ao_params *a)
 {
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1987,7 +1946,7 @@ static void ao_pass(int kind, int ms_depth, id<MTLTexture> target, id<MTLTexture
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
-    [e setRenderPipelineState:ao_pipeline(kind, ms_depth, target.pixelFormat, 1, MTLPixelFormatInvalid)];
+    [e setRenderPipelineState:ao_pipeline(kind, target.pixelFormat, MTLPixelFormatInvalid)];
     [e setFragmentTexture:t0 atIndex:0];
     [e setFragmentTexture:t1 atIndex:1];
     [e setFragmentBytes:a length:sizeof *a atIndex:0];
@@ -2130,6 +2089,30 @@ static NSString *const ssr_source =
      "            sum += v * w, wsum += w;\n"
      "        }\n"
      "    return sum / max(wsum, 1e-5); }\n"
+     // Under TAA (post_run): the filtered reflections blended with last frame's, found
+     // through the camera's motion vectors (full resolution, texture coordinates). The
+     // history is kept within the 3x3 neighbourhood's range (a little wider), so it
+     // follows when the reflection really changes but not when a thin thing is hit one
+     // frame and missed the next.
+     "fragment float4 ssr_history(V in [[stage_in]], texture2d<float> cur [[texture(0)]],\n"
+     "                            texture2d<float> hist [[texture(1)]], texture2d<float> mv [[texture(2)]],\n"
+     "                            constant SP &a [[buffer(0)]]) {\n"
+     "    int2 p = int2(in.pos.xy), hs = int2(a.hsize) - 1;\n"
+     "    float4 c = cur.read(uint2(p));\n"
+     "    if (c.w < 0.0) return c;\n"
+     "    float4 lo = c, hi = c;\n"
+     "    for (int j = -1; j <= 1; j++)\n"
+     "        for (int i = -1; i <= 1; i++) {\n"
+     "            float4 v = cur.read(uint2(clamp(p + int2(i, j), int2(0), hs)));\n"
+     "            if (v.w >= 0.0) lo = min(lo, v), hi = max(hi, v);\n"
+     "        }\n"
+     "    float2 m = mv.read(uint2(min(p * 2, int2(mv.get_width(), mv.get_height()) - 1))).xy;\n"
+     "    float2 q = (in.pos.xy / a.hsize + m) * a.hsize;\n"
+     "    if (any(q < 0.0) || any(q >= a.hsize)) return c;\n"
+     "    float4 h = hist.read(uint2(q));\n"
+     "    if (h.w < 0.0) return c;\n"
+     "    float4 ext = (hi - lo) * 0.25;\n"
+     "    return mix(clamp(h, lo - ext, hi + ext), c, 0.1); }\n"
      // GT7's tone mapping (Polyphony Digital's published SDR curve and chroma handling):
      // frame buffer 1.0 is 100 nits, paper white 250 nits. The curve maps each channel
      // (toe, linear section, exponential shoulder); the result's intensity in ICtCp is kept,
@@ -2230,6 +2213,7 @@ static NSString *const ssr_source =
      // sharpened, with the reflections in place of that share of the cubemaps.
      "static float3 picture(texture2d<float> base, texture2d<float> info, texture2d<float> skin, float sk, int2 q) {\n"
      "    return sk > 0.0 && info.read(uint2(q)).w < -0.5 ? skin.read(uint2(q)).rgb : base.read(uint2(q)).rgb; }\n"
+     "static bool hair_at(texture2d<float> info, int2 q) { float w = info.read(uint2(q)).w; return w < -1.3 && w > -1.5; }\n"
      "fragment float4 post_apply(V in [[stage_in]], texture2d<float> base [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
      "                           texture2d<float> ssr [[texture(2)]], texture2d<float> aux [[texture(3)]],\n"
      "                           texture2d<float> fogt [[texture(4)]], texture2d<float> skin [[texture(5)]],\n"
@@ -2238,9 +2222,14 @@ static NSString *const ssr_source =
      "    float4 c = base.read(uint2(p));\n"
      "    float3 col = picture(base, info, skin, a.skin, p);\n"
      // Characters' pixels come from the scattered skin picture, and are sharpened like the
-     // rest (in red for the options' "show").
+     // rest (in red for the options' "show"), except hair and the pixels beside it, whose
+     // fine strands sharpening turns into dark specks. (Without reflections or skin the
+     // info texture is not bound; base's alpha is never below -1.3.)
+     "    bool hair = a.sharpen > 0.0 && (hair_at(info, p) || hair_at(info, clamp(p - int2(0, 1), int2(0), m)) ||\n"
+     "                hair_at(info, clamp(p - int2(1, 0), int2(0), m)) || hair_at(info, clamp(p + int2(1, 0), int2(0), m)) ||\n"
+     "                hair_at(info, clamp(p + int2(0, 1), int2(0), m)));\n"
      "    if (a.skin > 1.5 && info.read(uint2(p)).w < -0.5) col = float3(1.0, 0.1, 0.1);\n"
-     "    else if (a.sharpen > 0.0) {\n"
+     "    else if (a.sharpen > 0.0 && !hair) {\n"
      "        float3 n = picture(base, info, skin, a.skin, clamp(p - int2(0, 1), int2(0), m));\n"
      "        float3 w = picture(base, info, skin, a.skin, clamp(p - int2(1, 0), int2(0), m));\n"
      "        float3 e = picture(base, info, skin, a.skin, clamp(p + int2(1, 0), int2(0), m));\n"
@@ -2282,9 +2271,10 @@ static NSString *const ssr_source =
      "    return float4(saturate(col), c.a); }\n";
 
 // kind 0: trace (a second target for the ray's length and Fresnel factor); 1: filter;
-// 2: post_apply, in the game's pass with its depth attachment (`depth`).
+// 2: post_apply, in the game's pass with its depth attachment (`depth`); 4: the blend
+// with last frame's reflections under TAA.
 #define SSR_AUX_FORMAT MTLPixelFormatRG16Float
-static id<MTLRenderPipelineState> ssr_pipeline(int kind, MTLPixelFormat color, int samples, MTLPixelFormat depth)
+static id<MTLRenderPipelineState> ssr_pipeline(int kind, MTLPixelFormat color, MTLPixelFormat depth)
 {
     static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *cache;
     static id<MTLLibrary> lib;
@@ -2294,17 +2284,15 @@ static id<MTLRenderPipelineState> ssr_pipeline(int kind, MTLPixelFormat color, i
         lib = [mtl newLibraryWithSource:ssr_source options:nil error:&error];
         if (!lib) bl_fatal("reflection shader: %s", error.localizedDescription.UTF8String);
     }
-    NSString *key = [NSString stringWithFormat:@"%d/%lu/%d/%lu", kind, (unsigned long)color, samples,
-                                               (unsigned long)depth];
+    NSString *key = [NSString stringWithFormat:@"%d/%lu/%lu", kind, (unsigned long)color, (unsigned long)depth];
     id<MTLRenderPipelineState> p = cache[key];
     if (p) return p;
-    static NSString *const names[] = {@"ssr_trace", @"ssr_blur", @"post_apply", @"hdr_present"};
+    static NSString *const names[] = {@"ssr_trace", @"ssr_blur", @"post_apply", @"hdr_present", @"ssr_history"};
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [lib newFunctionWithName:@"ssr_vs"];
     d.fragmentFunction = [lib newFunctionWithName:names[kind]];
     d.colorAttachments[0].pixelFormat = color;
     if (kind == 0) d.colorAttachments[1].pixelFormat = SSR_AUX_FORMAT;
-    d.rasterSampleCount = (NSUInteger)samples;
     d.depthAttachmentPixelFormat = depth;
     d.stencilAttachmentPixelFormat = depth;
     NSError *error = nil;
@@ -2328,7 +2316,7 @@ static void ssr_pass(int kind, id<MTLTexture> target, id<MTLTexture> target2, id
         rp.colorAttachments[1].storeAction = MTLStoreActionStore;
     }
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
-    [e setRenderPipelineState:ssr_pipeline(kind, target.pixelFormat, 1, MTLPixelFormatInvalid)];
+    [e setRenderPipelineState:ssr_pipeline(kind, target.pixelFormat, MTLPixelFormatInvalid)];
     [e setFragmentTexture:t0 atIndex:0];
     [e setFragmentTexture:t1 atIndex:1];
     [e setFragmentTexture:t2 atIndex:2];
@@ -2647,9 +2635,16 @@ static void fx_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTe
 }
 
 // The map's brightest lights for this frame's camera, in view space (bl_bsp_lights once
-// a frame, which also fades lights in and out): for the haze and the skin's shine.
-static struct fog_light frame_lights[FOG_LIGHTS];
-static int frame_nlights;
+// a frame, which also fades lights in and out): for the haze, the first FOG_LIGHTS, as
+// bright as the camera sees them; and for the characters (char_lights), as bright as they
+// are in this part of the map, so that a light the camera cannot see past a fitting (the
+// bar's canopy, walking up to it) still lights the people under it. Their shine and
+// contact shadows take the same first FOG_LIGHTS, their light with a direction
+// (detail_bind) all CHAR_LIGHTS: picked by brightness at the camera, the lights on a
+// character up ahead would drop out for ones behind it as the camera came closer.
+#define CHAR_LIGHTS 64
+static struct fog_light frame_lights[FOG_LIGHTS], char_lights[CHAR_LIGHTS];
+static int frame_nlights, frame_nchar;
 static float frame_cam[3];
 static int view_lights(void)
 {
@@ -2660,9 +2655,9 @@ static int view_lights(void)
     float *cam = frame_cam;
     for (int k = 0; k < 3; k++)
         cam[k] = -(view_rows[0][k] * view_rows[0][3] + view_rows[1][k] * view_rows[1][3] + view_rows[2][k] * view_rows[2][3]);
-    struct bl_light l[FOG_LIGHTS];
-    int n = bl_bsp_lights(cam, l, FOG_LIGHTS);
-    struct fog_light *fl = frame_lights;
+    struct bl_light l[CHAR_LIGHTS];
+    int n = bl_bsp_lights(cam, l, CHAR_LIGHTS);
+    struct fog_light fl[CHAR_LIGHTS];
     for (int i = 0; i < n; i++) {
         for (int r = 0; r < 3; r++) {
             fl[i].pos[r] = view_rows[r][0] * l[i].pos[0] + view_rows[r][1] * l[i].pos[1] + view_rows[r][2] * l[i].pos[2] +
@@ -2674,8 +2669,12 @@ static int view_lights(void)
             fl[i].att[r] = l[i].att[r];
         }
         fl[i].pos[3] = l[i].radius, fl[i].color[3] = l[i].inner, fl[i].dir[3] = l[i].outer, fl[i].att[3] = l[i].exponent;
+        char_lights[i] = fl[i];
+        for (int r = 0; r < 3; r++) char_lights[i].color[r] = l[i].color[r] * l[i].seen;
+        if (i < FOG_LIGHTS) frame_lights[i] = fl[i];
     }
-    return frame_nlights = n;
+    frame_nchar = n;
+    return frame_nlights = n < FOG_LIGHTS ? n : FOG_LIGHTS;
 }
 
 static void fog_run(id<MTLTexture> z, NSUInteger hw, NSUInteger hh, struct ssr_params *p)
@@ -2698,7 +2697,7 @@ static void skin_run(id<MTLTexture> color, id<MTLTexture> z, NSUInteger hw, NSUI
 {
     struct fx_params a = {{p->full[0], p->full[1]}, {(float)hw, (float)hh}, view_proj.p00, view_proj.p11};
     a.width = env_sss_width, a.strength = env_sss_strength < 0 ? 0 : env_sss_strength > 1 ? 1 : env_sss_strength;
-    id<MTLTexture> info = info_texture(color, 1);
+    id<MTLTexture> info = info_texture(color);
     id<MTLTexture> across = ao_texture(11, MTLPixelFormatRGBA16Float, color.width, color.height);
     post_skin = ao_texture(12, MTLPixelFormatRGBA16Float, color.width, color.height);
     // Normals for the shine, half resolution, smoothed over the model's flat faces.
@@ -2711,10 +2710,10 @@ static void skin_run(id<MTLTexture> color, id<MTLTexture> z, NSUInteger hw, NSUI
         fx_pass(4, normals, nraw, z, nil, nil, nil, &a, NULL, 0);
     }
     a.dir[0] = 1, a.dir[1] = 0, a.final = 0;
-    fx_pass(2, across, info, info, z, post_base, normals, &a, frame_lights, sizeof frame_lights[0]);
+    fx_pass(2, across, info, info, z, post_base, normals, &a, char_lights, sizeof char_lights[0]);
     a.dir[0] = 0, a.dir[1] = 1, a.final = 1;
-    fx_pass(2, post_skin, across, info, z, post_base, normals, &a, n ? frame_lights : NULL,
-            sizeof frame_lights[0] * (size_t)(n ? n : 1));
+    fx_pass(2, post_skin, across, info, z, post_base, normals, &a, n ? char_lights : NULL,
+            sizeof char_lights[0] * (size_t)(n ? n : 1));
     p->skin = env_sss_show ? 2 : 1;
 }
 
@@ -2782,16 +2781,23 @@ static NSString *const contact_source =
      "            if (cs <= outer) continue;\n"
      "            if (cs < inner) e *= (cs - outer) / max(inner - outer, 1e-4);\n"
      "        }\n"
-     "        float li = dot(L[k].color.rgb, lw) * e * saturate(dot(N, ld) + 0.1);\n"
+     // Not weighted by how the surface faces the light: N comes from the depth, so on
+     // low-poly parts (a collar) each flat face would pick its own light and the shadow
+     // would come and go in whole triangles as the character moves.
+     "        float li = dot(L[k].color.rgb, lw) * e;\n"
      "        total += li;\n"
      "        if (li > best) best = li, bl = ld, bv = v;\n"
      "    }\n"
      "    if (best <= 0.0) return 1.0;\n"
+     // Hair (-1.4) casts them but takes none: on its layered cards they come out as specks.
+     "    float iw = info.read(uint2(min(p * 2, int2(a.full) - 1))).w;\n"
+     "    if (iw < -1.3 && iw > -1.5) return 1.0;\n"
      "    bool me = person(a, info, p);\n"
      "    float len = min(a.length, length(bv) * 0.9);\n"
      "    float bias = 0.3 + 0.004 * w, thick = max(a.length, 0.02 * w);\n"
      "    float3 O = P + N * (0.002 * w);\n"
-     "    float j = ign(float2(p)), occ = 0.0;\n"
+     // pad: a frame number under TAA, so the grain moves and the scaler averages it out.
+     "    float j = ign(float2(p) + a.pad * 5.588238), occ = 0.0;\n"
      "    const int STEPS = 16;\n"
      "    for (int i = 0; i < STEPS; i++) {\n"
      "        float t = (float(i) + j) / float(STEPS);\n"
@@ -2802,6 +2808,9 @@ static NSString *const contact_source =
      "        if (any(q < 0.0) || any(q >= a.hsize)) break;\n"
      "        int2 qi = int2(q);\n"
      "        if (all(qi == p)) continue;\n"
+     // Not the surface it starts on: the next flat face of the same fold, within a
+     // world unit or so, would shade it in triangles.
+     "        if (len * t < 1.0 + 0.004 * w) continue;\n"
      "        float zs = zt.read(uint2(qi)).x;\n"
      "        if (zs <= 0.0) continue;\n"
      "        float diff = Q.z - zs;\n"
@@ -2833,7 +2842,7 @@ static void contact_run(id<MTLTexture> color, id<MTLTexture> z, const struct ao_
     int n = view_lights();
     if (!n) return;
     struct contact_params c = {{ap->full[0], ap->full[1]}, {ap->half[0], ap->half[1]}, ap->p00, ap->p11,
-                               env_contact_length, env_contact_strength, (float)n, 0};
+                               env_contact_length, env_contact_strength, (float)n, (float)(frames % 16)};
     NSUInteger hw = (NSUInteger)ap->half[0], hh = (NSUInteger)ap->half[1];
     id<MTLTexture> raw = ao_texture(15, MTLPixelFormatR16Float, hw, hh);
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -2843,23 +2852,23 @@ static void contact_run(id<MTLTexture> color, id<MTLTexture> z, const struct ao_
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
     [e setRenderPipelineState:contact_pipeline()];
     [e setFragmentTexture:z atIndex:0];
-    [e setFragmentTexture:info_texture(color, 1) atIndex:1];
+    [e setFragmentTexture:info_texture(color) atIndex:1];
     [e setFragmentBytes:&c length:sizeof c atIndex:0];
-    [e setFragmentBytes:frame_lights length:sizeof frame_lights[0] * (size_t)n atIndex:1];
+    [e setFragmentBytes:char_lights length:sizeof char_lights[0] * (size_t)n atIndex:1];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
     // The occlusion's depth-aware filter, then its multiply at full strength.
     id<MTLTexture> soft = ao_texture(16, MTLPixelFormatRG32Float, hw, hh);
-    ao_pass(2, 0, soft, raw, z, ap);
+    ao_pass(2, soft, raw, z, ap);
     contact_result = soft, contact_result_params = *ap;
     contact_result_params.strength = 1;
 }
 
 // Called by pass() for a new pass on the back buffer, after ao_apply.
-static void contact_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth)
+static void contact_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int has_depth)
 {
     MTLPixelFormat df = has_depth ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
-    [e setRenderPipelineState:ao_pipeline(env_contact_show ? 4 : 3, 0, color.pixelFormat, samples, df)];
+    [e setRenderPipelineState:ao_pipeline(env_contact_show ? 4 : 3, color.pixelFormat, df)];
     static id<MTLDepthStencilState> none;
     if (!none) none = [mtl newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
     [e setDepthStencilState:none];
@@ -2870,6 +2879,292 @@ static void contact_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, i
     [e setFragmentBytes:&contact_result_params length:sizeof contact_result_params atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     contact_result = nil;
+}
+
+// --- temporal anti-aliasing --------------------------------------------------------------
+//
+// The anti-aliasing: MetalFX's temporal scaler at the back buffer's own size (there is no
+// multisampling). Each frame the world view's draws move by a
+// different fraction of a pixel (a Halton 2,3 pattern of 8, added to D3D9's half-pixel
+// offset in d3d_vs_params.inv_viewport), and the scaler blends the frame with the ones
+// before it, following motion vectors. Those are the camera's alone (taa_motion): each
+// pixel's depth taken back to a position with this frame's view-projection and forward
+// with the last one's, so moving characters and props are blended as if they stood still.
+// The camera is the view-projection most of the world view's draws without bones used
+// (taa_note_camera): the map's brushes all share it, while each prop carries its own model
+// transform. post_run makes the motion vectors and a copy of the depth (the game may clear
+// its own before the view model); the next pass on the back buffer, once the effects are
+// drawn in, runs the scaler on the result and copies it back (taa_resolve), so the view
+// model and HUD stay out of it. The history is dropped after a frame without a world view,
+// on a size change and when the camera cuts. The offset spans half a pixel by default: the
+// scaler does not quite settle a full pixel's on thin, bright things (bottles shimmered).
+// BL_TAA_JITTER=n sets the span (1: a whole pixel, 0: none); negative flips the sign of
+// the offset handed to MetalFX (for testing which way it wants it).
+
+#define TAA_CAMS 16
+static struct { float m[4][4]; int n; } taa_cams[TAA_CAMS];
+static int taa_ncams, taa_reset = 1, taa_done, taa_have_prev;
+static double taa_prev[4][4];  // the last resolved frame's view-projection
+static unsigned taa_phase;
+static float taa_jitter_sign;
+static id<MTLFXTemporalScaler> taa_scaler;
+static id<MTLTexture> taa_in, taa_out, taa_mv, taa_z;
+
+static void taa_note_camera(const float r8[4], const float r9[4], const float r10[4], const float r11[4], float clip_y)
+{
+    float m[4][4];
+    memcpy(m[0], r8, sizeof m[0]);
+    for (int k = 0; k < 4; k++) m[1][k] = r9[k] * clip_y;
+    memcpy(m[2], r10, sizeof m[2]);
+    memcpy(m[3], r11, sizeof m[3]);
+    for (int i = 0; i < taa_ncams; i++)
+        if (!memcmp(taa_cams[i].m, m, sizeof m)) {
+            taa_cams[i].n++;
+            return;
+        }
+    if (taa_ncams < TAA_CAMS) memcpy(taa_cams[taa_ncams].m, m, sizeof m), taa_cams[taa_ncams++].n = 1;
+}
+
+// A depth clear on the back buffer before the world view (after a sky box) starts over.
+static void taa_forget_camera(void) { taa_ncams = 0; }
+
+static int invert4d(const double m[4][4], double out[4][4])
+{
+    double a[4][8];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 8; j++) a[i][j] = j < 4 ? m[i][j] : (j - 4 == i);
+    for (int c = 0; c < 4; c++) {
+        int p = c;
+        for (int i = c + 1; i < 4; i++)
+            if (fabs(a[i][c]) > fabs(a[p][c])) p = i;
+        if (fabs(a[p][c]) < 1e-15) return 0;
+        for (int j = 0; j < 8; j++) {
+            double t = a[c][j];
+            a[c][j] = a[p][j], a[p][j] = t;
+        }
+        double d = 1 / a[c][c];
+        for (int j = 0; j < 8; j++) a[c][j] *= d;
+        for (int i = 0; i < 4; i++) {
+            if (i == c) continue;
+            double f = a[i][c];
+            for (int j = 0; j < 8; j++) a[i][j] -= f * a[c][j];
+        }
+    }
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) out[i][j] = a[i][j + 4];
+    return 1;
+}
+
+static float halton(unsigned i, unsigned b)
+{
+    float f = 1, r = 0;
+    for (; i; i /= b) f /= (float)b, r += f * (float)(i % b);
+    return r;
+}
+
+// The scaler and its textures for a w x h picture.
+static void taa_setup(NSUInteger w, NSUInteger h)
+{
+    if (taa_scaler && taa_scaler.inputWidth == w && taa_scaler.inputHeight == h) return;
+    taa_scaler = nil;
+    MTLFXTemporalScalerDescriptor *d = [MTLFXTemporalScalerDescriptor new];
+    d.colorTextureFormat = d.outputTextureFormat = MTLPixelFormatRGBA16Float;
+    d.depthTextureFormat = MTLPixelFormatDepth32Float;
+    d.motionTextureFormat = MTLPixelFormatRG16Float;
+    d.inputWidth = d.outputWidth = w;
+    d.inputHeight = d.outputHeight = h;
+    taa_scaler = [d newTemporalScalerWithDevice:mtl];
+    if (!taa_scaler) bl_fatal("TAA: MetalFX made no temporal scaler for %lux%lu", (unsigned long)w, (unsigned long)h);
+    MTLTextureUsage usage[4] = {taa_scaler.colorTextureUsage, taa_scaler.outputTextureUsage,
+                                taa_scaler.motionTextureUsage, taa_scaler.depthTextureUsage};
+    MTLPixelFormat pf[4] = {MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA16Float, MTLPixelFormatRG16Float,
+                            MTLPixelFormatDepth32Float};
+    id<MTLTexture> __strong *t[4] = {&taa_in, &taa_out, &taa_mv, &taa_z};
+    static NSString *const labels[4] = {@"TAA input", @"TAA output", @"TAA motion", @"TAA depth"};
+    for (int i = 0; i < 4; i++) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf[i] width:w height:h
+                                                                                  mipmapped:NO];
+        td.usage = usage[i] | MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        *t[i] = [mtl newTextureWithDescriptor:td];
+        (*t[i]).label = labels[i];
+    }
+    taa_reset = 1;
+    LOG_ONCE("[metal] TAA: MetalFX temporal scaler at %lux%lu\n", (unsigned long)w, (unsigned long)h);
+}
+
+static NSString *const taa_source =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct TP { float4x4 reproj; float2 size, offset; };\n"
+     "struct V { float4 pos [[position]]; };\n"
+     "struct TO { float2 motion [[color(0)]]; float depth [[depth(any)]]; };\n"
+     "vertex V taa_vs(uint id [[vertex_id]]) {\n"
+     "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
+     // The pixel's place without this frame's offset (`offset`, what the vertex shaders
+     // added), taken to the last frame's clip space: the motion vector points there, in
+     // texture coordinates (scaled to pixels by the scaler).
+     "fragment TO taa_motion(V in [[stage_in]], depth2d<float> z [[texture(0)]], constant TP &p [[buffer(0)]]) {\n"
+     "    float d = z.read(uint2(in.pos.xy));\n"
+     "    float2 ndc = float2(in.pos.x / p.size.x * 2.0 - 1.0, 1.0 - in.pos.y / p.size.y * 2.0) - p.offset;\n"
+     "    float4 q = p.reproj * float4(ndc, d, 1.0);\n"
+     "    float2 prev = q.w > 1e-6 ? q.xy / q.w : ndc;\n"
+     "    TO o; o.motion = (prev - ndc) * float2(0.5, -0.5); o.depth = d; return o; }\n"
+     // The scaler's picture back into the back buffer, colour only (taa_resolve).
+     "fragment float4 taa_copy(V in [[stage_in]], texture2d<float> t [[texture(0)]]) {\n"
+     "    return t.read(uint2(in.pos.xy)); }\n";
+
+// kind 0: the motion vectors and depth copy; 1: the copy back into a `color` target.
+static id<MTLRenderPipelineState> taa_pipeline(int kind, MTLPixelFormat color)
+{
+    static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *cache;
+    static id<MTLLibrary> lib;
+    if (!cache) {
+        cache = [NSMutableDictionary new];
+        NSError *error = nil;
+        lib = [mtl newLibraryWithSource:taa_source options:nil error:&error];
+        if (!lib) bl_fatal("TAA shader: %s", error.localizedDescription.UTF8String);
+    }
+    NSNumber *key = @(color * 2 + (NSUInteger)kind);
+    id<MTLRenderPipelineState> p = cache[key];
+    if (p) return p;
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [lib newFunctionWithName:@"taa_vs"];
+    d.fragmentFunction = [lib newFunctionWithName:kind ? @"taa_copy" : @"taa_motion"];
+    d.colorAttachments[0].pixelFormat = color;
+    if (kind) d.colorAttachments[0].writeMask = MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue;
+    else d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    NSError *error = nil;
+    p = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!p) bl_fatal("TAA pipeline: %s", error.localizedDescription.UTF8String);
+    cache[key] = p;
+    return p;
+}
+
+// From post_run, with the world view's depth (single-sampled) and size; 0 when this frame
+// has no camera to go by.
+static int taa_motion(id<MTLTexture> depth, NSUInteger w, NSUInteger h)
+{
+    int best = -1;
+    for (int i = 0; i < taa_ncams; i++)
+        if (taa_cams[i].n >= 2 && (best < 0 || taa_cams[i].n > taa_cams[best].n)) best = i;
+    if (best < 0) return 0;
+    taa_setup(w, h);
+    double cur[4][4], inv[4][4], reproj[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int k = 0; k < 4; k++) cur[i][k] = taa_cams[best].m[i][k];
+    if (!invert4d(cur, inv)) return 0;
+    // A cut: the view turned by more than about 25 degrees, the camera jumped more than 64
+    // units (its position: where x, y and w are all 0) or the field of view changed.
+    int cut = !taa_have_prev;
+    if (!cut) {
+        double cp[2][3], fw[2][3], zoom[2];
+        double inv_prev[4][4];
+        if (!invert4d(taa_prev, inv_prev)) cut = 1;
+        const double(*m[2])[4] = {taa_prev, cur}, (*mi[2])[4] = {inv_prev, inv};
+        for (int f = 0; f < 2 && !cut; f++) {
+            double hw = mi[f][3][2], lw = 0, lx = 0;
+            for (int k = 0; k < 3; k++) cp[f][k] = hw != 0 ? mi[f][k][2] / hw : 0;
+            for (int k = 0; k < 3; k++) lw += m[f][3][k] * m[f][3][k], lx += m[f][0][k] * m[f][0][k];
+            for (int k = 0; k < 3; k++) fw[f][k] = lw > 0 ? m[f][3][k] / sqrt(lw) : 0;
+            zoom[f] = lw > 0 ? sqrt(lx / lw) : 0;
+        }
+        if (!cut) {
+            double dot = fw[0][0] * fw[1][0] + fw[0][1] * fw[1][1] + fw[0][2] * fw[1][2];
+            double dx = cp[0][0] - cp[1][0], dy = cp[0][1] - cp[1][1], dz = cp[0][2] - cp[1][2];
+            cut = dot < 0.9 || dx * dx + dy * dy + dz * dz > 64.0 * 64.0 || fabs(zoom[0] - zoom[1]) > 0.01 * zoom[1];
+        }
+    }
+    const double(*from)[4] = cut ? cur : taa_prev;
+    for (int i = 0; i < 4; i++)
+        for (int k = 0; k < 4; k++) {
+            double v = 0;
+            for (int j = 0; j < 4; j++) v += from[i][j] * inv[j][k];
+            reproj[i][k] = v;
+        }
+    struct { float reproj[4][4]; float size[2], offset[2]; } p;
+    for (int i = 0; i < 4; i++)
+        for (int k = 0; k < 4; k++) p.reproj[k][i] = (float)reproj[i][k];  // columns
+    p.size[0] = (float)w, p.size[1] = (float)h;
+    p.offset[0] = (1 + 2 * taa_jitter[0]) / (float)w, p.offset[1] = -(1 + 2 * taa_jitter[1]) / (float)h;
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = taa_mv;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.depthAttachment.texture = taa_z;
+    rp.depthAttachment.loadAction = MTLLoadActionDontCare;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:taa_pipeline(0, MTLPixelFormatRG16Float)];
+    static id<MTLDepthStencilState> always;
+    if (!always) {
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = YES;
+        always = [mtl newDepthStencilStateWithDescriptor:dd];
+    }
+    [e setDepthStencilState:always];
+    [e setFragmentTexture:depth atIndex:0];
+    [e setFragmentBytes:&p length:sizeof p atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    memcpy(taa_prev, cur, sizeof taa_prev);
+    taa_have_prev = 1;
+    if (cut) taa_reset = 1;
+    return 1;
+}
+
+// From pass(), on the back buffer's texture once the effects are drawn in.
+static void taa_resolve(id<MTLTexture> color)
+{
+    NSUInteger w = color.width, h = color.height;
+    if (!taa_scaler || taa_in.width != w || taa_in.height != h) return;
+    uint32_t r[4] = {0, 0, (uint32_t)w, (uint32_t)h};
+    stretch_draw(color, r, taa_in, r, 0);
+    taa_scaler.colorTexture = taa_in;
+    taa_scaler.depthTexture = taa_z;
+    taa_scaler.motionTexture = taa_mv;
+    taa_scaler.outputTexture = taa_out;
+    taa_scaler.inputContentWidth = w;
+    taa_scaler.inputContentHeight = h;
+    taa_scaler.jitterOffsetX = taa_jitter_sign * taa_jitter[0];
+    taa_scaler.jitterOffsetY = taa_jitter_sign * taa_jitter[1];
+    taa_scaler.motionVectorScaleX = (float)w;
+    taa_scaler.motionVectorScaleY = (float)h;
+    taa_scaler.depthReversed = NO;
+    taa_scaler.reset = taa_reset;
+    [taa_scaler encodeToCommandBuffer:command_buffer()];
+    // Colour only: the game never clears the back buffer, so its alpha (which the scaler
+    // need not keep) stays the game's own for the next frame's draws.
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = color;
+    rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:taa_pipeline(1, color.pixelFormat)];
+    [e setFragmentTexture:taa_out atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    taa_reset = 0, taa_done = 1;
+}
+
+// From present: the next frame's offset; a frame the scaler did not see breaks the history.
+static void taa_frame_end(void)
+{
+    static float scale = 2;  // BL_TAA_JITTER: the span in pixels, negative flipped for MetalFX
+    static int resolved;
+    if (scale == 2) scale = getenv("BL_TAA_JITTER") ? (float)atof(getenv("BL_TAA_JITTER")) : 0.5f;
+    taa_jitter_sign = scale < 0 ? -1 : 1;
+    resolved += taa_done;
+    if (frames % 100 == 0) {
+        fprintf(stderr, "[metal] TAA: %d of the last 100 frames through the scaler\n", resolved);
+        resolved = 0;
+    }
+    if (!taa_done) taa_have_prev = 0, taa_reset = 1;
+    taa_done = 0, taa_pending = 0, taa_ncams = 0;
+    taa_phase = taa_phase % 8 + 1;
+    taa_jitter[0] = fabsf(scale) * (halton(taa_phase, 2) - 0.5f);
+    taa_jitter[1] = fabsf(scale) * (halton(taa_phase, 3) - 0.5f);
 }
 
 // --- the world view's end ----------------------------------------------------------------
@@ -2886,12 +3181,11 @@ static void post_run(struct d3d_state *s)
              view_proj.p11);
     struct obj *bb = s->back_buffer, *ds = s->depth_stencil;
     if (!bb || !ds || clear_color_target == bb || clear_depth_target == ds) return;
-    int samples = multisampled(bb) ? msaa : 1;
-    if (multisampled(ds) != (samples > 1)) return;
     end_pass();
     id<MTLTexture> color = target_texture(bb);
-    id<MTLTexture> depth = samples > 1 ? ms_texture(ds) : target_texture(ds);
+    id<MTLTexture> depth = target_texture(ds);
     if (depth.width != color.width || depth.height != color.height) return;
+    taa_pending = taa_motion(depth, color.width, color.height);
     NSUInteger hw = (color.width + 1) / 2, hh = (color.height + 1) / 2;
     int reflect = env_ssr && info_frame == frames, skin = env_sss && info_frame == frames;
     int contact = contact_on() && info_frame == frames;
@@ -2899,12 +3193,12 @@ static void post_run(struct d3d_state *s)
     struct ao_params a = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, view_proj.alpha,
                           view_proj.beta, view_proj.p00, view_proj.p11, env_ao_radius,
                           1 / (env_ao_radius * env_ao_radius), 0.2f * (float)hh, env_ao_strength};
-    if (env_ao || reflect || env_fog || skin || contact) ao_pass(0, samples > 1, z, depth, nil, &a);
+    if (env_ao || reflect || env_fog || skin || contact) ao_pass(0, z, depth, nil, &a);
     if (env_ao) {
         id<MTLTexture> raw = ao_texture(1, MTLPixelFormatR16Float, hw, hh);
         id<MTLTexture> soft = ao_texture(2, MTLPixelFormatRG32Float, hw, hh);
-        ao_pass(1, 0, raw, z, nil, &a);
-        ao_pass(2, 0, soft, raw, z, &a);
+        ao_pass(1, raw, z, nil, &a);
+        ao_pass(2, soft, raw, z, &a);
         ao_result = soft, ao_result_params = a;
     }
     if (contact) contact_run(color, z, &a);
@@ -2923,8 +3217,23 @@ static void post_run(struct d3d_state *s)
         id<MTLTexture> raw = ao_texture(4, MTLPixelFormatRGBA16Float, hw, hh);
         post_aux = ao_texture(6, SSR_AUX_FORMAT, hw, hh);
         post_ssr = ao_texture(5, MTLPixelFormatRGBA16Float, hw, hh);
-        ssr_pass(0, raw, post_aux, z, info_texture(color, 1), post_base, &p);
+        ssr_pass(0, raw, post_aux, z, info_texture(color), post_base, &p);
         ssr_pass(1, post_ssr, nil, raw, z, post_aux, &p);
+        if (taa_pending) {
+            // Blended over frames: each frame's trace starts from depth offset by the TAA
+            // jitter, so thin things (the bottles on a bar) are hit on some frames and not others.
+            static unsigned long last;
+            static int which;
+            id<MTLTexture> prev = ao_texture(17 + which, MTLPixelFormatRGBA16Float, hw, hh);
+            id<MTLTexture> next = ao_texture(18 - which, MTLPixelFormatRGBA16Float, hw, hh);
+            if (last == frames - 1 && !taa_reset) ssr_pass(4, next, nil, post_ssr, prev, taa_mv, &p);
+            else {
+                blit = [command_buffer() blitCommandEncoder];
+                [blit copyFromTexture:post_ssr toTexture:next];
+                [blit endEncoding];
+            }
+            post_ssr = next, which ^= 1, last = frames;
+        }
     }
     if (env_fog) fog_run(z, hw, hh, &p);
     if (skin) skin_run(color, z, hw, hh, &p);
@@ -2932,10 +3241,10 @@ static void post_run(struct d3d_state *s)
 }
 
 // Called by pass() for a new pass on the back buffer.
-static void post_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth)
+static void post_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int has_depth)
 {
     MTLPixelFormat df = has_depth ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
-    [e setRenderPipelineState:ssr_pipeline(2, color.pixelFormat, samples, df)];
+    [e setRenderPipelineState:ssr_pipeline(2, color.pixelFormat, df)];
     static id<MTLDepthStencilState> none;
     if (!none) none = [mtl newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
     [e setDepthStencilState:none];
@@ -2943,7 +3252,7 @@ static void post_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int 
     [e setViewport:(MTLViewport){0, 0, color.width, color.height, 0, 1}];
     [e setScissorRect:(MTLScissorRect){0, 0, color.width, color.height}];
     [e setFragmentTexture:post_base atIndex:0];
-    [e setFragmentTexture:post_params.strength > 0 || post_params.skin > 0 ? info_texture(color, 1) : post_base atIndex:1];
+    [e setFragmentTexture:post_params.strength > 0 || post_params.skin > 0 ? info_texture(color) : post_base atIndex:1];
     [e setFragmentTexture:post_ssr atIndex:2];
     [e setFragmentTexture:post_aux atIndex:3];
     [e setFragmentTexture:post_fog atIndex:4];
@@ -2954,10 +3263,10 @@ static void post_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int 
 }
 
 // Called by pass() for a new pass on the back buffer, after post_apply.
-static void ao_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth)
+static void ao_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int has_depth)
 {
     MTLPixelFormat df = has_depth ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
-    [e setRenderPipelineState:ao_pipeline(env_ao_show ? 4 : 3, 0, color.pixelFormat, samples, df)];
+    [e setRenderPipelineState:ao_pipeline(env_ao_show ? 4 : 3, color.pixelFormat, df)];
     static id<MTLDepthStencilState> none;
     if (!none) none = [mtl newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
     [e setDepthStencilState:none];
@@ -3081,28 +3390,134 @@ static void log_draw(struct d3d_state *s, const char *what, uint32_t type, uint3
 // Everything a draw needs except vertex and index data; returns 0 if it cannot draw.
 // Characters' detail normal maps (BL_DETAIL=0 off; BL_DETAIL_STRENGTH, default 1; the
 // shine they and their roughness maps give skin and cloth, BL_SHINE, default 4; light
-// with a direction across them, BL_CHARLIGHT, 0 to 1, default 1): the map
+// with a direction across them, BL_CHARLIGHT, 0 to 1, default 1, darkening the side away
+// from the lights to no less than BL_CHARLIGHT_MIN of the game's light, default 0.8): the map
 // for the draw setup_draw is on, bound at [[texture(15)]] with the camera and the map's
 // lights at [[buffer(3)]] (d3d9_shader.c ps_detail).
 static id<MTLTexture> detail_map, detail_color;  // detail_color: the upscaled colour texture, or nil
 static int view_lights(void);
+// Hair redrawn as strips (hair_swap_for).
+struct hair_swap {
+    id<MTLBuffer> vb, ib;  // vb nil: the game's vertices, ib its triangles to keep
+    uint32_t nidx;
+    id<MTLTexture> tex;
+    id<MTLBuffer> base_ib;  // with strips: the game's triangles drawn under them (nil: all)
+    uint32_t nbase_idx;
+};
+static struct hair_swap *hair_swap;  // the draw's, while d3d_render_draw draws it
+
+// Hair's two passes (solid, then the blended see-through rest), except for strips: their
+// blended pass, drawn in no order across thousands of layered cards, shows the dark
+// behind them as specks. Alpha to coverage alone gives their edges.
+static int hair_soft_on(void) { return env_hair_soft > 0 && !(hair_swap && hair_swap->vb); }
 static void detail_bind(id<MTLRenderCommandEncoder> e)
 {
-    // 0: depth and projection; 1: 1 / target size, bump strength, light count; then four
-    // per light (struct fog_light: position and range, colour and spot's inner cosine,
-    // spot direction and outer cosine, falloff); last: the shine's strength.
-    float dl[2 + 4 * 8 + 1][4] = {{view_proj.alpha, view_proj.beta, view_proj.p00, view_proj.p11}};
+    // 0: depth and projection; 1: 1 / target size, bump strength, light count; 2 and 3:
+    // the shine, hair and light settings; then four per light (struct fog_light: position
+    // and range, colour and spot's inner cosine, spot direction and outer cosine, falloff).
+    // All of char_lights: each pixel takes what reaches it, lights past a character add
+    // nothing there.
+    float dl[4 + 4 * CHAR_LIGHTS][4] = {{view_proj.alpha, view_proj.beta, view_proj.p00, view_proj.p11}};
     id<MTLTexture> rt = enc_color ? target_texture(enc_color) : nil;
-    int n = env_sss_sheen >= 0 ? view_lights() : 0;
-    if (n > 8) n = 8;
+    int n = env_sss_sheen >= 0 && view_lights() ? frame_nchar : 0;
     dl[1][0] = rt ? 1.0f / (float)rt.width : 0, dl[1][1] = rt ? 1.0f / (float)rt.height : 0;
     dl[1][2] = env_detail_strength, dl[1][3] = (float)n;
-    for (int i = 0; i < n; i++) memcpy(dl[2 + 4 * i], &frame_lights[i], sizeof frame_lights[i]);
-    dl[2 + 4 * 8][0] = env_shine, dl[2 + 4 * 8][1] = env_charlight;
-    [e setFragmentBytes:dl length:sizeof dl atIndex:3];
+    for (int i = 0; i < n; i++) memcpy(dl[4 + 4 * i], &char_lights[i], sizeof char_lights[i]);
+    dl[2][0] = env_shine, dl[2][1] = env_charlight, dl[2][2] = env_hair_u;
+    // Strips made for the hair lie closer to the head than the game's hair (the fringe on
+    // the forehead) and are soft already: a shorter fade, or they would fade away.
+    dl[2][3] = hair_swap && hair_swap->vb ? 0.15f * env_hair_fade : env_hair_fade;
+    // Strips made for the hair draw their strands in their own texture: no pattern on top.
+    dl[3][0] = hair_swap && hair_swap->vb ? 0.0f : env_hair_strands;
+    dl[3][1] = env_charlight_min, dl[3][2] = env_hair_root, dl[3][3] = env_hair_glow;
+    // Over setFragmentBytes' 4 KB with many lights.
+    NSUInteger off;
+    id<MTLBuffer> b = upload(dl, sizeof dl[0] * (NSUInteger)(4 + 4 * n), &off);
+    [e setFragmentBuffer:b offset:off atIndex:3];
     [e setFragmentTexture:detail_map atIndex:15];
 }
+// Hair's soft edge needs the depth of what was drawn before the hair, which a pass cannot
+// read of its own depth: before a character's first hair draw (alpha-tested, skinned,
+// with no normal map of its own), the pass ends and its depth is copied.
+static id<MTLTexture> hair_depth;
+static unsigned long hair_depth_frame = ~0ul;
+static int hair_others;  // draws other than hair since the copy
+static void hair_before_draw(struct d3d_state *s)
+{
+    if (env_hair_fade <= 0 || !env_sss || env_detail <= 0 || !s->vs || !s->depth_stencil ||
+        s->render_target[0] != s->back_buffer || menu_frame || view_state == 2)
+        return;
+    BLShader *vs = shader_of(s->vs);
+    int skinned = 0;
+    for (int i = 0; i < 16; i++)
+        if ((vs->info.input_mask & (1u << i)) && (vs->info.input_usage[i] == 1 || vs->info.input_usage[i] == 2))
+            skinned = 1;
+    struct obj *t0 = s->texture[0];
+    int hair = skinned && s->rs[15] && !s->rs[27] && t0 && t0->type == OBJ_TEXTURE && t0->subs[0] && t0->subs[0]->mem;
+    if (hair) {
+        id<MTLTexture> color = nil;
+        hair = !bl_detail_normal(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
+                                 t0->subs[0]->pitch, &color);
+    }
+    if (!hair) {
+        hair_others = 1;
+        return;
+    }
+    if (hair_depth_frame == frames && !hair_others) return;
+    end_pass();
+    struct obj *depth = s->depth_stencil;
+    id<MTLTexture> src = target_texture(depth);
+    if (!hair_depth || hair_depth.width != src.width || hair_depth.height != src.height ||
+        hair_depth.pixelFormat != src.pixelFormat) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat
+                                                                                     width:src.width
+                                                                                    height:src.height
+                                                                                 mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        hair_depth = [mtl newTextureWithDescriptor:td];
+        hair_depth.label = @"depth before hair";
+    }
+    id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
+    [blit copyFromTexture:src toTexture:hair_depth];
+    [blit endEncoding];
+    hair_depth_frame = frames, hair_others = 0;
+}
+
 static uint32_t draw_prims;  // the draw setup_draw is for: its primitives
+// Characters' triangles drawn tessellated (d3d_shader_variant.tess), each a patch of the
+// same tessellation factors (env_tess). Set by d3d_render_draw for setup_draw while it
+// can draw a triangle list that way.
+#define TESS_MAX_PATCHES 65536
+static int draw_tess;
+
+static void draw_patches(id<MTLRenderCommandEncoder> e, id<MTLBuffer> ib, NSUInteger io, MTLIndexType it, uint32_t ic,
+                         NSInteger bv)
+{
+    static id<MTLBuffer> factors;
+    static int factors_for;
+    if (factors_for != env_tess) {
+        factors = [mtl newBufferWithLength:TESS_MAX_PATCHES * sizeof(MTLTriangleTessellationFactorsHalf)
+                                   options:MTLResourceStorageModeShared];
+        MTLTriangleTessellationFactorsHalf *f = factors.contents;
+        __fp16 t = (__fp16)env_tess;
+        for (int i = 0; i < TESS_MAX_PATCHES; i++)
+            f[i].edgeTessellationFactor[0] = f[i].edgeTessellationFactor[1] = f[i].edgeTessellationFactor[2] =
+                f[i].insideTessellationFactor = t;
+        factors_for = env_tess;
+    }
+    // Patches have no base vertex: the indices are copied with it added, as 32-bit.
+    NSUInteger po;
+    id<MTLBuffer> pb = upload(NULL, (NSUInteger)ic * 4, &po);
+    uint32_t *dst = (uint32_t *)((uint8_t *)pb.contents + po);
+    const uint8_t *src = (const uint8_t *)ib.contents + io;
+    for (uint32_t i = 0; i < ic; i++)
+        dst[i] = (uint32_t)((it == MTLIndexTypeUInt32 ? ((const uint32_t *)src)[i] : ((const uint16_t *)src)[i]) + bv);
+    [e setTessellationFactorBuffer:factors offset:0 instanceStride:0];
+    [e drawIndexedPatches:3 patchStart:0 patchCount:ic / 3 patchIndexBuffer:nil patchIndexBufferOffset:0
+          controlPointIndexBuffer:pb controlPointIndexBufferOffset:po instanceCount:1 baseInstance:0];
+}
+
 static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32_t type, struct element *el, int nel,
                       struct pipe_key *k)
 {
@@ -3158,9 +3573,6 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     k->write_mask = rs[168] & 15;
     shadow_variant(s, ps, k);
     k->point = type == 1;
-    k->samples = (uint8_t)enc_samples;
-    // Alpha-tested cut-outs (fences, foliage, hair) get soft edges from the samples.
-    k->alpha_to_coverage = enc_samples > 1 && rs[15] && !rs[27];  // ALPHATESTENABLE, no blending
     for (int b = 0; b < 16; b++) k->stride[b] = (uint16_t)s->stream_stride[b];
     k->stride[16] = 16;
     // In the world view's passes, draws that replace the colour also replace the
@@ -3174,6 +3586,9 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
             for (int i = 0; i < 16; i++)
                 if ((vs->info.input_mask & (1u << i)) && (vs->info.input_usage[i] == 1 || vs->info.input_usage[i] == 2))
                     k->psv.skin = env_sss ? 1 : 2;
+        // Hair strips are shaded as hair whatever the options, which needs the character
+        // path (skin 1); without skin scattering nothing reads what that marks.
+        if (hair_swap && hair_swap->vb && k->info == 2 && s->vs) k->psv.skin = 1;
         // Eyeballs: a few dozen triangles with a 128x128 colour texture, in a character's
         // vertex layout (with bone weights or indices, though their shader reads neither).
         if (env_sss && env_sss_eyes && k->info == 2 && draw_prims <= 64 && s->texture[0] &&
@@ -3189,10 +3604,32 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
             detail_map = bl_detail_normal(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
                                           t0->subs[0]->pitch, &color);
             detail_color = env_upscale_off ? nil : color;
-            if (!detail_map) detail_map = bl_detail_flat(mtl);
+            if (hair_swap && hair_swap->tex) detail_color = hair_swap->tex;
+            // Hair: alpha-tested and without a map of its own (hair textures get none),
+            // fading near what was drawn before it once hair_before_draw has its depth.
+            if (!detail_map) {
+                detail_map = bl_detail_flat(mtl);
+                if (rs[15])
+                    k->psv.hair = env_hair_fade > 0 && hair_depth && hair_depth_frame == frames &&
+                                          hair_depth.width == target_texture(s->depth_stencil).width
+                                      ? 2
+                                      : 1;
+            }
             k->psv.detail = 1;
             k->vsv.smooth_normal = k->psv.detail;
+            k->vsv.tess = draw_tess && view_state == 1;
         }
+        // Eyeballs: no map, but the upscaled colour texture when there is one.
+        if (k->psv.skin == 3 && !env_upscale_off && t0 && t0->type == OBJ_TEXTURE && t0->subs[0] && t0->subs[0]->mem) {
+            id<MTLTexture> color = nil;
+            bl_detail_normal(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
+                             t0->subs[0]->pitch, &color);
+            detail_color = color;
+        }
+    }
+    if (k->psv.hair && hair_pass >= 2) {  // SRCALPHA, INVSRCALPHA, ADD
+        k->blend[0] = 1, k->blend[1] = k->blend[4] = 5, k->blend[2] = k->blend[5] = 6, k->blend[3] = k->blend[6] = 1;
+        k->info = 1;
     }
 
     id<MTLFunction> vf = shader_function(vs, &k->vsv), pf = shader_function(ps, &k->psv);
@@ -3277,13 +3714,26 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         }
         if (proj > 0 && aspect > proj * 1.01f) vp.clip_y = aspect / proj;
     }
-    if ((env_ao || env_ssr || env_sharpen || env_tonemap || env_hdr || env_fog || env_sss) && perspective && to_back_buffer && fabsf(w_row[3]) > 1e-4f && s->viewport[2] == rtt.width &&
+    if (perspective && to_back_buffer && fabsf(w_row[3]) > 1e-4f && s->viewport[2] == rtt.width &&
         s->viewport[3] == rtt.height && u2f(s->viewport[4]) == 0 && u2f(s->viewport[5]) >= 0.99f) {
         const float(*r)[4] = vs->ff_vertex ? vc : vc + 8;
         note_projection(r[0], r[1], r[2], r[3], vp.clip_y);
+        // The camera for the motion vectors: from draws without bones (a character's
+        // constants may hold something else).
+        int skinned = 0;
+        for (int i = 0; i < nel; i++) skinned |= el[i].usage == 1 || el[i].usage == 2;
+        if (view_state != 2 && !skinned) taa_note_camera(r[0], r[1], r[2], r[3], vp.clip_y);
+    }
+    // The world view's draws (not the view model's, drawn with a narrowed depth range,
+    // nor a menu's) move by this frame's offset, on top of D3D9's half pixel.
+    if (perspective && to_back_buffer && !menu_frame && view_state != 2 && fabsf(w_row[3]) > 1e-4f &&
+        u2f(s->viewport[5]) >= 0.99f && s->viewport[2] && s->viewport[3]) {
+        vp.inv_viewport[0] += 2 * taa_jitter[0] / (float)s->viewport[2];
+        vp.inv_viewport[1] += 2 * taa_jitter[1] / (float)s->viewport[3];
     }
     set_viewport(s, e, (uint32_t)rtt.width, (uint32_t)rtt.height, squeeze);
     [e setVertexBytes:&vp length:sizeof vp atIndex:21];
+    if (k->vsv.tess) [e setVertexBytes:&view_proj length:sizeof view_proj atIndex:22];
 
     float pc[224][4];
     memcpy(pc, s->ps_f, sizeof pc);
@@ -3309,7 +3759,10 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     }
     pp.alpha_func = rs[15] ? rs[25] : 8;  // ALPHATESTENABLE, ALPHAFUNC
     pp.alpha_ref = (rs[24] & 255) / 255.0f;
-    pp.edge = k->alpha_to_coverage && !env_edges_off;
+    if (k->psv.hair && hair_soft_on() && (pp.alpha_func == 5 || pp.alpha_func == 7)) {  // GREATER(EQUAL)
+        pp.alpha_ref = fmaxf(pp.alpha_ref, env_hair_soft);
+        if (hair_pass == 2) pp.alpha_func = 2;  // LESS: what the solid pass left
+    }
     if (rs[28]) {  // FOGENABLE
         uint32_t c = rs[34];
         pp.fog_color[0] = (c >> 16 & 255) / 255.0f, pp.fog_color[1] = (c >> 8 & 255) / 255.0f;
@@ -3320,6 +3773,7 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     }
     [e setFragmentBytes:&pp length:sizeof pp atIndex:1];
     if (k->psv.detail) detail_bind(e);
+    if (k->psv.hair >= 2) [e setFragmentTexture:hair_depth atIndex:14];
     shadow_draw(s, e, k, vs->ff_vertex ? (const float(*)[4])vc : (const float(*)[4])vc + 8, &vp);
 
     for (uint32_t i = 0; i < D3D_SHADER_MAX_SAMPLERS; i++) {
@@ -3327,7 +3781,10 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         struct obj *t = s->texture[i];
         id<MTLTexture> mt = t ? texture_of(t) : dummy_texture(k->psv.tex_kind[i]);
         if (tex_kind_of(t) != k->psv.tex_kind[i]) mt = dummy_texture(k->psv.tex_kind[i]);
-        if (i == 0 && k->psv.detail && detail_color) mt = detail_color;
+        if (i == 0 && (k->psv.detail || k->psv.skin == 3) && detail_color) mt = detail_color;
+        // Hair strips always with their own texture, even drawn plain (the game's
+        // texture does not fit them).
+        if (i == 0 && hair_swap && hair_swap->vb && hair_swap->tex) mt = hair_swap->tex;
         [e setFragmentTexture:mt atIndex:i];
         [e setFragmentSamplerState:sampler_state(s->ss[i], mt.mipmapLevelCount > 1) atIndex:i];
     }
@@ -3359,10 +3816,258 @@ static id<MTLBuffer> index_data(uint32_t type, const void *src, int is32, uint32
     return b;
 }
 
+// Hair redrawn as strips (tex_detail.h bl_detail_hair), for an indexed triangle draw of a
+// skinned character whose texture has strips made for it: the strips in the draw's own
+// vertex layout, each vertex a copy of the game's nearest vertex of this draw (so it
+// follows the same bones) with the strip's position, normal and texture coordinates,
+// placed by fitting the strips' anchors onto the draw's vertices (scale, a turn between
+// axes, offset). For a texture with only a part to keep (the hair ties), the draw's
+// triangles inside that part of the texture. Made once per mesh; NULL when not hair.
+static NSMutableDictionary<NSData *, NSValue *> *hair_swaps;
+
+static struct hair_swap *hair_swap_for(struct d3d_state *s, struct element *el, int nel, uint32_t start,
+                                       uint32_t count, int32_t base_vertex)
+{
+    if (!env_hair_mesh || view_state != 1 || !s->vs || !s->indices) return NULL;
+    struct obj *t0 = s->texture[0];
+    if (!t0 || t0->type != OBJ_TEXTURE || !t0->subs[0] || !t0->subs[0]->mem) return NULL;
+    const struct element *pe = NULL, *ne = NULL, *te = NULL;
+    int skinned = 0;
+    for (int i = 0; i < nel; i++) {
+        if (el[i].usage == 1 || el[i].usage == 2) skinned = 1;
+        if (el[i].usage == 0 && el[i].index == 0 && el[i].type == 2) pe = &el[i];
+        if (el[i].usage == 3 && el[i].index == 0 && el[i].type == 2) ne = &el[i];
+        if (el[i].usage == 5 && el[i].index == 0 && el[i].type == 1) te = &el[i];
+    }
+    if (!skinned || !pe || !te) return NULL;
+    for (int i = 0; i < nel; i++)
+        if (el[i].stream != pe->stream) return NULL;
+    id<MTLTexture> color;
+    bl_detail_normal(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem), t0->subs[0]->pitch,
+                     &color);
+    const struct bl_hair_mesh *m = bl_detail_hair(mtl, t0, t0->width, t0->height);
+    struct obj *vbo = s->stream[pe->stream], *ibo = s->indices;
+    if (!m || !vbo || !vbo->mem) return NULL;
+    struct { const void *m, *vb, *ib; uint32_t voff, start, count; int32_t base; } key = {
+        m, vbo, ibo, s->stream_offset[pe->stream], start, count, base_vertex};
+    NSData *kd = [NSData dataWithBytes:&key length:sizeof key];
+    if (!hair_swaps) hair_swaps = [NSMutableDictionary new];
+    NSValue *known = hair_swaps[kd];
+    if (known) return known.pointerValue;
+    hair_swaps[kd] = [NSValue valueWithPointer:NULL];
+    int is32 = ibo->format == 102;
+    uint32_t stride = s->stream_stride[pe->stream], ni = count * 3;
+    if ((uint64_t)(start + ni) * (is32 ? 4 : 2) > ibo->size) return NULL;
+    const uint8_t *ip = (const uint8_t *)bl_g2h(ibo->mem) + (size_t)start * (is32 ? 4 : 2);
+    const uint8_t *vb = (const uint8_t *)bl_g2h(vbo->mem) + s->stream_offset[pe->stream];
+    size_t vsize = vbo->size - s->stream_offset[pe->stream];
+#define HAIR_INDEX(i) (is32 ? ((const uint32_t *)ip)[i] : ((const uint16_t *)ip)[i])
+    for (uint32_t i = 0; i < ni; i++)
+        if ((size_t)((int64_t)base_vertex + HAIR_INDEX(i) + 1) * stride > vsize) return NULL;
+    struct hair_swap *hs = calloc(1, sizeof *hs);
+    if (!m->nverts) {  // keep the triangles inside m->keep
+        uint32_t *keep = malloc((size_t)ni * 4), nk = 0;
+        for (uint32_t t = 0; t < count; t++) {
+            float u = 0, v = 0;
+            for (int c = 0; c < 3; c++) {
+                const float *uv = (const float *)(vb + (size_t)(base_vertex + HAIR_INDEX(t * 3 + c)) * stride + te->offset);
+                u += uv[0] / 3, v += uv[1] / 3;
+            }
+            if (u >= m->keep[0] - 0.01f && u <= m->keep[2] + 0.01f && v >= m->keep[1] - 0.01f && v <= m->keep[3] + 0.01f)
+                for (int c = 0; c < 3; c++) keep[nk++] = HAIR_INDEX(t * 3 + c);
+        }
+        hs->nidx = nk;
+        if (nk) hs->ib = [mtl newBufferWithBytes:keep length:(NSUInteger)nk * 4 options:MTLResourceStorageModeShared];
+        free(keep);
+        fprintf(stderr, "[metal] hair: %u of %u triangles kept\n", nk / 3, count);
+        hair_swaps[kd] = [NSValue valueWithPointer:hs];
+        return hs;
+    }
+    // The draw's vertices.
+    uint32_t *ids = malloc((size_t)ni * 4), nid = 0;
+    for (uint32_t i = 0; i < ni; i++) {
+        uint32_t id = (uint32_t)(base_vertex + (int32_t)HAIR_INDEX(i));
+        int dup = 0;
+        for (uint32_t j = 0; j < nid && !dup; j++) dup = ids[j] == id;
+        if (!dup) ids[nid++] = id;
+    }
+#undef HAIR_INDEX
+    float(*mp)[3] = malloc((size_t)nid * 12);
+    for (uint32_t j = 0; j < nid; j++) memcpy(mp[j], vb + (size_t)ids[j] * stride + pe->offset, 12);
+    // Fit: q = sc * R a + t, R one of the 48 signed axis permutations.
+    double cm[3] = {0}, ca[3] = {0}, rm = 0, ra = 0;
+    for (uint32_t j = 0; j < nid; j++)
+        for (int k = 0; k < 3; k++) cm[k] += mp[j][k] / nid;
+    for (uint32_t j = 0; j < m->nanchors; j++)
+        for (int k = 0; k < 3; k++) ca[k] += m->anchors[j * 3 + k] / m->nanchors;
+    for (uint32_t j = 0; j < nid; j++)
+        for (int k = 0; k < 3; k++) rm += (mp[j][k] - cm[k]) * (mp[j][k] - cm[k]) / nid;
+    for (uint32_t j = 0; j < m->nanchors; j++)
+        for (int k = 0; k < 3; k++) ra += (m->anchors[j * 3 + k] - ca[k]) * (m->anchors[j * 3 + k] - ca[k]) / m->nanchors;
+    double sc = ra > 0 ? sqrt(rm / ra) : 1, best = 1e30, R[3][3] = {{0}}, t[3];
+    static const int perm[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+    for (int pi = 0; pi < 6; pi++)
+        for (int sg = 0; sg < 8; sg++) {
+            double err = 0;
+            for (uint32_t j = 0; j < m->nanchors; j++) {
+                const float *a = &m->anchors[j * 3];
+                double q[3], dmin = 1e30;
+                for (int k = 0; k < 3; k++)
+                    q[k] = cm[k] + sc * ((sg >> k & 1) ? -1 : 1) * (a[perm[pi][k]] - ca[perm[pi][k]]);
+                for (uint32_t i = 0; i < nid; i++) {
+                    double dx = mp[i][0] - q[0], dy = mp[i][1] - q[1], dz = mp[i][2] - q[2], d = dx * dx + dy * dy + dz * dz;
+                    if (d < dmin) dmin = d;
+                }
+                err += dmin;
+            }
+            if (err < best) {
+                best = err;
+                memset(R, 0, sizeof R);
+                for (int k = 0; k < 3; k++) R[k][perm[pi][k]] = (sg >> k & 1) ? -1 : 1;
+            }
+        }
+    for (int k = 0; k < 3; k++) t[k] = cm[k] - sc * (R[k][0] * ca[0] + R[k][1] * ca[1] + R[k][2] * ca[2]);
+    // Then scale and offset refined against each anchor's nearest vertex (the two sets
+    // need not cover the same parts, so their spreads only give a first guess).
+    double rms = 0;
+    for (int iter = 0; iter < 20; iter++) {
+        double sa[3] = {0}, sm[3] = {0}, num = 0, den = 0, err = 0;
+        double(*ra_)[3] = malloc((size_t)m->nanchors * 24), (*nm)[3] = malloc((size_t)m->nanchors * 24);
+        for (uint32_t j = 0; j < m->nanchors; j++) {
+            const float *a = &m->anchors[j * 3];
+            double q[3], dmin = 1e30;
+            uint32_t bi = 0;
+            for (int k = 0; k < 3; k++) {
+                ra_[j][k] = R[k][0] * a[0] + R[k][1] * a[1] + R[k][2] * a[2];
+                q[k] = sc * ra_[j][k] + t[k];
+            }
+            for (uint32_t i = 0; i < nid; i++) {
+                double dx = mp[i][0] - q[0], dy = mp[i][1] - q[1], dz = mp[i][2] - q[2], d = dx * dx + dy * dy + dz * dz;
+                if (d < dmin) dmin = d, bi = i;
+            }
+            err += dmin;
+            for (int k = 0; k < 3; k++) nm[j][k] = mp[bi][k], sa[k] += ra_[j][k] / m->nanchors, sm[k] += nm[j][k] / m->nanchors;
+        }
+        for (uint32_t j = 0; j < m->nanchors; j++)
+            for (int k = 0; k < 3; k++) num += (ra_[j][k] - sa[k]) * (nm[j][k] - sm[k]), den += (ra_[j][k] - sa[k]) * (ra_[j][k] - sa[k]);
+        free(ra_), free(nm);
+        rms = sqrt(err / m->nanchors);
+        if (den > 0) sc = num / den;
+        for (int k = 0; k < 3; k++) t[k] = sm[k] - sc * sa[k];
+    }
+    fprintf(stderr, "[metal] hair: %u strip vertices onto %u of the game's, scale %.2f, fit %.3f (%.1f%% of its size)\n",
+            m->nverts, nid, sc, rms, 100 * rms / sqrt(rm));
+    if (rms > 0.05 * sqrt(rm)) {
+        free(ids), free(mp), free(hs);
+        return NULL;
+    }
+    id<MTLBuffer> out = [mtl newBufferWithLength:(NSUInteger)m->nverts * stride options:MTLResourceStorageModeShared];
+    uint8_t *o = out.contents;
+    for (uint32_t v = 0; v < m->nverts; v++) {
+        const float *src = &m->verts[v * 8];
+        float q[3], n[3];
+        for (int k = 0; k < 3; k++) {
+            q[k] = (float)(sc * (R[k][0] * src[0] + R[k][1] * src[1] + R[k][2] * src[2]) + t[k]);
+            n[k] = (float)(R[k][0] * src[3] + R[k][1] * src[4] + R[k][2] * src[5]);
+        }
+        uint32_t nearest = 0;
+        float dmin = 1e30f;
+        for (uint32_t i = 0; i < nid; i++) {
+            float dx = mp[i][0] - q[0], dy = mp[i][1] - q[1], dz = mp[i][2] - q[2], d = dx * dx + dy * dy + dz * dz;
+            if (d < dmin) dmin = d, nearest = i;
+        }
+        uint8_t *r = o + (size_t)v * stride;
+        memcpy(r, vb + (size_t)ids[nearest] * stride, stride);
+        memcpy(r + pe->offset, q, 12);
+        if (ne) memcpy(r + ne->offset, n, 12);
+        memcpy(r + te->offset, &src[6], 8);
+    }
+    // The game's triangles to keep under the strips: those whose centre is one of m->base,
+    // placed by the same fit (the scalp, without the locks the strips replace).
+    if (m->nbase) {
+        uint32_t *keep = malloc((size_t)ni * 4), nk = 0;
+        float tol = 0.01f * (float)sqrt(rm);
+        for (uint32_t tr = 0; tr < count; tr++) {
+            float c[3] = {0};
+            uint32_t vi[3];
+            for (int k = 0; k < 3; k++) {
+                vi[k] = is32 ? ((const uint32_t *)ip)[tr * 3 + k] : ((const uint16_t *)ip)[tr * 3 + k];
+                const float *pv = (const float *)(vb + (size_t)(base_vertex + (int32_t)vi[k]) * stride + pe->offset);
+                for (int j = 0; j < 3; j++) c[j] += pv[j] / 3;
+            }
+            int hit = 0;
+            for (uint32_t b = 0; b < m->nbase && !hit; b++) {
+                const float *bc = &m->base[b * 3];
+                float d2 = 0;
+                for (int k = 0; k < 3; k++) {
+                    float q = (float)(sc * (R[k][0] * bc[0] + R[k][1] * bc[1] + R[k][2] * bc[2]) + t[k]) - c[k];
+                    d2 += q * q;
+                }
+                hit = d2 < tol * tol;
+            }
+            if (hit)
+                for (int k = 0; k < 3; k++) keep[nk++] = vi[k];
+        }
+        hs->nbase_idx = nk;
+        hs->base_ib = [mtl newBufferWithBytes:keep length:(NSUInteger)(nk ? nk : 1) * 4
+                                      options:MTLResourceStorageModeShared];
+        free(keep);
+        fprintf(stderr, "[metal] hair: %u of the game's %u triangles kept under the strips\n", nk / 3, count);
+    }
+    free(ids), free(mp);
+    hs->vb = out, hs->nidx = m->nidx, hs->tex = m->tex;
+    hs->ib = [mtl newBufferWithBytes:m->idx length:(NSUInteger)m->nidx * 4 options:MTLResourceStorageModeShared];
+    hair_swaps[kd] = [NSValue valueWithPointer:hs];
+    return hs;
+}
+
+static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, uint32_t min_index, uint32_t nverts,
+                        uint32_t start, uint32_t count, int indexed);
+
 void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, uint32_t min_index, uint32_t nverts,
                      uint32_t start, uint32_t count, int indexed, uint32_t unused0, uint32_t unused1)
 {
     (void)unused0, (void)unused1;
+    ensure_device();
+    struct hair_swap *hs = NULL;
+    if (indexed && type == 4) {
+        struct element el[64];
+        int nel = vertex_elements(s, el, 64);
+        hs = hair_swap_for(s, el, nel, start, count, base_vertex);
+    }
+    if (!hs) {
+        render_draw(s, type, base_vertex, min_index, nverts, start, count, indexed);
+        return;
+    }
+    if (!hs->nidx) {  // nothing of it kept
+        draws++, frame_draws++;
+        return;
+    }
+    // Strips: over the game's own hair (a base where they leave gaps), alpha-tested and
+    // blended as hair (both sides), whatever the game set.
+    if (hs->vb && hs->base_ib) {
+        // The base pushed a little behind, as the strips lie on it (the fringe's on its locks).
+        struct hair_swap base = {.ib = hs->base_ib, .nidx = hs->nbase_idx};
+        uint32_t *rs = s->rs, bias[2] = {rs[195], rs[175]};
+        float b = 64.0f / 16777215.0f, sl = 2.0f;
+        memcpy(&rs[195], &b, 4), memcpy(&rs[175], &sl, 4);
+        hair_swap = &base;
+        if (base.nidx) render_draw(s, type, base_vertex, min_index, nverts, start, count, indexed);
+        hair_swap = NULL;
+        rs[195] = bias[0], rs[175] = bias[1];
+    } else if (hs->vb)
+        render_draw(s, type, base_vertex, min_index, nverts, start, count, indexed);
+    uint32_t *rs = s->rs, saved[5] = {rs[15], rs[24], rs[25], rs[27], rs[22]};
+    if (hs->vb) rs[15] = 1, rs[24] = 0x60, rs[25] = 7, rs[27] = 0, rs[22] = 1;
+    hair_swap = hs;
+    render_draw(s, type, base_vertex, min_index, nverts, start, count, indexed);
+    hair_swap = NULL;
+    rs[15] = saved[0], rs[24] = saved[1], rs[25] = saved[2], rs[27] = saved[3], rs[22] = saved[4];
+}
+
+static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, uint32_t min_index, uint32_t nverts,
+                        uint32_t start, uint32_t count, int indexed)
+{
     ensure_device();
     draws++, frame_draws++;
     log_draw(s, indexed ? "drawindexed" : "draw", type, count);
@@ -3375,10 +4080,14 @@ void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
     struct element el[64];
     int nel = vertex_elements(s, el, 64);
     post_before_draw(s, el, nel);
+    hair_before_draw(s);
     id<MTLRenderCommandEncoder> e = pass(s);
     struct pipe_key k;
     draw_prims = count;
-    if (!setup_draw(s, e, type, el, nel, &k)) return;
+    draw_tess = env_tess > 1 && indexed && type == 4 && count <= TESS_MAX_PATCHES && s->indices && !hair_swap;
+    int ok = setup_draw(s, e, type, el, nel, &k);
+    draw_tess = 0;
+    if (!ok) return;
     if (env_tex_stats && (long)frames == draw_stats_frame) {
         // debugging: brightness of each plain 32-bit texture the frame samples, once per texture
         static void *seen[256];
@@ -3489,6 +4198,10 @@ void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
             if (k.attr[i].format && k.attr[i].buffer == b) used = 1;
         if (!used) continue;
         int rebased;
+        if (hair_swap && hair_swap->vb) {
+            [e setVertexBuffer:hair_swap->vb offset:0 atIndex:(NSUInteger)b];
+            continue;
+        }
         src[b] = stream_data(s->stream[b], s->stream_offset[b], s->stream_stride[b], first, nv, &rebased);
         if (!src[b].buf) {
             LOG_ONCE("[metal] draw without a vertex buffer on stream %d\n", b);
@@ -3533,8 +4246,24 @@ void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
     MTLIndexType it;
     id<MTLBuffer> ib = index_data(type, (const uint8_t *)bl_g2h(ibo->mem) + (size_t)start * isz, is32, count, &ic, &io, &it);
     NSInteger bv = rel ? -(NSInteger)min_index : base_vertex;
-    [e drawIndexedPrimitives:primitive(type) indexCount:ic indexType:it indexBuffer:ib indexBufferOffset:io
-               instanceCount:1 baseVertex:bv baseInstance:0];
+    if (hair_swap) {
+        ib = hair_swap->ib, io = 0, it = MTLIndexTypeUInt32, ic = hair_swap->nidx;
+        if (hair_swap->vb) bv = 0;
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass) {  // hair's blended pass
+            if (!k.psv.hair || !hair_soft_on() || !s->rs[15]) break;
+            hair_pass = 2, draw_tess = k.vsv.tess;
+            ok = setup_draw(s, e, type, el, nel, &k);
+            hair_pass = 0, draw_tess = 0;
+            if (!ok) break;
+        }
+        if (k.vsv.tess)
+            draw_patches(e, ib, io, it, ic, bv);
+        else
+            [e drawIndexedPrimitives:primitive(type) indexCount:ic indexType:it indexBuffer:ib indexBufferOffset:io
+                       instanceCount:1 baseVertex:bv baseInstance:0];
+    }
 }
 
 void d3d_render_draw_up(struct d3d_state *s, uint32_t type, uint32_t min_index, uint32_t nverts, uint32_t count,
@@ -3547,6 +4276,7 @@ void d3d_render_draw_up(struct d3d_state *s, uint32_t type, uint32_t min_index, 
     struct element el[64];
     int nel = vertex_elements(s, el, 64);
     post_before_draw(s, el, nel);
+    hair_before_draw(s);
     id<MTLRenderCommandEncoder> e = pass(s);
     struct pipe_key k;
     // UP draws read stream 0 with the given stride.
@@ -3738,7 +4468,7 @@ static void hdr_draw(id<MTLTexture> pic, id<MTLTexture> world, id<MTLTexture> ou
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
-    [e setRenderPipelineState:ssr_pipeline(3, out.pixelFormat, 1, MTLPixelFormatInvalid)];
+    [e setRenderPipelineState:ssr_pipeline(3, out.pixelFormat, MTLPixelFormatInvalid)];
     [e setFragmentTexture:pic atIndex:0];
     [e setFragmentTexture:world ? world : pic atIndex:1];
     [e setFragmentBytes:hp length:sizeof hp atIndex:0];
@@ -3797,9 +4527,10 @@ void d3d_render_present(struct d3d_state *s)
     bl_vgui_poll();  // the options' check box
     if (view_state == 1) {  // a frame with no view model or HUD
         post_run(s);
-        if ((ao_result || post_result) && s->render_target[0] == s->back_buffer) pass(s);
+        if ((ao_result || post_result || taa_pending) && s->render_target[0] == s->back_buffer) pass(s);
     }
     view_state = 0, ao_result = nil, post_result = 0;
+    taa_frame_end();
     flush_clears(s);
     shadow_frame_start();
     frames++;
@@ -4006,7 +4737,6 @@ void d3d_render_stretch(struct obj *src, uint32_t src_rect, struct obj *dst, uin
         memcpy(dr, bl_g2h(dst_rect), 16);
         for (int i = 0; i < 4; i++) dr[i] *= (uint32_t)obj_scale(dst);
     }
-    if (multisampled(dst)) dst->ms_stale = 1;  // written outside its multisampled copy
     if (sr[2] - sr[0] != dr[2] - dr[0] || sr[3] - sr[1] != dr[3] - dr[1]) {
         stretch_draw(a, sr, b, dr, filter != 1);  // D3DTEXF_POINT is 1; NONE and LINEAR filter
         return;

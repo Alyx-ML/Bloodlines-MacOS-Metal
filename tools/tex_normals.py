@@ -64,10 +64,13 @@ def main():
                 Image.fromarray((y * 255 + 0.5).astype(np.uint8), "RGB").save(dst)
             done += 1
     # The renderer's list (d3d9/tex_detail.m): size, signature and map of each texture
-    # matched that has one.
+    # matched that has one, and every hair, eye and tongue texture (they get no map, but may
+    # have an upscaled copy, <name>_u.png, for the renderer to draw instead).
+    hair = [t for t in index if any(m in t["name"] for m in args.match) and "hair" in os.path.basename(t["name"]).lower()]
+    hair += [t for t in index if "character/eyes/" in t["name"] or t["name"].endswith("character/teeth/tongue")]
     with open(os.path.join(args.dir, "normals.txt"), "w") as f:
-        for t in todo:
-            if os.path.exists(os.path.join(args.dir, t["name"] + "_n.png")):
+        for t in todo + hair:
+            if t in hair or os.path.exists(os.path.join(args.dir, t["name"] + "_n.png")):
                 f.write(f'{t["w"]} {t["h"]} {" ".join(str(v) for v in t["sig"])} {t["name"]}_n.png\n')
     print(f"{done} maps made ({len(todo)} textures matched) in {os.path.abspath(args.dir)}")
 

@@ -53,6 +53,15 @@ struct d3d_shader_variant {
     // Vertex: also output the clip-space step to the position nudged along the normal
     // (BLVSOut.bln), the smooth normal detail maps are laid on.
     uint8_t smooth_normal;
+    // Vertex, with smooth_normal: a post-tessellation function over the draw's triangles
+    // ([[patch(triangle, 3)]]), each split finer and its points pushed out onto the curve
+    // the three corners' normals describe (Phong tessellation), so round shapes (heads,
+    // arms) lose their facets. Needs the view's projection at [[buffer(22)]]:
+    // {alpha, beta, p00, p11}, clip z = alpha * w + beta.
+    uint8_t tess;
+    // Pixel, with detail: hair, whose shine is a band across the strands (ps_detail). 2
+    // also fades it near what was drawn before it, whose depth is at [[texture(14)]].
+    uint8_t hair;
     // Pixel: samplers (bit n) that read the shadow atlas (metal_render.m, shadows). Their
     // reads become one soft-shadow lookup, bl_shadow_soft, with its parameters (struct
     // d3d_shadow_params) in [[buffer(2)]].
@@ -106,8 +115,7 @@ struct d3d_ps_params {
     uint32_t fog_mode;        // 0 off, 1 vertex (oFog), 2 linear, 3 exp, 4 exp2 (per pixel)
     float alpha_ref;
     uint32_t alpha_func;      // D3DCMPFUNC; 8 (ALWAYS) when alpha test is off
-    float edge;               // 1: alpha to coverage, the cut-out's edge from its alpha's slope
-    float pad;
+    float pad[2];
 };
 
 // Fixed-function pixel stages (draws with no pixel shader): the texture stage states

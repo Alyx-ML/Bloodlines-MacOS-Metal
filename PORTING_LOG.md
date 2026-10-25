@@ -1506,3 +1506,201 @@ The windows vary by up to 1 ms from run to run.
     reflections.
   - The cost of contact shadows in the close-up, about 1–1.5 ms, has not been
     optimized.
+
+## 2026-10-25 — Rounder characters (GPU smoothing)
+
+Character draws that get the detail maps (skin, clothes, hair) are now drawn as
+tessellated patches. Each triangle is split 3 times per edge (`BL_TESS`, 0 off, at most
+16), and the new points are pushed out onto the curve the corners' normals describe
+(Phong tessellation, three quarters of the way). That rounds off the faceted chins,
+cheeks and pigtails.
+
+- The game's vertex shader is generated as a function (`bl_vs`) run on the three corners
+  of each patch, then a `[[patch(triangle, 3)]]` main function works in view space with
+  the projection the renderer already reads from the world view (`view_proj`, buffer 22).
+  The normal is the same clip-space step the detail maps use.
+- Only indexed triangle lists of up to 65536 triangles in the world view. The indices are
+  copied as 32-bit with the base vertex added, since patch draws have none. The patch
+  winding had to be counter-clockwise to keep the game's culling.
+- Verified: headless `sm_asylum_1` close-up of Jeanette with Metal API validation, no
+  errors and no cracks; the jaw, chin and pigtails are smoother.
+- Not verified: the frame cost, other levels, crowds of characters, and whether the
+  shadow casters (drawn untessellated) leave visible gaps in self-shadowing.
+
+## 2026-10-25 — Hair: soft edges, strands, roots, back light
+
+Shader-only work on characters' hair (alpha-tested, skinned, with no normal map of its
+own), tried on Jeanette:
+
+- Two passes (`BL_HAIR_SOFT`, default 0.75, 0 off): first solid where the texture's alpha
+  is above 0.75, writing depth, then again blended where it is below, without writing
+  depth. Thin strands and tips now fade out instead of being cut off. Indexed draws only.
+- Strands (`BL_HAIR_STRANDS`, default 1): about 420 strands across the texture, each with
+  its own brightness and a slightly turned normal. The shine breaks up into strands, and
+  the pattern fades out where strands get smaller than a pixel.
+- Roots (`BL_HAIR_ROOT`, default 1): up to 45% darker where hair lies within 3 units of
+  the head or body, from the depth copy the soft blend already uses.
+- Back light (`BL_HAIR_GLOW`, default 1): light from behind the hair shows through it in
+  the hair's colour.
+- Verified: headless `sm_asylum_1` close-up with Metal API validation, no errors. The
+  pigtail tips are soft and the strand pattern shows.
+- Not verified: the look in motion, other characters' hair, and whether the unsorted
+  blended pass shows hair-behind-hair in the wrong order anywhere.
+
+## 2026-10-25 — Hair redrawn as strips (Jeanette)
+
+A character's hair can be replaced in the renderer by new hair strips made on the
+player's machine from their own game files (`BL_HAIR_MESH`, default on; 0 off).
+
+- **Files:** beside a hair texture's normal map path, `<name>_hair.bin` (strips:
+  positions, normals, texture coordinates, indices, plus the game's hair vertices they
+  were made from, as anchors) and `<name>_hair.png` (the strips' strand texture). A file
+  with no strips instead lists the part of the game's texture to keep drawing (the red
+  hair ties). `tex_detail.m` now remembers which listed texture each game texture
+  matched, and loads these files (`bl_detail_hair`).
+- **Drawing (`metal_render.m` `hair_swap_for`):** for an indexed triangle draw of a
+  skinned texture with strips, each strip vertex becomes a copy of the game's nearest
+  vertex in that draw (so it keeps the same bone indices and weights and follows the
+  head), with the strip's position, normal and texture coordinates. The strips are placed
+  by fitting the anchors onto the draw's vertices: one of the 48 axis turns and flips,
+  then scale and offset refined against nearest vertices. On Jeanette the fit is exact
+  (scale 52.49 from the tools' metres to model units). The game's hair is drawn first as
+  a base, then the strips alpha-tested and blended as hair, on both sides, untessellated.
+- **Removed:** the strands grown on hair at draw time (`BL_STRANDS`, the quad-patch
+  `strand_main`); they drew nothing useful.
+- **Made by:** scratch Blender/Python scripts so far (SourceIO import, strands traced and
+  combed over her hair surfaces, round pigtail bunches, strips from guide strands). Not
+  yet a tool in `tools/`.
+- Verified: headless `sm_asylum_1` close-up: 70100 strip vertices placed with a 0.0%
+  fit error; the pigtails draw as round bunches in the right place; of the eight pigtail
+  draws only the hair ties' 56 triangles remain.
+- Not verified: the top of her head (out of the close-up's frame), the look in motion,
+  frame cost, Metal API validation, other characters. The right pigtail is too bright.
+- Later the same day: the first strips (one thin strip per traced strand, about 8,700)
+  looked noisy and broken in game, so they were replaced. The new ones come from Daniel
+  Bystedt's free Blender Geometry Nodes setup "hair cards from curves" (the player's own
+  download; it works in Blender 5.3, its inputs set through
+  `modifier.properties.inputs.<id>.value`). Her traced strands are clumped by k-means
+  into 390 guide curves (top 170, fringe 50, pigtails 170), each becoming one card about
+  2.4 cm wide. The cards lie on the top shell or on a round tube per pigtail, and carry a
+  new 2048x2048 clump texture: four variants; the top's fade in and out softly so the
+  overlapping rows show no edges, and the pigtails' start solid at the tie. 9,360
+  vertices, 8,580 triangles. The renderer no longer adds the hair shader's strand pattern
+  on such strips, since the texture has its own strands.
+- Verified (new cards): headless `sm_asylum_1` close-up, placed with a 0.0% fit error,
+  smooth round pigtails, no noise in the still frame.
+- Not verified (new cards): in motion, other angles in game, frame cost, other characters.
+- The fringe too (same day): the game's own fringe locks were still drawn under the cards
+  as part of the base, and hung in front of the new ones. The strip file may now end with
+  a list of the game's triangles to keep under the strips (their centres in the anchors'
+  space, placed by the same fit); for Jeanette, the 196 triangles of her scalp, so her
+  locks are no longer drawn. The new fringe cards run straight down those locks (lines
+  of equal u in their texture on the big front piece; along their own long axis on the
+  two small centre locks). The strips' soft edge near the skin is now 0.15 of the game
+  hair's (`BL_HAIR_FADE`), since the fringe lies close to the forehead and faded away.
+- Verified (fringe): headless close-up, 196 of 390 hair_1 triangles kept, the fringe drawn
+  as new locks in the same style as the rest.
+- After a window check (fringe stuck out like a visor; black dots and lines in the hair):
+  the clump texture's colour had been left multiplied by its cover, so every hair had a
+  dark edge where see-through (now divided out); the fringe guides' upper halves are
+  brought down onto the scalp, since the game's lock piece curls forward at the
+  hairline; and hair's smooth normal now faces the camera like its triangle normal
+  (`d3d9_shader.c`), so the back of a two-sided card is not lit as facing away.
+- Verified: Blender render (no visor, no dark edges); headless close-up, pigtails clean.
+  Not verified: the fringe in game (out of the close-up's frame this run).
+- The user's window check still showed black dots and lines: the dark room showing
+  through gaps between the pigtail cards. Each pigtail now has a solid core under its
+  cards (a smooth tube, 0.8 of the bunch's radius and three quarters of its length,
+  textured with the dense roots of the pigtail texture), as the scalp is under the top,
+  and the pigtail texture variants have about twice the hairs. 10,290 vertices.
+- Verified: headless, frames 1300 and 1500 (the latter frames her whole head): solid
+  pigtails with nothing showing through, the fringe falling from the scalp.
+- The user's next window check: black specks still in the hair, the fringe looking
+  pasted on with the outline of her head showing, and "not how it is in game". My
+  headless runs had been forcing effects on and off (`BL_AO=0 BL_SSR=0 BL_SHARPEN=1 ...`)
+  and a scratch data directory; the player's runs take the options from their own
+  registry (all effects on except HDR). Captured again with nothing forced.
+- Black specks: switching one effect off at a time and counting hair pixels much darker
+  than their neighbourhood (frame 1500, per 1000 hair pixels): 3.5 with everything on,
+  1.0 with only sharpening off, 4.7 to 6.6 with each other effect off alone (their
+  poses differ, so those vary). The sharpening (contrast adaptive) darkens the gaps
+  beside each fine bright strand. Hair (pixels shaded by ps_detail with `hair`) now
+  marks its reflection info -1.4 instead of -1.25, still inside the skin range for skin
+  scattering and contact shadows and below the sheen's -1.1; post_apply skips
+  sharpening on such pixels and their four neighbours (`metal_render.m`). 1.6 after,
+  with sharpening on; the game's own hair was 2.9.
+- Fringe: drawn over the game's own fringe locks again, with the scalp (all 390 hair_1
+  triangles kept under the strips), so nothing see-through and no edge of the scalp
+  shows between the new locks. The base is drawn with a depth bias (64 units, slope 2)
+  so the strips lying on it win.
+- Verified: headless with the player's settings, frame 1500: fringe solid and joined to
+  the top, no head outline, specks 1.5 per 1000. Not verified: a window run by the user.
+- The user's next window check: with skin scattering off the new hair was a black blocky
+  mess, and with it on the black dots and lines were still in the pigtails.
+  - Skin scattering off: the strips only got their own texture and hair shading on the
+    character path (variant skin 1), which only skin scattering turned on, so they were
+    drawn with the game's hair texture. Strip draws now take that path whenever the
+    reflection info is drawn, and always bind their own texture (`metal_render.m`).
+  - The dots: the pigtail cores were textured from the pigtail slot's roots, 30 to 65%
+    see-through, so the room showed through them. They now use an opaque strip of hair
+    between slots 2 and 3 of the texture (pixels 1524-1547, which no card reaches; made
+    by the scratch tool core_strip.py). What was left was the hair's blended second pass:
+    with thousands of layered cards drawn in no order, it shows the dark behind as
+    specks (gone with `BL_HAIR_SOFT=0`, unchanged with MSAA or the edge smoothing off).
+    Strips now draw in one alpha-tested pass with alpha to coverage (`hair_soft_on`);
+    the game's own hair keeps both passes.
+  - The export script now keeps all 390 hair_1 triangles under the cards (as installed).
+- Verified: headless with the player's settings, skin scattering on and off, frame 1500:
+  pigtails solid without specks. With skin scattering off the fringe's edges are harder
+  (the game's locks underneath are drawn plain then, as before this work).
+- Seen by the user, not looked at yet: with skin scattering on, the barman goes dark
+  when the camera moves, and back to normal from the side.
+- The user saw patches of a different colour round Jeanette's neck as she moved: the
+  contact shadows (`BL_CONTACT=show`). Two causes, both fixed in `contact_main`:
+  the light each pixel steps toward was weighted by how the surface faces it, with a
+  normal taken from the depth, so on the low-poly collar each flat face picked its own
+  light; and the first steps hit the next face of the same fold. The light is now chosen
+  by brightness alone, and hits within `1 + 0.004 * w` units of the start are skipped.
+  Hair (info -1.4) still casts contact shadows but no longer takes them.
+- Verified: headless, `BL_CONTACT=show`: the neck and collar shade smoothly, no facets.
+
+## 2026-10-25: hair, collar and contact shadows with MetalFX TAA
+
+- TAA is still opt-in in this tree (`BL_TAA=1`); earlier checks were all MSAA.
+- Under TAA the contact shadows' step offset now changes each frame (the params' `pad`
+  carries `frames % 16`), so the scaler averages their grain out instead of keeping it.
+- Verified: headless with the player's settings plus `BL_TAA=1`, frame 1500, 100 of 100
+  frames through the scaler, 390 hair triangles kept: hair specks 0.58 per 1000 (1.31
+  with MSAA); hair tips and pigtail edges finer, collar smooth, contact shadows smooth.
+- Not verified: moving shots. Skinned characters get no motion vectors, so the scaler
+  may smear moving hair; a window run by the user is the check.
+
+## 2026-10-25: characters going dark up close with skin scattering
+
+- The user: walking up to a character (the barman in the asylum) darkens them; stepping
+  to the side brings them back. Headless walk-up captures (frame 850, `BL_TAA=1`, one
+  effect off at a time): only `BL_SSS=0` brings him back; shadows, contact shadows and
+  ambient occlusion off do not.
+- First fix tried: the characters' light (ps_detail, the skin's shine, contact shadows)
+  now takes the lights as bright as they are in that part of the map (`bl_light.seen`,
+  `char_lights`), not dimmed to 0.3 where a fitting hides them from the camera, and all
+  24 of the frame's lights instead of the first 8 (`detail_bind`; its settings moved to
+  bl_dl[2] and [3]).
+- Verified: built, and one headless run: the barman is still dark at frame 850. So that
+  was not the cause, or not all of it. Next suspect: the 24 lights are still the
+  brightest at the camera (the map has 72), so walking up changes which ones light him;
+  `BL_CHARLIGHT=0` would show whether the light with a direction is what darkens him.
+- Verified (one headless run, frame 850, `BL_CHARLIGHT=0`): with the light with a
+  direction off, the barman looks as he does with skin scattering off. That part of
+  ps_detail is what darkens him: lit by lights behind him, his front is turned to 0.35
+  to 0.5 of the game's light.
+- Fix: the light with a direction now takes every light the frame has for this part of
+  the map (up to 64, `CHAR_LIGHTS`, uploaded per draw because that is over
+  setFragmentBytes' 4 KB), so each pixel uses what reaches it, wherever the camera is;
+  the haze, the skin's shine and contact shadows keep the first 24. And the side away
+  from the lights is darkened to no less than `BL_CHARLIGHT_MIN` of the game's light
+  (default 0.8, was 0.35), passed in bl_dl[3].y.
+- Verified: one headless run, frame 850 (`BL_TAA=1`, the player's settings): the barman
+  lit as with skin scattering off, with a little more shape; frame 820, further away,
+  unchanged. Not verified: other characters and maps, a window run by the user, and the
+  cost of up to 64 lights per character pixel (not measured).

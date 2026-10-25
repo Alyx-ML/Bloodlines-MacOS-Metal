@@ -201,8 +201,9 @@ int bl_bsp_lights(const float cam[3], struct bl_light *out, int max)
         struct bl_light *l = &m->lights[i];
         float v[3] = {l->pos[0] - cam[0], l->pos[1] - cam[1], l->pos[2] - cam[2]};
         float d2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-        float target = 0;
+        float target = 0, in = 0;
         if (d2 < 3000.0f * 3000.0f && sees(m, cluster, m->light_cluster[i])) {
+            in = 1;
             // The light's origin may sit just inside its fitting: start the line a little
             // towards the camera.
             float d = sqrtf(d2), s = d > 8 ? 4 / d : 0, p[3];
@@ -210,8 +211,11 @@ int bl_bsp_lights(const float cam[3], struct bl_light *out, int max)
             target = clear_line(m, 0, p, cam, 0) ? 1 : 0.3f;
         }
         l->vis += (target - l->vis) * 0.15f;
-        if (l->vis < 0.01f) continue;
-        float c = fmaxf(l->color[0], fmaxf(l->color[1], l->color[2])) * l->vis;
+        l->seen += (in - l->seen) * 0.15f;
+        if (l->seen < 0.01f) continue;
+        // Ranked by how much it lights here, not how much of it the camera sees: the
+        // characters' light takes the list as well.
+        float c = fmaxf(l->color[0], fmaxf(l->color[1], l->color[2])) * l->seen;
         float score = c / (l->att[0] + l->att[1] * sqrtf(d2) + l->att[2] * d2 + 1);
         // Kept sorted, brightest first.
         int j = n < max ? n++ : max;

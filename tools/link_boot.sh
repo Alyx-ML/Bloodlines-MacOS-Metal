@@ -24,6 +24,6 @@ rm -f tests/boot
 # shellcheck disable=SC2086
 clang -std=c2x -g -O2 -arch arm64 -mmacosx-version-min=14.0 -Wall -I../runtime -I runtime \
     ../tests/boot.c $objs -Wl,-export_dynamic -Wl,-force_load,runtime/libbl_runtime.a -Wl,-alias_list,tests/aliases.txt \
-    -framework Metal -framework QuartzCore -framework AppKit -framework CoreGraphics -framework CoreText -framework AudioToolbox -framework GameController -framework ImageIO -o tests/boot 2>&1 | grep -v xcrun_db || true
+    -framework Metal -framework MetalFX -framework QuartzCore -framework AppKit -framework CoreGraphics -framework CoreText -framework AudioToolbox -framework GameController -framework ImageIO -o tests/boot 2>&1 | grep -v xcrun_db || true
 test -x tests/boot
 echo "built: $HERE/build/tests/boot"

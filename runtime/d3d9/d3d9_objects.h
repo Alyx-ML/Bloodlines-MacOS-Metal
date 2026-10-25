@@ -34,8 +34,6 @@ struct obj {
     uint32_t query_type;
     uint32_t input_kind, input_state_size;  // DirectInput devices (dinput8.c)
     void *gpu;                 // renderer's texture or buffer (metal_render.m)
-    void *gpu_ms;              // back buffer and auto depth: the multisampled copy drawn into
-    int ms_stale;              // gpu was written without going through gpu_ms
     int gpu_scale;             // gpu is this many times the size (the shadow atlas; 0 = 1)
     void *sound;               // DirectSound buffer state (dsound.c)
     int dirty;                 // guest memory changed since the last upload

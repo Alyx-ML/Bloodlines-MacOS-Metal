@@ -238,6 +238,7 @@ static id<MTLTexture> load_map(id<MTLDevice> dev, const char *rel)
 
 // The upscaled colour texture beside the normal map (<name>_u.png for <name>_n.png), its
 // bytes as they are (alpha not premultiplied), with box-filtered mipmaps; nil without one.
+static id<MTLTexture> load_rgba(id<MTLDevice> dev, const char *path);
 static id<MTLTexture> load_color(id<MTLDevice> dev, const char *rel)
 {
     char path[1600];
@@ -245,6 +246,11 @@ static id<MTLTexture> load_color(id<MTLDevice> dev, const char *rel)
     char *u = strstr(path, "_n.png");
     if (!u) return nil;
     memcpy(u, "_u", 2);
+    return load_rgba(dev, path);
+}
+
+static id<MTLTexture> load_rgba(id<MTLDevice> dev, const char *path)
+{
     NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
     CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
     if (!src) return nil;
@@ -306,6 +312,7 @@ id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t sta
     }
     float sig[192];
     id<MTLTexture> result = nil;
+    const char *name = NULL;
     if (signature(w, h, format, data, pitch, sig)) {
         int best = -1;
         float best_err = 0.01f;  // mean difference per channel, 0..1 (a texture matches itself within 0.003)
@@ -319,6 +326,7 @@ id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t sta
         }
         if (best >= 0) {
             result = load_map(dev, entries[best].path);
+            name = entries[best].path;
             *color = load_color(dev, entries[best].path);
             fprintf(stderr, "[detail] %ux%u texture: %s (difference %.4f)%s\n", w, h, entries[best].path, best_err,
                     *color ? [[NSString stringWithFormat:@", upscaled %lux%lu", (unsigned long)(*color).width,
@@ -326,7 +334,8 @@ id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t sta
                            : "");
         }
     }
-    cache[k] = @[result ? (id)result : [NSNull null], *color ? (id)*color : [NSNull null]];
+    cache[k] = @[result ? (id)result : [NSNull null], *color ? (id)*color : [NSNull null],
+                 name ? (id)[NSString stringWithUTF8String:name] : [NSNull null]];
     return result;
 }
 
@@ -342,4 +351,55 @@ id<MTLTexture> bl_detail_flat(id<MTLDevice> dev)
         [t replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:px bytesPerRow:4];
     }
     return t;
+}
+
+// <name>_hair.bin: "BLHM", version 1, vertex count, index count, anchor count (uint32 each),
+// the vertices {position xyz, normal xyz, uv}, the indices (uint32), the anchors (xyz) and
+// the rectangle of the game's texture to keep (u0 v0 u1 v1), all little-endian floats; then
+// optionally a count (uint32) and that many centres (xyz) of the game's triangles to draw
+// under the strips.
+const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, const void *key, uint32_t w, uint32_t h)
+{
+    static NSMutableDictionary<NSString *, NSValue *> *meshes;
+    if (!cache) return NULL;
+    NSArray *hit = cache[[NSString stringWithFormat:@"%p/%u/%ux%u", key, 0u, w, h]];
+    if (!hit || hit.count < 3 || hit[2] == [NSNull null]) return NULL;
+    NSString *name = hit[2];
+    if (!meshes) meshes = [NSMutableDictionary new];
+    NSValue *v = meshes[name];
+    if (v) return v.pointerValue;
+    struct bl_hair_mesh *m = NULL;
+    char path[1600];
+    snprintf(path, sizeof path, "%s/%s", dir, name.UTF8String);
+    char *u = strstr(path, "_n.png");
+    if (u) {
+        snprintf(u, path + sizeof path - u, "_hair.bin");
+        NSData *d = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path]];
+        const uint32_t *hd = d.bytes;
+        if (d.length >= 20 && !memcmp(hd, "BLHM", 4) && hd[1] == 1) {
+            uint32_t nv = hd[2], ni = hd[3], na = hd[4];
+            size_t need = 20 + (size_t)nv * 32 + (size_t)ni * 4 + (size_t)na * 12 + 16;
+            uint32_t nb = 0;
+            if (d.length >= need + 4) memcpy(&nb, (const uint8_t *)d.bytes + need, 4);
+            if (d.length == need || d.length == need + 4 + (size_t)nb * 12) {
+                m = calloc(1, sizeof *m);
+                m->nverts = nv, m->nidx = ni, m->nanchors = na;
+                const uint8_t *p = (const uint8_t *)d.bytes + 20;
+                m->verts = memcpy(malloc((size_t)nv * 32 + 1), p, (size_t)nv * 32), p += (size_t)nv * 32;
+                m->idx = memcpy(malloc((size_t)ni * 4 + 1), p, (size_t)ni * 4), p += (size_t)ni * 4;
+                m->anchors = memcpy(malloc((size_t)na * 12 + 1), p, (size_t)na * 12), p += (size_t)na * 12;
+                memcpy(m->keep, p, 16), p += 16;
+                if (d.length > need)
+                    m->nbase = nb, m->base = memcpy(malloc((size_t)nb * 12 + 1), p + 4, (size_t)nb * 12);
+                if (nv) {
+                    snprintf(u, path + sizeof path - u, "_hair.png");
+                    m->tex = load_rgba(dev, path);
+                    if (!m->tex) free(m), m = NULL;
+                }
+            }
+        }
+        if (m) fprintf(stderr, "[detail] hair mesh for %s: %u vertices, %u triangles\n", name.UTF8String, m->nverts, m->nidx / 3);
+    }
+    meshes[name] = [NSValue valueWithPointer:m];
+    return m;
 }

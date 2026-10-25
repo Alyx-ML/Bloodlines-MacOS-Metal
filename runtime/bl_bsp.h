@@ -12,6 +12,8 @@ struct bl_light {
     float inner, outer;  // spot lights: cosines of the full and the zero cone; 0 0 for points
     float exponent;      // spot lights: falloff inside the full cone
     float vis;           // 0..1: how much it shows from the camera (smoothed over frames)
+    float seen;          // 0..1: whether it is in the part of the map the camera is in (smoothed):
+                         // for lighting things, which a fitting hiding it from the camera does not darken
     int spot;
 };
 

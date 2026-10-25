@@ -475,7 +475,7 @@ static const char *const header =
     "using namespace metal;\n"
     "struct BLVSParams { int4 i[16]; uint b[16]; float2 inv_viewport; float clip_y; float pad; };\n"
     "struct BLPSParams { int4 i[16]; uint b[16]; float4 bumpenv[8]; float4 bumpenv_l[8]; float4 fog_color;\n"
-    "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float edge, pad; };\n"
+    "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float pad0, pad1; };\n"
     "struct BLVSOut {\n"
     "    float4 pos [[position]]; float psize [[point_size]];\n"
     "    float4 d0 [[user(d0)]]; float4 d1 [[user(d1)]];\n"
@@ -833,9 +833,9 @@ static int gen_body(struct gen *g)
 // coordinates change across the pixel ("normal mapping without precomputed tangents"),
 // laid on the model's smooth normal. The light (oc0 and _l together, so the skin pass's colour
 // stays the texture's) is scaled by how far the bumps tilt towards the map's lights
-// (bl_dl[2 + 4k] to [5 + 4k]: metal_render.m's struct fog_light), and the shine added
-// (bl_dl[34].x its strength; the map's alpha is the roughness), and the light given a direction.
-static void ps_detail(struct out *o, const char *coord)
+// (bl_dl[4 + 4k] to [7 + 4k]: metal_render.m's struct fog_light), and the shine added
+// (bl_dl[2].x its strength; the map's alpha is the roughness), and the light given a direction.
+static void ps_detail(struct out *o, const char *coord, int hair)
 {
     line(o, "{");
     o->indent++;
@@ -855,6 +855,9 @@ static void ps_detail(struct out *o, const char *coord)
     // the triangle's.
     line(o, "float3 _Ns = float3(in.bln.x / bl_dl[0].z, in.bln.y / bl_dl[0].w, in.bln.w);");
     line(o, "_Ns = dot(_Ns, _Ns) > 1e-12 ? normalize(_Ns) : _N;");
+    // Hair is drawn on both sides: lit from the side that faces the camera, as the
+    // triangle's normal is, or its back shows dark streaks.
+    if (hair) line(o, "if (dot(_Ns, _P) > 0.0) _Ns = -_Ns;");
     line(o, "_T = normalize(_T - _Ns * dot(_T, _Ns) + 1e-12); _B = normalize(_B - _Ns * dot(_B, _Ns) + 1e-12);");
     line(o, "float3 _nm = bl_dn.sample(bl_ds, _uv).xyz * 2.0 - 1.0;");
     line(o, "float3 _n = normalize(_T * _nm.x - _B * _nm.y + _Ns * max(_nm.z, 0.05));");
@@ -868,9 +871,21 @@ static void ps_detail(struct out *o, const char *coord)
     line(o, "float _rg = clamp(_ms.w, 0.22, 1.0), _a2 = _rg * _rg * _rg * _rg;");
     line(o, "float _cloth = smoothstep(0.6, 0.85, _rg);");
     line(o, "float3 _V = -normalize(_P); float _nv = saturate(dot(_n, _V)) + 1e-4;");
-    line(o, "float _f = 0.0, _E = 0.0, _S = 0.0, _Sh = 0.0, _Et = 0.0, _Dl = 0.0;");
+    line(o, "float _f = 0.0, _E = 0.0, _S = 0.0, _Sh = 0.0, _Et = 0.0, _Dl = 0.0, _Tr = 0.0, _hs = 0.0;");
+    if (hair) {
+        // Strands (bl_dl[3].x their strength): a pattern across the strands, about 420 to
+        // the texture's width, each strand its own brightness and its normal turned a
+        // little across, so the shine breaks up into strands. It fades out where strands
+        // get thinner than a pixel.
+        line(o, "float _ac = bl_dl[2].z > 0.5 ? _uv.y : _uv.x;");
+        line(o, "float _sf = 420.0 * _ac, _sa = saturate(1.5 - fwidth(_sf)) * bl_dl[3].x;");
+        line(o, "float _si = floor(_sf), _sx = fract(_sf);");
+        line(o, "float _hr0 = fract(sin(_si * 12.9898) * 43758.5453), _hr1 = fract(sin((_si + 1.0) * 12.9898) * 43758.5453);");
+        line(o, "_hs = (mix(_hr0, _hr1, smoothstep(0.0, 1.0, _sx)) - 0.5) * _sa;");
+        line(o, "_n = normalize(_n + (bl_dl[2].z > 0.5 ? _B : _T) * (_hr1 - _hr0) * 6.0 * _sx * (1.0 - _sx) * 0.3 * _sa);");
+    }
     line(o, "for (int _k = 0; _k < int(bl_dl[1].w); _k++) {");
-    line(o, "    float4 _lp = bl_dl[2 + 4 * _k], _lc = bl_dl[3 + 4 * _k], _ld = bl_dl[4 + 4 * _k], _at = bl_dl[5 + 4 * _k];");
+    line(o, "    float4 _lp = bl_dl[4 + 4 * _k], _lc = bl_dl[5 + 4 * _k], _ld = bl_dl[6 + 4 * _k], _at = bl_dl[7 + 4 * _k];");
     line(o, "    float3 _v = _lp.xyz - _P;");
     line(o, "    float _d2 = max(dot(_v, _v), 64.0), _dd = sqrt(_d2);");
     line(o, "    float3 _L = _v / _dd;");
@@ -883,6 +898,24 @@ static void ps_detail(struct out *o, const char *coord)
     line(o, "    _E += _e * (dot(_Ns, _L) * 0.5 + 0.5), _f += _e * (dot(_n, _L) * 0.5 + 0.5);");
     line(o, "    _Et += _e, _Dl += _e * saturate((dot(_n, _L) + 0.2) / 1.2);");
     line(o, "    float _nl = saturate(dot(_n, _L));");
+    if (hair) {
+        // Hair (Kajiya-Kay, two lobes as in Scheuermann's hair shading): light off the
+        // strands, which run along the texture (bl_dl[2].z: 0 along v, 1 along u), in a
+        // band across them; a white one shifted towards the tips, a wider one tinted
+        // by the hair's colour towards the roots. Lit also from a little behind.
+        line(o, "    if (_e <= 0.0) continue;");
+        line(o, "    float3 _H = normalize(_L + _V);");
+        line(o, "    float3 _st = bl_dl[2].z > 0.5 ? _T : _B;");
+        line(o, "    float3 _t1 = normalize(_st - (0.08 + 0.12 * _hs) * _n), _t2 = normalize(_st + (0.12 + 0.12 * _hs) * _n);");
+        line(o, "    float _h1 = dot(_t1, _H), _h2 = dot(_t2, _H);");
+        line(o, "    float _w = smoothstep(-0.3, 0.3, dot(_Ns, _L));");
+        line(o, "    _S += _e * _w * pow(sqrt(saturate(1.0 - _h1 * _h1)), 90.0);");
+        line(o, "    _Sh += _e * _w * pow(sqrt(saturate(1.0 - _h2 * _h2)), 22.0);");
+        // Light from behind, through the strands towards the camera.
+        line(o, "    _Tr += _e * pow(saturate(dot(_L, -_V)), 4.0);");
+        line(o, "}");
+        line(o, "oc0.xyz *= 1.0 + 0.4 * _hs;");
+    } else {
     line(o, "    if (_nl <= 0.0 || _e <= 0.0) continue;");
     line(o, "    float3 _H = normalize(_L + _V);");
     line(o, "    float _nh = saturate(dot(_n, _H)), _vh = saturate(dot(_V, _H));");
@@ -893,22 +926,41 @@ static void ps_detail(struct out *o, const char *coord)
     line(o, "    float _sr = 1.0 / max(_rg * _rg, 0.05), _sn = sqrt(saturate(1.0 - _nh * _nh));");
     line(o, "    _Sh += _e * (2.0 + _sr) * pow(_sn, _sr) / 6.28318 / (4.0 * (_nl + _nv - _nl * _nv)) * _nl;");
     line(o, "}");
+    }
     line(o, "float _q = _E > 1e-6 ? clamp(1.0 + 2.0 * bl_dl[1].z * (_f / _E - 1.0), 0.6, 1.5) : 1.0;");
-    // Light with a direction (bl_dl[34].y its strength): the game lights characters per
+    // Light with a direction (bl_dl[2].y its strength): the game lights characters per
     // vertex, mostly from an even ambient, so faces look flat. Its light here is shared
     // out again per pixel: a third stays even, the rest by how the surface (smooth
-    // normal and bumps) faces each light, with a little wrap for skin's soft edge. The
-    // same on average, brighter towards the lights and darker away from them.
-    line(o, "if (_Et > 1e-6 && bl_dl[34].y > 0.0) {");
+    // normal and bumps) faces each light, with a little wrap for skin's soft edge:
+    // brighter towards the lights and darker away from them, but only a little darker
+    // (bl_dl[3].y the least, 0.8 by default), or a character seen from the side away from
+    // the lights (walking up to the barman, the bar's lights behind him) goes dark.
+    line(o, "if (_Et > 1e-6 && bl_dl[2].y > 0.0) {");
     line(o, "    float _amb = 0.35 * _Et;");
-    line(o, "    _q = mix(_q, clamp((_amb + _Dl) / (_amb + 0.5 * _Et), 0.35, 1.8), saturate(bl_dl[34].y));");
+    line(o, "    _q = mix(_q, clamp((_amb + _Dl) / (_amb + 0.5 * _Et), bl_dl[3].y, 1.8), saturate(bl_dl[2].y));");
     line(o, "}");
-    line(o, "if (_E > 1e-6 && bl_dl[34].x > 0.0) {");
+    line(o, "if (_E > 1e-6 && bl_dl[2].x > 0.0) {");
     line(o, "    float3 _alb = clamp(oc0.xyz / max(_l, float3(1e-3)), 0.0, 1.0);");
-    line(o, "    float3 _sh = _l * (3.14159 * bl_dl[34].x / _E) * (_S * (1.0 - 0.7 * _cloth) + 0.35 * _cloth * _Sh * _alb);");
+    if (hair) {
+        line(o, "    float3 _sh = _l * (bl_dl[2].x / _E) * (0.15 * _S + 0.18 * _Sh * _alb) * smoothstep(0.1, 0.5, oc0.w);");
+        // The glow of light through hair from behind (bl_dl[3].w), in the hair's colour.
+        line(o, "    _sh += _l * _alb * (0.6 * bl_dl[3].w * _Tr / max(_Et, 1e-6));");
+    } else
+        line(o, "    float3 _sh = _l * (3.14159 * bl_dl[2].x / _E) * (_S * (1.0 - 0.7 * _cloth) + 0.35 * _cloth * _Sh * _alb);");
     line(o, "    oc0.xyz += min(_sh, float3(1.0));");
     line(o, "}");
     line(o, "oc0.xyz *= _q; _l *= _q;");
+    if (hair >= 2) {
+        // Hair's soft edge (bl_dl[2].w world units): fades where it comes near what was
+        // drawn before it (the head, the body, clothes; bl_hd, the depth then), so where
+        // it passes into them shows no hard line. Depth is alpha + beta / w.
+        line(o, "float _db = bl_hd.read(uint2(in.pos.xy));");
+        line(o, "float _wb = bl_dl[0].y / min(_db - bl_dl[0].x, -1e-7);");
+        // Darker where it lies on the head or body (bl_dl[3].z): the roots, the hair's
+        // underside, in shadow from the hair over them.
+        line(o, "oc0.xyz *= mix(1.0 - 0.45 * bl_dl[3].z, 1.0, saturate((_wb - _zw) / 3.0));");
+        line(o, "oc0.w *= saturate((_wb - _zw) / bl_dl[2].w);");
+    }
     o->indent--;
     line(o, "}");
 }
@@ -917,13 +969,7 @@ static void ps_detail(struct out *o, const char *coord)
 // _fog: the share of the colour the fog leaves.
 static void ps_alpha_and_fog(struct out *o)
 {
-    // With alpha to coverage (p.edge), a "greater" test's edge is placed from how fast
-    // alpha changes across the pixel, so the samples cover it in proportion: a smooth,
-    // sharp edge instead of a jagged one, or a dithered one from plain coverage.
-    line(o, "if (p.edge > 0.5 && (p.alpha_func == 5 || p.alpha_func == 7) && p.alpha_ref > 0.002) {");
-    line(o, "    oc0.w = saturate((oc0.w - p.alpha_ref) / max(fwidth(oc0.w), 1e-4) + 0.5);");
-    line(o, "    if (oc0.w <= 0.0) discard_fragment();");
-    line(o, "} else if (!bl_cmp(p.alpha_func, oc0.w, p.alpha_ref)) discard_fragment();");
+    line(o, "if (!bl_cmp(p.alpha_func, oc0.w, p.alpha_ref)) discard_fragment();");
     line(o, "float _fog = 1.0;");
     line(o, "if (p.fog_mode != 0) {");
     line(o, "    float z = in.fogz, f = in.fog;");
@@ -951,6 +997,41 @@ static void ps_locals(struct gen *g)
     if (g->v && g->v->shadow_receiver) line(o, "float4 _sh = 0; bool _shd = false;");
 }
 
+// The tessellated vertex shader's main function (v->tess): the shader run on the three
+// corners, then Phong tessellation in view space (Boubekeur and Alexa 2008): the point is
+// projected onto each corner's tangent plane, the three weighted like the point itself,
+// and moved three quarters of the way there. Everything else is interpolated.
+static const char *const tess_main =
+    "#define BL_I(f) (bc.x * r[0].f + bc.y * r[1].f + bc.z * r[2].f)\n"
+    "[[patch(triangle, 3)]] vertex BLVSOut bl_main(patch_control_point<BLVSIn> cp [[stage_in]],\n"
+    "        float3 bc [[position_in_patch]], constant float4 *c [[buffer(20)]],\n"
+    "        constant BLVSParams &p [[buffer(21)]], constant float4 &tp [[buffer(22)]]) {\n"
+    "    BLVSRaw r[3] = {bl_vs(cp[0], c, p), bl_vs(cp[1], c, p), bl_vs(cp[2], c, p)};\n"
+    "    float3 _P[3], _N[3];\n"
+    "    for (int i = 0; i < 3; i++) {\n"
+    "        _P[i] = float3(r[i].pos.x / tp.z, r[i].pos.y / tp.w, r[i].pos.w);\n"
+    "        float4 d = r[i].p2 - r[i].pos;\n"
+    "        float3 n = float3(d.x / tp.z, d.y / tp.w, d.w);\n"
+    "        float l = dot(n, n);\n"
+    "        _N[i] = l > 1e-12 ? n * rsqrt(l) : float3(0.0);\n"
+    "    }\n"
+    "    float3 _X = bc.x * _P[0] + bc.y * _P[1] + bc.z * _P[2], _Q = 0.0;\n"
+    "    for (int i = 0; i < 3; i++) _Q += bc[i] * (_X - dot(_X - _P[i], _N[i]) * _N[i]);\n"
+    "    float3 _D = 0.75 * (_Q - _X);\n"
+    "    float4 opos = BL_I(pos) + float4(_D.x * tp.z, _D.y * tp.w, _D.z * tp.x, _D.z);\n"
+    "    BLVSOut out;\n"
+    "    out.bln = BL_I(p2) - BL_I(pos); out.bln.y *= p.clip_y;\n"
+    "    out.pos = opos;\n"
+    "    out.pos.y *= p.clip_y;\n"
+    "    out.pos.xy += float2(p.inv_viewport.x, -p.inv_viewport.y) * opos.w;\n"
+    "    out.psize = BL_I(pts.x);\n"
+    "    out.d0 = BL_I(d0); out.d1 = BL_I(d1);\n"
+    "    out.t0 = BL_I(t0); out.t1 = BL_I(t1); out.t2 = BL_I(t2); out.t3 = BL_I(t3);\n"
+    "    out.t4 = BL_I(t4); out.t5 = BL_I(t5); out.t6 = BL_I(t6); out.t7 = BL_I(t7);\n"
+    "    out.fog = BL_I(fog.x); out.fogz = opos.w;\n"
+    "    return out;\n"
+    "}\n";
+
 char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, char *err, int errlen)
 {
     struct gen g;
@@ -971,9 +1052,15 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
                 i, i);
         }
         if (g.info.input_mask) put(o, "};\n");
-        put(o, "vertex BLVSOut bl_main(%sconstant float4 *c [[buffer(20)]],\n"
-               "                       constant BLVSParams &p [[buffer(21)]]) {\n",
-            g.info.input_mask ? "BLVSIn in [[stage_in]], " : "");
+        // Tessellated (v->tess): the shader is a function run on each corner of a triangle.
+        int tess = v && v->tess && v->smooth_normal && g.info.input_mask;
+        if (tess)
+            put(o, "struct BLVSRaw { float4 pos, p2, d0, d1, t0, t1, t2, t3, t4, t5, t6, t7, fog, pts; };\n"
+                   "static inline BLVSRaw bl_vs(BLVSIn in, constant float4 *c, constant BLVSParams &p) {\n");
+        else
+            put(o, "vertex BLVSOut bl_main(%sconstant float4 *c [[buffer(20)]],\n"
+                   "                       constant BLVSParams &p [[buffer(21)]]) {\n",
+                g.info.input_mask ? "BLVSIn in [[stage_in]], " : "");
         o->indent = 1;
         for (int i = 0; i < D3D_SHADER_MAX_INPUTS; i++)
             if (g.info.input_mask & (1u << i)) line(o, "float4 v%d = float4(in.v%d);", i, i);
@@ -1006,6 +1093,13 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
             if (start(&g.ps, code, err, errlen) || gen_body(&g)) goto failed;
             line(o, "_p2 = opos;");
             line(o, "}");
+        }
+        if (tess) {
+            line(o, "BLVSRaw r = {_p1, _p2, saturate(od0), saturate(od1), ot0, ot1, ot2, ot3, ot4, ot5, ot6, ot7, ofog, opts};");
+            line(o, "return r;");
+            put(o, "}\n");
+            put(o, "%s", tess_main);
+            return o->s;
         }
         line(o, "BLVSOut out;");
         line(o, "out.bln = _p2 - _p1; out.bln.y *= p.clip_y;");
@@ -1042,6 +1136,8 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         int detail = info && v->skin == 1 && v->detail && (g.info.sampler_mask & 1);
         if (detail)
             put(o, ",\n                         texture2d<float> bl_dn [[texture(15)]], constant float4 *bl_dl [[buffer(3)]]");
+        if (detail && v->hair >= 2)
+            put(o, ",\n                         depth2d<float> bl_hd [[texture(14)]]");
         if (v && v->shadow_receiver) put(o, ",\n                         constant BLShadowParams &sp [[buffer(2)]]");
         put(o, ") {\n");
         o->indent = 1;
@@ -1086,14 +1182,17 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (gen_body(&g)) goto failed;
         if (g.ps.major == 1) line(o, "oc0 = r0;");
         if (g.env) line(o, "float3 _d = oc0.xyz - _e0, _w = _e1 - _e0;");
-        if (detail && skin && g.base_coord[0]) ps_detail(o, g.base_coord);
+        if (detail && skin && g.base_coord[0]) ps_detail(o, g.base_coord, v->hair);
         ps_alpha_and_fog(o);
         if (v && v->shadow_caster) line(o, v->shadow_caster == 2 ? "oc0.w = in.pos.z;" : "oc0.w = 1.0 - in.pos.z;");
         line(o, "BLPSOut out;");
         for (int i = 0; i < 4; i++)
             if (g.info.color_outputs & (1u << i)) line(o, "out.c%d = oc%d;", i, i);
-        // -1.25: shone here (ps_detail), so the skin pass does not add its own shine.
-        if (skin) line(o, "out.c1 = float4(max(_l, 0.0), %s);", detail && g.base_coord[0] ? "-1.25" : "-1.0");
+        // -1.25: shone here (ps_detail), so the skin pass does not add its own shine; -1.4:
+        // hair too, which the sharpening leaves alone (its fine strands turn to dark specks).
+        if (skin)
+            line(o, "out.c1 = float4(max(_l, 0.0), %s);",
+                 detail && g.base_coord[0] ? (v->hair ? "-1.4" : "-1.25") : "-1.0");
         else if (info && v->skin) line(o, v->skin == 3 ? "out.c1 = float4(0.0, 0.0, 0.0, -3.0);" : "out.c1 = float4(0.0, 0.0, 0.0, -2.0);");
         else if (info && g.env) line(o, "out.c1 = float4(_d * _fog, (_w.x + _w.y + _w.z) * _fog / 3.0);");
         else if (info) line(o, "out.c1 = 0;");

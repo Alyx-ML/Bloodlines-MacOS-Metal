@@ -17,3 +17,24 @@ id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t sta
 // A flat normal map (roughness 0.5) for character parts without one of their own (hair,
 // teeth, characters not in the list), so they get the same light as the rest.
 id<MTLTexture> bl_detail_flat(id<MTLDevice> dev);
+
+// Hair redrawn as strips (made by the hair tools on the player's machine from their own
+// game files, beside the texture's normal map path as <name>_hair.bin and _hair.png): the
+// strips, in the space of `anchors` (the game's hair vertices they replace, in the same
+// units as the tools' import), with their own texture; or, with no strips, the part of
+// the game's hair to keep drawing, as a rectangle of its texture coordinates (`keep`).
+struct bl_hair_mesh {
+    uint32_t nverts, nidx, nanchors;
+    const float *verts;  // nverts x {position xyz, normal xyz, uv}
+    const uint32_t *idx;
+    const float *anchors;  // nanchors x xyz
+    float keep[4];         // u0, v0, u1, v1
+    // With strips, the game's triangles still drawn under them, by their centres in the
+    // anchors' space (all of them when nbase is 0).
+    uint32_t nbase;
+    const float *base;  // nbase x xyz
+    id<MTLTexture> tex;
+};
+
+// The hair mesh for the texture `key` (w x h), or NULL; after bl_detail_normal saw it.
+const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, const void *key, uint32_t w, uint32_t h);
