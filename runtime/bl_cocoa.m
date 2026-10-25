@@ -178,6 +178,14 @@ int bl_cocoa_refresh_rate(void)
     return window && screen ? (int)screen.maximumFramesPerSecond : 0;
 }
 
+// The current EDR headroom of the window's screen: it changes with the brightness and
+// rises once HDR content is on screen.
+float bl_cocoa_edr_headroom(void)
+{
+    NSScreen *screen = window.screen ? window.screen : NSScreen.mainScreen;
+    return window && screen ? (float)screen.maximumExtendedDynamicRangeColorComponentValue : 1;
+}
+
 // Cmd+Ctrl+F, Cmd+Return or the green button. A game started without -window asks
 // for full screen when it creates its device.
 void bl_cocoa_set_fullscreen(int on)
@@ -290,13 +298,53 @@ static void button(int b, int down, uint32_t lp)
 // BL_CLICKS="frame:x,y ..." clicks the left button at x,y (game pixels) on those
 // frames, for testing menus without a window: the cursor moves there on the frame,
 // the button goes down three frames later and up three after that.
+// BL_KEYS="frame:key:frames ..." holds a key (macOS key code, e.g. 13 for W) down from
+// that frame for that many frames; "frame:m:dx,dy" moves the mouse by dx,dy then (turning
+// the view in a level); "frame:t:text|" types the text, a character a frame, with ~ for
+// Return (for the console: 50 is its key).
+void bl_cocoa_motion(int dx, int dy);
+static void script_keys(unsigned long frame)
+{
+    static const char *script;
+    static int init;
+    if (!init) init = 1, script = getenv("BL_KEYS");
+    for (const char *p = script; p && *p;) {
+        char *end;
+        unsigned long f = strtoul(p, &end, 10);
+        if (*end != ':') break;
+        if (end[1] == 't') {
+            const char *t = end + 3, *stop = strchr(t, '|');
+            size_t n = stop ? (size_t)(stop - t) : strlen(t);
+            if (frame >= f && frame < f + n) {
+                char c = t[frame - f];
+                if (c == '~') key(36, 1, 0, nil), key(36, 0, 0, nil);
+                else bl_u32_PostMessageA_c(game_hwnd, WM_CHAR, (uint8_t)c, 1);
+            }
+            end = (char *)(stop ? stop + 1 : t + n);
+        } else if (end[1] == 'm') {
+            int dx = (int)strtol(end + 3, &end, 10), dy = *end == ',' ? (int)strtol(end + 1, &end, 10) : 0;
+            if (frame == f) bl_cocoa_motion(dx, dy);
+        } else {
+            int k = (int)strtol(end + 1, &end, 10), n = *end == ':' ? (int)strtol(end + 1, &end, 10) : 1;
+            if (frame == f || frame == f + (unsigned long)n) {
+                fprintf(stderr, "[input] frame %lu: key %d %s\n", frame, k, frame == f ? "down" : "up");
+                key((uint16_t)k, frame == f, 0, nil);
+            }
+        }
+        p = end;
+        while (*p == ' ') p++;
+        if (p == end && *p) break;
+    }
+}
+
 void bl_cocoa_script_input(unsigned long frame, uint32_t hwnd)
 {
     static const char *script;
     static int init;
     if (!init) init = 1, script = getenv("BL_CLICKS");
-    if (!script) return;
     if (!game_hwnd) game_hwnd = hwnd;
+    script_keys(frame);
+    if (!script) return;
     for (const char *p = script; *p;) {
         char *end;
         unsigned long f = strtoul(p, &end, 10);

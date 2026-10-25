@@ -41,6 +41,10 @@ struct d3d_shader_variant {
     // rgb what the shader's reflection cubemaps added to oc0, a how much a white cubemap
     // would add (the mean over rgb); zero for shaders without one.
     uint8_t reflection_info;
+    // Pixel, with reflection_info: a character (metal_render.m skin_run) writes
+    // [[color(1)]] as its light alone (the colour texture read as white) and -1, or
+    // without a colour texture 0 0 0 -2.
+    uint8_t skin;
 };
 
 // Pixel shader samplers that read a reflection cubemap: cube samplers whose result is

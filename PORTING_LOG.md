@@ -1324,3 +1324,81 @@ Stacking them under "Combat effects" covered the "Particles" slider, so "Reflect
   at edges), Retina resolution, reflections of the view model (drawn after the trace, so
   never reflected), and shaders on other levels that might write a second colour output
   themselves (they are left without reflections).
+
+### Reflection tune-ups (2026-10-24)
+Six small changes to the screen-space reflections, all in `metal_render.m`:
+
+- **Fresnel.** The game's cubemaps are as strong head-on as at a grazing angle. The trace
+  now also writes Schlick's term, `1 + fresnel * (1 - cos)^5`, to a second half-resolution
+  target (RG16Float, with how far the ray went), and `post_apply` scales the whole
+  reflection (screen-space part and the cubemap that stays) by it:
+  `col += strength * (F * (weight * reflection + (1 - confidence) * cubemap) - cubemap)`,
+  the old formula when F is 1. `BL_SSR_FRESNEL` (default 3).
+- **Blur by ray length.** The filter's width follows how far the ray went (sigma 0.4 to 2
+  half-resolution pixels, `BL_SSR_BLUR` per pixel of ray, default 0.02): sharp where
+  things touch the surface, softer further off. A fixed 5x5 grid of taps, spaced 2 apart
+  for the wider blurs, still weighted by depth.
+- **Contact.** The ray starts half a pixel out instead of 1.5, with a small depth bias
+  (0.2%) so the surface does not meet itself. The dark band under the Asylum's bar turned
+  out to be mostly the bar's dark base reflected, which is right; it is now sharper.
+- **Upsample.** `post_apply` blends the four half-resolution pixels around by hand and
+  leaves out those that are not reflective (an object in front), instead of a plain
+  bilinear sample that bled their zero into the reflection's edge. The trace marks them
+  with confidence -1, which the filter skips too.
+- **Back faces.** After the halvings the hit point's own normal comes from its depth
+  neighbours; a ray going the way that surface faces came from behind it and is dropped.
+- **Noise.** Interleaved gradient noise in place of the 4x4 Bayer offset, so the step
+  pattern no longer repeats every 4 pixels.
+
+- Verified (M4 Pro, 1920x1080, MSAA 2x, headless, no audio), against the previous commit:
+  in `sm_asylum_1` the bar top now shows the bottles reflected and the floor's
+  reflections are stronger towards the back, where the view is more grazing; in
+  `la_ventruetower_1` the desk top reflects the guard and the sign. Metal API validation
+  is clean with all three effects on. GPU time: `sm_asylum_1` 2.70 ms a frame (2.71
+  before), `la_ventruetower_1` about 5.0 ms (4.5 before; the wider blur over its large
+  reflective floor).
+- Not verified: the look in motion and in a window.
+
+## 2026-10-25 — Tone mapping tests, HDR, volumetric light, skin scattering
+
+All in `runtime/d3d9/metal_render.m` unless named; each effect has an environment
+variable (documented at the top of that file) and, apart from the tone maps, a check box in
+the Visual options (`bl_vgui.c`: "HDR", "Volumetric Light", "Skin Scattering").
+
+- **Tone map tests.** `BL_TONEMAP=gt7|gt7x|pbr|pbrx` tries Gran Turismo 7's curve and
+  Khronos PBR Neutral on the world view in `post_apply`, with `BL_TONEMAP_EXPAND`. Off by
+  default and not in the options: kept for comparison only.
+- **HDR.** On a screen with extended dynamic range, `hdr_present` lifts bright parts above
+  normal white by luminance: above a knee (`BL_HDR_KNEE`, default 0.05) the colour is
+  scaled up towards `BL_HDR_PEAK` (default 4) times white, with a soft shoulder, capped by
+  the screen's headroom at the time (`bl_cocoa_edr_headroom`). Checked with a
+  ScreenCaptureKit HDR capture of a window run: pixels above white reach the screen
+  (headroom 2.67 on the M4 Pro's screen at that brightness).
+- **Volumetric light.** `runtime/bl_bsp.c` reads the map's `.bsp` when the game opens it
+  (`bl_k32_CreateFileA_c`): its world lights (point and spot, with falloff and cones),
+  BSP tree and visibility. Each frame the camera's leaf picks the lights it can see
+  (within 3000 units, brightest 24, a line test against solid space fading those behind
+  walls to 0.3). `fog_scatter` marches 16 jittered steps per half-resolution pixel through
+  a thin haze (Henyey-Greenstein, g 0.35), a depth-aware blur follows, and `post_apply`
+  adds it before the tone map. No shadows inside the haze. About 4 ms of GPU a frame.
+- **Skin scattering.** Skinned draws (vertex shaders with blend weights or indices) get
+  a shader variant (`d3d9_shader.c`) that runs the pixel shader a second time with its
+  colour texture white and writes that light alone to the second colour target, marked
+  -1. `skin_blur` blurs only that light (two passes, 13 taps, about 0.8 world units,
+  red reaching further), then multiplies by the pixel's own colour (the picture divided
+  by its light), so texture detail stays sharp. Only skin colours count (YCbCr test;
+  blonde and red hair left out). On top: a two-lobe skin sheen lit by the map's lights
+  and scaled to the game's own light there, Schlick Fresnel, wetter lips, the texture's
+  fine detail as pores, creases (from depth) dimmed, and a faint rim at grazing angles.
+  `BL_SSS=show` paints the characters' pixels red.
+- **Fix found on the way:** with skin scattering on, characters' pixels skipped the
+  sharpening filter and looked soft next to the sharpened world; they are now sharpened
+  from the scattered picture like everything else.
+- **Test input:** `BL_KEYS` (`bl_cocoa.m`) scripts keys, mouse turns and typed text by
+  frame, for walking to characters in headless runs.
+
+- Verified (M4 Pro, 1920x1080, headless, no audio): `sm_asylum_1`, Jeanette's dialog
+  close-up and Cal at the bar, effects off and on; the lamp cones in the haze line up
+  with the lamps downtown.
+- Not verified: other levels' characters, the look in motion, GPU time of skin
+  scattering on its own, Metal API validation with the new passes.

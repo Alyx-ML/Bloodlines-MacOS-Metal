@@ -265,6 +265,9 @@ struct gen {
     // texture, 1 black, 2 white.
     uint32_t env;
     int env_value;
+    // Skin (variant skin): stage 0, the colour texture, read as white for now (its alpha
+    // kept, which may mask the shine).
+    int white_base;
 };
 
 static const char comp[] = "xyzw";
@@ -444,6 +447,10 @@ static void sample(struct gen *g, uint32_t stage, const char *coord, const char 
         return;
     }
     int k = tex_kind(g, stage);
+    if (g->white_base && stage == 0 && k == D3D_TEX_2D) {
+        snprintf(buf, len, "float4(1.0, 1.0, 1.0, tex0.sample(smp0, (%s).xy%s).w)", coord, extra ? extra : "");
+        return;
+    }
     snprintf(buf, len, "tex%u.sample(smp%u, (%s).%s%s)", stage, stage, coord, k == D3D_TEX_2D ? "xy" : "xyz",
              extra ? extra : "");
 }
@@ -881,6 +888,23 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
             start(&g.ps, code, err, errlen);
             g.env_value = 0;
         }
+        int skin = info && v->skin && (g.info.sampler_mask & 1);
+        if (skin) {
+            // The body again with the colour texture white: the light alone (_l), for the
+            // light under the skin (metal_render.m skin_run).
+            line(o, "float3 _l;");
+            line(o, "{");
+            o->indent++;
+            ps_locals(&g);
+            g.white_base = 1;
+            if (gen_body(&g)) goto failed;
+            g.white_base = 0;
+            if (g.ps.major == 1) line(o, "oc0 = r0;");
+            line(o, "_l = oc0.xyz;");
+            o->indent--;
+            line(o, "}");
+            start(&g.ps, code, err, errlen);
+        }
         ps_locals(&g);
         if (gen_body(&g)) goto failed;
         if (g.ps.major == 1) line(o, "oc0 = r0;");
@@ -889,7 +913,9 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         line(o, "BLPSOut out;");
         for (int i = 0; i < 4; i++)
             if (g.info.color_outputs & (1u << i)) line(o, "out.c%d = oc%d;", i, i);
-        if (info && g.env) line(o, "out.c1 = float4(_d * _fog, (_w.x + _w.y + _w.z) * _fog / 3.0);");
+        if (skin) line(o, "out.c1 = float4(max(_l, 0.0), -1.0);");
+        else if (info && v->skin) line(o, "out.c1 = float4(0.0, 0.0, 0.0, -2.0);");
+        else if (info && g.env) line(o, "out.c1 = float4(_d * _fog, (_w.x + _w.y + _w.z) * _fog / 3.0);");
         else if (info) line(o, "out.c1 = 0;");
         if (g.info.writes_depth) line(o, "out.depth = odepth;");
         line(o, "return out;");
@@ -1022,7 +1048,7 @@ char *d3d_ff_ps_msl(const struct d3d_ff_ps *k, const struct d3d_shader_variant *
     ps_alpha_and_fog(o);
     line(o, "BLPSOut out;");
     line(o, "out.c0 = oc0;");
-    if (info) line(o, "out.c1 = 0;");
+    if (info) line(o, v->skin ? "out.c1 = float4(0.0, 0.0, 0.0, -2.0);" : "out.c1 = 0;");
     line(o, "return out;");
     put(o, "}\n");
     return o->s;

@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "bl_bsp.h"
 #include "bl_cocoa.h"
 #include "bl_win32.h"
 
@@ -334,6 +335,7 @@ uint32_t bl_k32_CreateFileA_c(uint32_t name, uint32_t access, uint32_t share, ui
         bl_set_last_error(bl_errno_to_win32(errno));
         return BL_INVALID_HANDLE;
     }
+    if (!wr) bl_bsp_note_open(host);  // a map: its lights, for the volumetric lighting
     struct file *f = calloc(1, sizeof *f);
     f->fd = fd;
     bl_set_last_error(existed && (disposition == 2 || disposition == 4) ? BL_ERROR_ALREADY_EXISTS : 0);

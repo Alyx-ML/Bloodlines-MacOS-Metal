@@ -22,6 +22,7 @@ void bl_cocoa_set_fullscreen(int on);
 // 4:3 on a wider mode; 1 = full width): mouse positions are mapped to match.
 void bl_cocoa_set_squeeze(float squeeze);
 int bl_cocoa_refresh_rate(void);  // the window's screen, in Hz (0 = no window)
+float bl_cocoa_edr_headroom(void);  // how far above normal white the window's screen can show now (1 = none)
 // Synthetic input from bl_gamecontroller.m: a key by Mac key code, a mouse button
 // (0 left, 1 right, 2 middle), a wheel step (120 = one notch up) and relative motion.
 void bl_cocoa_key(uint16_t mac, int down);

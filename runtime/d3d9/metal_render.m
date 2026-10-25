@@ -37,9 +37,19 @@
 //                            BL_AO_RADIUS, BL_AO_STRENGTH tune it
 //   BL_SSR=0|1|show|hits     screen-space reflections (see post_run), over the options' check box;
 //                            "hits": red the reflection weight, green where rays met the picture,
-//                            blue what the cubemaps added; BL_SSR_STRENGTH (default 1) scales them
+//                            blue what the cubemaps added; BL_SSR_STRENGTH (default 1) scales them,
+//                            BL_SSR_FRESNEL (3) and BL_SSR_BLUR (0.02) tune them
 //   BL_SHARPEN=0|1           sharpening of the world view (see post_apply), over the options'
 //                            check box; BL_SHARPEN_STRENGTH (0..1, default 0.5)
+//   BL_HDR=0|1               HDR output on screens that have it (see hdr_present), over the
+//                            options' check box; BL_HDR_PEAK, BL_HDR_KNEE, BL_HDR_HEADROOM tune it
+//   BL_FOG=0|1               volumetric light: the map's lights in a thin haze (see fog_run), over
+//                            the options' check box; BL_FOG_DENSITY (default 0.0002 a world unit)
+//                            and BL_FOG_DIST (how far it is traced, default 2000)
+//   BL_SSS=0|1               light scattered under the skin of characters (see skin_run), over the
+//                            options' check box ("show": the characters' pixels in red); BL_SSS_WIDTH (world units, default 0.8) and
+//                            BL_SSS_STRENGTH (0..1, default 0.8); BL_SSS_SHEEN the skin's shine
+//                            (default 3, 0 none)
 //   BL_GPU_STATS=1           log the mean GPU time per frame every 100 frames
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
@@ -53,6 +63,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bl_bsp.h"
 #include "bl_cocoa.h"
 #include "bl_win32.h"
 #include "d3d9_shader.h"
@@ -94,26 +105,35 @@ static int msaa;        // samples for the back buffer and its depth (BL_MSAA, d
 static int deep_color;  // 16-bit back buffer, 10-bit window (BL_DEEP_COLOR, default on)
 
 // Effects at the end of the world view, before the view model and HUD (post_run):
-// ambient occlusion, screen-space reflections and sharpening.
+// ambient occlusion, screen-space reflections, sharpening, volumetric light and skin.
 // view_state: 0 no world view yet this frame, 1 world drawn (view_proj holds its
 // projection), 2 done for this frame.
-static int env_ao, env_ao_show, env_ssr, env_ssr_show, env_sharpen;
-static float env_ao_radius, env_ao_strength, env_ssr_strength, env_sharpen_strength;
+static int env_ao, env_ao_show, env_ssr, env_ssr_show, env_sharpen, env_tonemap, env_hdr, env_fog, env_sss, env_sss_show;
+static float env_ao_radius, env_ao_strength, env_ssr_strength, env_ssr_fresnel, env_ssr_blur, env_sharpen_strength,
+    env_tonemap_expand, env_hdr_peak, env_hdr_knee, env_hdr_headroom, env_fog_density, env_fog_dist, env_sss_width,
+    env_sss_strength, env_sss_sheen;
 static int view_state;
 static struct { float alpha, beta, p00, p11; } view_proj;
+// The camera of that projection: rows giving view x (right), y (up) and depth from a world
+// position (dot with xyz, plus w).
+static float view_rows[3][4];
 static id<MTLTexture> ao_result;  // waiting to be multiplied in at the next pass on the back buffer
 static int post_result;           // reflections or sharpening waiting for that pass too
 static void ao_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth);
 static void post_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int samples, int has_depth);
+static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h);
 
 // The Visual options tab's check boxes (bl_vgui.c, read once a frame by bl_vgui_poll)
 // set the effects and save them in the registry; the environment, when set, wins over both.
 #define EFFECT_KEY "HKCU\\Software\\Troika\\Vampire\\Native"
-enum { BL_EFFECT_AO, BL_EFFECT_SSR, BL_EFFECT_SHARPEN, BL_EFFECTS };
+enum { BL_EFFECT_AO, BL_EFFECT_SSR, BL_EFFECT_SHARPEN, BL_EFFECT_HDR, BL_EFFECT_FOG, BL_EFFECT_SSS, BL_EFFECTS };
 static const struct { const char *env, *value; int *on, *show; } effects[BL_EFFECTS] = {
     {"BL_AO", "AmbientOcclusion", &env_ao, &env_ao_show},
     {"BL_SSR", "Reflections", &env_ssr, &env_ssr_show},
     {"BL_SHARPEN", "Sharpening", &env_sharpen, NULL},
+    {"BL_HDR", "HDR", &env_hdr, NULL},
+    {"BL_FOG", "VolumetricLight", &env_fog, NULL},
+    {"BL_SSS", "SkinScattering", &env_sss, &env_sss_show},
 };
 static int effects_loaded, effect_forced[BL_EFFECTS];
 void bl_vgui_poll(void);
@@ -628,7 +648,7 @@ void d3d_render_shader_created(struct obj *o)
                 v.tex_kind[i] = (uint8_t)(sh->info.sampler_type[i] ? sh->info.sampler_type[i] : D3D_TEX_2D);
     // With reflections on, the world's shaders draw with reflection info (setup_draw).
     effect_settings();
-    if (sh->info.pixel && env_ssr && !(sh->info.color_outputs & 2)) v.reflection_info = 1;
+    if (sh->info.pixel && (env_ssr || env_sss) && !(sh->info.color_outputs & 2)) v.reflection_info = 1;
     static dispatch_queue_t queue;
     if (!queue) queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     // The game may release the shader before the compile ends: compile from a copy.
@@ -1008,7 +1028,25 @@ static void ensure_device(void)
     env_ao_radius = getenv("BL_AO_RADIUS") ? (float)atof(getenv("BL_AO_RADIUS")) : 32;
     env_ao_strength = getenv("BL_AO_STRENGTH") ? (float)atof(getenv("BL_AO_STRENGTH")) : 0.6f;
     env_ssr_strength = getenv("BL_SSR_STRENGTH") ? (float)atof(getenv("BL_SSR_STRENGTH")) : 1;
+    env_ssr_fresnel = getenv("BL_SSR_FRESNEL") ? (float)atof(getenv("BL_SSR_FRESNEL")) : 3;
+    env_ssr_blur = getenv("BL_SSR_BLUR") ? (float)atof(getenv("BL_SSR_BLUR")) : 0.02f;
     env_sharpen_strength = getenv("BL_SHARPEN_STRENGTH") ? (float)atof(getenv("BL_SHARPEN_STRENGTH")) : 0.5f;
+    const char *tm = getenv("BL_TONEMAP");
+    env_tonemap = !tm                   ? 0
+                  : !strcmp(tm, "gt7")  ? 1
+                  : !strcmp(tm, "gt7x") ? 2
+                  : !strcmp(tm, "pbr")  ? 3
+                  : !strcmp(tm, "pbrx") ? 4
+                                        : 0;
+    env_tonemap_expand = getenv("BL_TONEMAP_EXPAND") ? (float)atof(getenv("BL_TONEMAP_EXPAND")) : 0.8f;
+    env_hdr_peak = getenv("BL_HDR_PEAK") ? (float)atof(getenv("BL_HDR_PEAK")) : 4;
+    env_hdr_knee = getenv("BL_HDR_KNEE") ? (float)atof(getenv("BL_HDR_KNEE")) : 0.05f;
+    env_hdr_headroom = getenv("BL_HDR_HEADROOM") ? (float)atof(getenv("BL_HDR_HEADROOM")) : 0;
+    env_fog_density = getenv("BL_FOG_DENSITY") ? (float)atof(getenv("BL_FOG_DENSITY")) : 0.0002f;
+    env_fog_dist = getenv("BL_FOG_DIST") ? (float)atof(getenv("BL_FOG_DIST")) : 2000;
+    env_sss_width = getenv("BL_SSS_WIDTH") ? (float)atof(getenv("BL_SSS_WIDTH")) : 0.8f;
+    env_sss_strength = getenv("BL_SSS_STRENGTH") ? (float)atof(getenv("BL_SSS_STRENGTH")) : 0.8f;
+    env_sss_sheen = getenv("BL_SSS_SHEEN") ? (float)atof(getenv("BL_SSS_SHEEN")) : 3;
 }
 
 static id<MTLCommandBuffer> command_buffer(void)
@@ -1072,6 +1110,9 @@ static void restore_ms(struct obj *o, id<MTLTexture> ms)
     [e endEncoding];
 }
 
+static id<MTLTexture> hdr_world;
+static unsigned long hdr_world_frame;
+
 static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
 {
     struct obj *color = s->render_target[0], *depth = s->depth_stencil;
@@ -1122,8 +1163,9 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
         }
     }
     // The world view's passes on the back buffer also draw reflection info (post_run),
-    // cleared with the frame's first one or with the colour.
-    int info = env_ssr && color && color == s->back_buffer && !menu_frame && view_state != 2;
+    // cleared with the frame's first one or with the colour; with skin scattering it also
+    // marks what characters drew (d3d_shader_variant skin).
+    int info = (env_ssr || env_sss) && color && color == s->back_buffer && !menu_frame && view_state != 2;
     if (info) {
         id<MTLTexture> ct = target_texture(color);
         MTLRenderPassColorAttachmentDescriptor *a = d.colorAttachments[1];
@@ -1142,8 +1184,24 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
     }
     enc = [command_buffer() renderCommandEncoderWithDescriptor:d];
     enc_color = color, enc_depth = depth, enc_samples = samples, enc_info = info;
+    int world_end = (post_result || ao_result) && color && color == s->back_buffer;
     if (post_result && color && color == s->back_buffer) post_apply(enc, target_texture(color), samples, depth != NULL);
     if (ao_result && color && color == s->back_buffer) ao_apply(enc, target_texture(color), samples, depth != NULL);
+    if (world_end && env_hdr) {
+        // A copy of the finished world view, before the view model and HUD: what
+        // hdr_present may brighten.
+        [enc endEncoding];
+        id<MTLTexture> ct = target_texture(color);
+        hdr_world = ao_texture(7, ct.pixelFormat, ct.width, ct.height);
+        id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
+        [blit copyFromTexture:ct toTexture:hdr_world];
+        [blit endEncoding];
+        hdr_world_frame = frames;
+        d.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        d.depthAttachment.loadAction = d.stencilAttachment.loadAction = MTLLoadActionLoad;
+        if (info) d.colorAttachments[1].loadAction = MTLLoadActionLoad;
+        enc = [command_buffer() renderCommandEncoderWithDescriptor:d];
+    }
     return enc;
 }
 
@@ -1182,6 +1240,22 @@ static int full_screen(void)
 
 static uint32_t game_window;
 
+// The window's pixels: sRGB, or with HDR (hdr_present) linear values, 1 at normal white
+// and above it up to the screen's headroom. Switched when the HDR box changes.
+static int layer_hdr = -1;
+static void layer_format(void)
+{
+    if (!layer || layer_hdr == env_hdr) return;
+    layer_hdr = env_hdr;
+    // The game's colours are sRGB. Without a colour space the compositor shows them
+    // unconverted, too saturated on a wide-gamut (P3) screen.
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(env_hdr ? kCGColorSpaceExtendedLinearSRGB : kCGColorSpaceSRGB);
+    layer.pixelFormat = env_hdr ? MTLPixelFormatRGBA16Float : deep_color ? MTLPixelFormatBGR10A2Unorm : MTLPixelFormatBGRA8Unorm;
+    layer.colorspace = cs;
+    layer.wantsExtendedDynamicRangeContent = env_hdr != 0;
+    CGColorSpaceRelease(cs);
+}
+
 void d3d_render_init(uint32_t window)
 {
     ensure_device();
@@ -1191,12 +1265,7 @@ void d3d_render_init(uint32_t window)
         layer = bl_cocoa_open_window(w, h, "Vampire: The Masquerade – Bloodlines", window);
         if (layer) {
             layer.device = mtl;
-            // The game's colours are sRGB. Without a colour space the compositor shows
-            // them unconverted, too saturated on a wide-gamut (P3) screen.
-            layer.pixelFormat = deep_color ? MTLPixelFormatBGR10A2Unorm : MTLPixelFormatBGRA8Unorm;
-            CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-            layer.colorspace = srgb;
-            CGColorSpaceRelease(srgb);
+            layer_format();
             layer.framebufferOnly = NO;
             layer.drawableSize = CGSizeMake(w, h);
             bl_cocoa_set_fullscreen(full_screen());
@@ -1623,13 +1692,18 @@ static void note_projection(const float r8[4], const float r9[4], const float r1
     view_proj.p00 = sqrtf(r8[0] * r8[0] + r8[1] * r8[1] + r8[2] * r8[2]) / lw;
     view_proj.p11 = sqrtf(r9[0] * r9[0] + r9[1] * r9[1] + r9[2] * r9[2]) / lw * clip_y;
     if (view_proj.beta != 0 && view_proj.p00 > 0 && view_proj.p11 > 0) view_state = 1;
+    const float *rows[3] = {r8, r9, r11};
+    for (int i = 0; i < 3; i++) {
+        float l = sqrtf(rows[i][0] * rows[i][0] + rows[i][1] * rows[i][1] + rows[i][2] * rows[i][2]);
+        for (int k = 0; k < 4; k++) view_rows[i][k] = l > 0 ? rows[i][k] / l : 0;
+    }
 }
 
 // A texture for post_run, kept between frames (half resolution but for the copy of the
 // world view).
 static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h)
 {
-    static id<MTLTexture> t[6];
+    static id<MTLTexture> t[15];
     if (!t[i] || t[i].width != w || t[i].height != h || t[i].pixelFormat != pf) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h
                                                                                  mipmapped:NO];
@@ -1666,25 +1740,35 @@ static void ao_pass(int kind, int ms_depth, id<MTLTexture> target, id<MTLTexture
 // share of the cubemap with what the screen shows where the reflected ray meets it.
 // Three passes after the ambient occlusion's view depth (half resolution): the trace,
 // 24 steps along the reflected ray from the depth's normal, denser near the start and
-// offset in a 4x4 pattern, then 5 halvings; a depth-aware 5x5 filter; and, at full
+// offset by interleaved gradient noise, then 5 halvings, with hits on the backs of
+// surfaces dropped; a filter that blurs more the further the ray went (sharp where things
+// touch the surface, soft further off) and keeps to similar depths; and, at full
 // resolution in the game's next pass on the back buffer, post_apply: a copy of the world
-// view, sharpened (BL_SHARPEN, contrast adaptive like AMD's CAS), plus the reflections
-// where they were found. Elsewhere (off screen, behind things) the cubemap stays.
+// view, sharpened (BL_SHARPEN, contrast adaptive like AMD's CAS), plus the reflections,
+// upsampled from the reflective half-resolution pixels only. Elsewhere (off screen,
+// behind things) the cubemap stays. Both are stronger at grazing angles (Schlick's
+// Fresnel term, which the game's cubemaps lack).
 // BL_SSR=show shows the reflections alone, BL_SSR=hits what the trace had to go on;
-// BL_SSR_STRENGTH (default 1) scales them.
+// BL_SSR_STRENGTH (default 1) scales them, BL_SSR_FRESNEL (default 3) is the extra
+// reflection at a grazing angle, BL_SSR_BLUR (default 0.02) the blur per pixel of ray.
 
 struct ssr_params {
     float full[2], half[2];  // back buffer and half-resolution sizes
     float p00, p11;          // projection scales in x and y
     float strength;          // of the reflections; 0: none this frame
     float sharpen;           // 0..1; 0: none
-    float max_dist, show;    // longest ray (world units); show the reflections alone
+    float max_dist, show;    // longest ray (world units); show the reflections (1) or the trace's inputs (2)
+    float fresnel, blur;     // extra reflection at a grazing angle; blur radius per half-resolution pixel of ray
+    float tonemap, expand;   // tone mapping: 0 off, 1 GT7, 3 Khronos PBR Neutral; 2 and 4 the same after
+                             // expanding highlights by `expand` (0..1)
+    float fog, skin;         // add the volumetric light (fog_run); use the scattered skin (skin_run)
 };
 
 static NSString *const ssr_source =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
-     "struct SP { float2 full, hsize; float p00, p11, strength, sharpen, max_dist, show; };\n"
+     "struct SP { float2 full, hsize; float p00, p11, strength, sharpen, max_dist, show, fresnel, blur, tonemap, expand,\n"
+     "            fog, skin; };\n"
      "struct V { float4 pos [[position]]; };\n"
      "vertex V ssr_vs(uint id [[vertex_id]]) {\n"
      "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
@@ -1694,37 +1778,45 @@ static NSString *const ssr_source =
      "    if (w <= 0.0) w = 1e6;\n"
      "    float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.hsize.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.hsize.y);\n"
      "    return float3(ndc.x * w / a.p00, ndc.y * w / a.p11, w); }\n"
-     // View-space point to half-resolution pixel coordinates (centres at +0.5).
-     "static float2 project(constant SP &a, float3 q) {\n"
-     "    return float2((q.x * a.p00 / q.z + 1.0) * 0.5 * a.hsize.x, (1.0 - q.y * a.p11 / q.z) * 0.5 * a.hsize.y); }\n"
-     "constant float bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};\n"
-     // Output: the colour where the ray meets the picture, times the confidence; the confidence.
-     "fragment float4 ssr_trace(V in [[stage_in]], texture2d<float> zt [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
-     "                          texture2d<float> color [[texture(2)]], constant SP &a [[buffer(0)]]) {\n"
-     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
-     "    int2 p = int2(in.pos.xy);\n"
-     "    if (zt.read(uint2(p)).x <= 0.0 || info.sample(s, in.pos.xy / a.hsize).w < 0.004) return 0.0;\n"
-     "    float3 P = vpos(a, zt, p);\n"
+     // The normal from neighbouring depths (the nearer side of an edge), facing the camera.
+     "static float3 vnormal(constant SP &a, texture2d<float> zt, int2 p, float3 P) {\n"
      "    float3 l = vpos(a, zt, p - int2(1, 0)), r = vpos(a, zt, p + int2(1, 0));\n"
      "    float3 u = vpos(a, zt, p - int2(0, 1)), b = vpos(a, zt, p + int2(0, 1));\n"
      "    float3 dx = abs(r.z - P.z) < abs(P.z - l.z) ? r - P : P - l;\n"
      "    float3 dy = abs(b.z - P.z) < abs(P.z - u.z) ? b - P : P - u;\n"
-     "    float3 N = normalize(cross(dx, dy)), D = normalize(P);\n"
-     "    if (dot(N, D) > 0.0) N = -N;\n"
+     "    float3 N = normalize(cross(dx, dy));\n"
+     "    return dot(N, P) > 0.0 ? -N : N; }\n"
+     // View-space point to half-resolution pixel coordinates (centres at +0.5).
+     "static float2 project(constant SP &a, float3 q) {\n"
+     "    return float2((q.x * a.p00 / q.z + 1.0) * 0.5 * a.hsize.x, (1.0 - q.y * a.p11 / q.z) * 0.5 * a.hsize.y); }\n"
+     "static float ign(float2 p) { return fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715)))); }\n"
+     // c: the colour where the ray meets the picture, times the confidence; the confidence
+     // (-1: not reflective). aux: how far the ray went (half-resolution pixels; 1e4 no hit),
+     // and the Fresnel factor.
+     "struct TOut { float4 c [[color(0)]]; float2 aux [[color(1)]]; };\n"
+     "fragment TOut ssr_trace(V in [[stage_in]], texture2d<float> zt [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
+     "                        texture2d<float> color [[texture(2)]], constant SP &a [[buffer(0)]]) {\n"
+     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+     "    TOut o; o.c = float4(0.0, 0.0, 0.0, -1.0); o.aux = float2(1e4, 1.0);\n"
+     "    int2 p = int2(in.pos.xy);\n"
+     "    if (zt.read(uint2(p)).x <= 0.0 || info.sample(s, in.pos.xy / a.hsize).w < 0.004) return o;\n"
+     "    float3 P = vpos(a, zt, p), N = vnormal(a, zt, p, P), D = normalize(P);\n"
+     "    o.c.w = 0.0, o.aux.y = 1.0 + a.fresnel * pow(1.0 - saturate(dot(-D, N)), 5.0);\n"
      "    float3 R = reflect(D, N);\n"
      "    float len = a.max_dist;\n"
      "    if (R.z < 0.0) len = min(len, (P.z - 4.0) / -R.z);\n"
-     "    if (len <= 0.0) return 0.0;\n"
+     "    if (len <= 0.0) return o;\n"
      "    float3 E = P + R * len;\n"
      "    float2 s0 = project(a, P), d = project(a, E) - s0;\n"
      "    float t1 = 1.0;\n"
      "    if (d.x > 1e-3) t1 = min(t1, (a.hsize.x - 0.5 - s0.x) / d.x); else if (d.x < -1e-3) t1 = min(t1, (0.5 - s0.x) / d.x);\n"
      "    if (d.y > 1e-3) t1 = min(t1, (a.hsize.y - 0.5 - s0.y) / d.y); else if (d.y < -1e-3) t1 = min(t1, (0.5 - s0.y) / d.y);\n"
-     "    float px = length(d) * t1;\n"
-     "    if (px < 2.0) return 0.0;\n"
+     "    float dl = length(d);\n"
+     "    if (dl * t1 < 2.0) return o;\n"
      "    float iz0 = 1.0 / P.z, iz1 = 1.0 / E.z;\n"
-     "    float t0 = 1.5 / length(d);\n"
-     "    float jitter = (bayer[(p.x & 3) + (p.y & 3) * 4] + 0.5) / 16.0;\n"
+     // Start half a pixel out; the depth bias keeps the surface from meeting itself.
+     "    float t0 = 0.5 / dl;\n"
+     "    float jitter = ign(in.pos.xy);\n"
      "    const int STEPS = 24;\n"
      "    float lo = 0.0, hi = -1.0, prz = P.z;\n"
      "    for (int i = 0; i < STEPS; i++) {\n"
@@ -1732,61 +1824,202 @@ static NSString *const ssr_source =
      "        float t = t0 + (t1 - t0) * f * f;\n"
      "        float rz = 1.0 / mix(iz0, iz1, t);\n"
      "        float sz = zt.read(uint2(s0 + d * t)).x;\n"
-     "        if (sz > 0.0 && rz > sz && rz - sz < max(abs(rz - prz) * 2.0, sz * 0.02)) { hi = t; break; }\n"
+     "        float gap = rz - sz;\n"
+     "        if (sz > 0.0 && gap > sz * 0.002 && gap < max(abs(rz - prz) * 2.0, sz * 0.02)) { hi = t; break; }\n"
      "        lo = t, prz = rz;\n"
      "    }\n"
-     "    if (hi < 0.0) return 0.0;\n"
+     "    if (hi < 0.0) return o;\n"
      "    for (int i = 0; i < 5; i++) {\n"
      "        float t = 0.5 * (lo + hi);\n"
      "        float rz = 1.0 / mix(iz0, iz1, t);\n"
      "        float sz = zt.read(uint2(s0 + d * t)).x;\n"
-     "        if (sz > 0.0 && rz > sz) hi = t; else lo = t;\n"
+     "        if (sz > 0.0 && rz - sz > sz * 0.002) hi = t; else lo = t;\n"
      "    }\n"
+     "    int2 q = int2(s0 + d * hi);\n"
+     // A ray going the way the surface it meets faces came from behind it.
+     "    float3 H = vpos(a, zt, q);\n"
+     "    if (dot(vnormal(a, zt, q, H), R) > 0.1) return o;\n"
      "    float2 uv = (s0 + d * hi) / a.hsize, edge = min(uv, 1.0 - uv);\n"
      // Fade out towards the screen's edges, the ray's end and rays coming back at the camera.
      "    float conf = saturate(min(edge.x, edge.y) * 12.0) * (1.0 - smoothstep(0.7, 1.0, hi)) * saturate(R.z * 2.0 + 1.0);\n"
-     "    return float4(color.sample(s, uv).rgb * conf, conf); }\n"
+     "    o.c = float4(color.sample(s, uv).rgb * conf, conf);\n"
+     "    o.aux.x = dl * hi;\n"
+     "    return o; }\n"
      "fragment float4 ssr_blur(V in [[stage_in]], texture2d<float> ssr [[texture(0)]], texture2d<float> zt [[texture(1)]],\n"
-     "                         constant SP &a [[buffer(0)]]) {\n"
+     "                         texture2d<float> aux [[texture(2)]], constant SP &a [[buffer(0)]]) {\n"
      "    int2 p = int2(in.pos.xy), hs = int2(a.hsize) - 1;\n"
      "    float z = zt.read(uint2(p)).x;\n"
-     "    if (z <= 0.0) return 0.0;\n"
+     "    if (z <= 0.0 || ssr.read(uint2(p)).w < 0.0) return float4(0.0, 0.0, 0.0, -1.0);\n"
+     // 5 by 5 taps, spaced out for the wider blurs.
+     "    float sigma = clamp(aux.read(uint2(p)).x * a.blur, 0.4, 2.0);\n"
+     "    int step = sigma > 1.3 ? 2 : 1;\n"
+     "    float k = -0.5 / (sigma * sigma);\n"
      "    float4 sum = 0.0;\n"
      "    float wsum = 0.0;\n"
      "    for (int j = -2; j <= 2; j++)\n"
      "        for (int i = -2; i <= 2; i++) {\n"
-     "            uint2 q = uint2(clamp(p + int2(i, j), int2(0), hs));\n"
-     "            float w = exp(-abs(zt.read(q).x - z) * 20.0 / z);\n"
-     "            sum += ssr.read(q) * w, wsum += w;\n"
+     "            int2 o = int2(i, j) * step;\n"
+     "            uint2 q = uint2(clamp(p + o, int2(0), hs));\n"
+     "            float4 v = ssr.read(q);\n"
+     "            if (v.w < 0.0) continue;\n"
+     "            float w = exp(-abs(zt.read(q).x - z) * 20.0 / z + float(o.x * o.x + o.y * o.y) * k);\n"
+     "            sum += v * w, wsum += w;\n"
      "        }\n"
-     "    return sum / wsum; }\n"
+     "    return sum / max(wsum, 1e-5); }\n"
+     // GT7's tone mapping (Polyphony Digital's published SDR curve and chroma handling):
+     // frame buffer 1.0 is 100 nits, paper white 250 nits. The curve maps each channel
+     // (toe, linear section, exponential shoulder); the result's intensity in ICtCp is kept,
+     // with the original chroma faded out towards white, and the two are blended 40:60.
+     "static float gt7_smooth(float x, float e0, float e1) { float t = saturate((x - e0) / (e1 - e0)); return t * t * (3.0 - 2.0 * t); }\n"
+     "constant float GT7_PEAK = 2.5, GT7_ALPHA = 0.25, GT7_MID = 0.538, GT7_LIN = 0.444, GT7_TOE = 1.28;\n"
+     "static float gt7_curve(float x) {\n"
+     "    if (x < 0.0) return 0.0;\n"
+     "    float k = (GT7_LIN - 1.0) / (GT7_ALPHA - 1.0);\n"
+     "    float ka = GT7_PEAK * GT7_LIN + GT7_PEAK * k, kb = -GT7_PEAK * k * exp(GT7_LIN / k), kc = -1.0 / (k * GT7_PEAK);\n"
+     "    if (x >= GT7_LIN * GT7_PEAK) return ka + kb * exp(x * kc);\n"
+     "    float wl = gt7_smooth(x, 0.0, GT7_MID);\n"
+     "    return (1.0 - wl) * GT7_MID * pow(x / GT7_MID, GT7_TOE) + wl * x; }\n"
+     "static float3 pq_encode(float3 l) {\n"
+     "    float3 p = pow(max(l, 0.0), 0.1593017578125);\n"
+     "    return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), 78.84375); }\n"
+     "static float3 pq_decode(float3 n) {\n"
+     "    float3 p = pow(max(n, 0.0), 1.0 / 78.84375);\n"
+     "    return pow(max(p - 0.8359375, 0.0) / (18.8515625 - 18.6875 * p), 1.0 / 0.1593017578125); }\n"
+     // Rec.2020 frame buffer values to ICtCp and back.
+     "static float3 to_ictcp(float3 c) {\n"
+     "    float3 lms = float3(dot(c, float3(1688, 2146, 262)), dot(c, float3(683, 2951, 462)), dot(c, float3(99, 309, 3688))) / 4096.0;\n"
+     "    float3 q = pq_encode(lms * 0.01);\n"
+     "    return float3(0.5 * (q.x + q.y), dot(q, float3(6610, -13613, 7003)) / 4096.0, dot(q, float3(17933, -17390, -543)) / 4096.0); }\n"
+     "static float3 from_ictcp(float3 i) {\n"
+     "    float3 q = float3(i.x + 0.00860904 * i.y + 0.11102963 * i.z, i.x - 0.00860904 * i.y - 0.11102963 * i.z,\n"
+     "                      i.x + 0.56003134 * i.y - 0.32062717 * i.z);\n"
+     "    float3 lms = pq_decode(q) * 100.0;\n"
+     "    return float3(dot(lms, float3(3.4366066943, -2.5064521187, 0.0698454243)),\n"
+     "                  dot(lms, float3(-0.7913295556, 1.9836004518, -0.1922708962)),\n"
+     "                  dot(lms, float3(-0.0259498997, -0.0989137147, 1.1248636144))); }\n"
+     "static float3 gt7(float3 srgb, float mode, float expand) {\n"
+     "    float3 lin = select(pow((srgb + 0.055) / 1.055, 2.4), srgb / 12.92, srgb <= 0.04045);\n"
+     // Highlights the game clamped at 1, pushed back up (inverse Reinhard on the brightest channel).
+     "    if (mode > 1.5) { float m = max(max(lin.r, lin.g), lin.b); lin *= 1.0 / max(1.0 - expand * m, 1.0 - expand); }\n"
+     "    float3 c = float3(dot(lin, float3(0.6274, 0.3293, 0.0433)), dot(lin, float3(0.0691, 0.9195, 0.0114)),\n"
+     "                      dot(lin, float3(0.0164, 0.0880, 0.8956))) * GT7_PEAK;\n"
+     "    float3 ucs = to_ictcp(c);\n"
+     "    float3 skew = float3(gt7_curve(c.r), gt7_curve(c.g), gt7_curve(c.b));\n"
+     "    float3 su = to_ictcp(skew);\n"
+     "    float target = to_ictcp(float3(GT7_PEAK)).x;\n"
+     "    float chroma = 1.0 - gt7_smooth(ucs.x, 0.98 * target, 1.16 * target);\n"
+     "    float3 scaled = from_ictcp(float3(su.x, ucs.y * chroma, ucs.z * chroma));\n"
+     "    float3 o = min(mix(skew, scaled, 0.6), GT7_PEAK) / GT7_PEAK;\n"
+     "    o = float3(dot(o, float3(1.6605, -0.5876, -0.0728)), dot(o, float3(-0.1246, 1.1329, -0.0083)),\n"
+     "               dot(o, float3(-0.0182, -0.1006, 1.1187)));\n"
+     "    o = saturate(o);\n"
+     "    return select(1.055 * pow(o, 1.0 / 2.4) - 0.055, o * 12.92, o <= 0.0031308); }\n"
+     // Khronos PBR Neutral (the reference version), on linear sRGB.
+     "static float3 pbr_neutral(float3 srgb, float mode, float expand) {\n"
+     "    float3 c = select(pow((srgb + 0.055) / 1.055, 2.4), srgb / 12.92, srgb <= 0.04045);\n"
+     "    if (mode > 3.5) { float m = max(max(c.r, c.g), c.b); c *= 1.0 / max(1.0 - expand * m, 1.0 - expand); }\n"
+     "    const float start = 0.8 - 0.04, desat = 0.15;\n"
+     "    float x = min(c.r, min(c.g, c.b));\n"
+     "    c -= x < 0.08 ? x - 6.25 * x * x : 0.04;\n"
+     "    float peak = max(c.r, max(c.g, c.b));\n"
+     "    if (peak >= start) {\n"
+     "        const float d = 1.0 - start;\n"
+     "        float np = 1.0 - d * d / (peak + d - start);\n"
+     "        c *= np / peak;\n"
+     "        c = mix(c, float3(np), 1.0 - 1.0 / (desat * (peak - np) + 1.0));\n"
+     "    }\n"
+     "    c = saturate(c);\n"
+     "    return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308); }\n"
+     // HDR output: the picture in linear light, 1 at normal white. Where the HUD and view
+     // model left the world view alone, everything lit brighter than `knee` (luminance) is
+     // brightened, more the brighter it is (in proportion to how far it is from `knee`
+     // to white), white reaching `peak`; then the brightest channel is rolled off at the
+     // screen's headroom with GT7's shoulder (straight, then exponential towards the
+     // peak) and whitened a little near it. The HUD stays at normal white, below the lit
+     // world. `preview` writes the result divided by the headroom, in sRGB, for dumps.
+     "struct HP { float headroom, peak, knee, world, preview, pad0, pad1, pad2; };\n"
+     "fragment float4 hdr_present(V in [[stage_in]], texture2d<float> pic [[texture(0)]], texture2d<float> world [[texture(1)]],\n"
+     "                            constant HP &h [[buffer(0)]]) {\n"
+     "    uint2 p = uint2(in.pos.xy);\n"
+     "    float3 c = saturate(pic.read(p).rgb);\n"
+     "    float3 o = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);\n"
+     "    float H = h.headroom;\n"
+     "    if (h.world > 0.0 && H > 1.001 && all(abs(world.read(p).rgb - c) < 1e-3)) {\n"
+     "        float Y = dot(o, float3(0.2126, 0.7152, 0.0722));\n"
+     "        if (Y > h.knee) {\n"
+     "            float u = saturate((Y - h.knee) / (1.0 - h.knee));\n"
+     "            o *= 1.0 + (h.peak - 1.0) * u;\n"
+     "            float m = max(max(o.r, o.g), o.b), x = m;\n"
+     "            float L = max(GT7_LIN, min(1.0 / H, 0.999)), k = (L - 1.0) / (GT7_ALPHA - 1.0);\n"
+     "            float ka = H * L + H * k, kb = -H * k * exp(L / k), kc = -1.0 / (k * H);\n"
+     "            float y = x < L * H ? x : min(ka + kb * exp(x * kc), H);\n"
+     "            o *= y / m;\n"
+     "            o = mix(o, float3(y), 0.4 * smoothstep(0.5, 1.0, y / H));\n"
+     "        }\n"
+     "    }\n"
+     "    if (h.preview > 0.0) {\n"
+     "        o = saturate(o / H);\n"
+     "        return float4(select(1.055 * pow(o, 1.0 / 2.4) - 0.055, o * 12.92, o <= 0.0031308), 1.0);\n"
+     "    }\n"
+     "    return float4(o, 1.0); }\n"
      // Full resolution, in the game's next pass on the back buffer: the world view again,
      // sharpened, with the reflections in place of that share of the cubemaps.
+     "static float3 picture(texture2d<float> base, texture2d<float> info, texture2d<float> skin, float sk, int2 q) {\n"
+     "    return sk > 0.0 && info.read(uint2(q)).w < -0.5 ? skin.read(uint2(q)).rgb : base.read(uint2(q)).rgb; }\n"
      "fragment float4 post_apply(V in [[stage_in]], texture2d<float> base [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
-     "                           texture2d<float> ssr [[texture(2)]], constant SP &a [[buffer(0)]]) {\n"
-     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+     "                           texture2d<float> ssr [[texture(2)]], texture2d<float> aux [[texture(3)]],\n"
+     "                           texture2d<float> fogt [[texture(4)]], texture2d<float> skin [[texture(5)]],\n"
+     "                           constant SP &a [[buffer(0)]]) {\n"
      "    int2 p = int2(in.pos.xy), m = int2(a.full) - 1;\n"
      "    float4 c = base.read(uint2(p));\n"
-     "    float3 col = c.rgb;\n"
-     "    if (a.sharpen > 0.0) {\n"
-     "        float3 n = base.read(uint2(clamp(p - int2(0, 1), int2(0), m))).rgb;\n"
-     "        float3 w = base.read(uint2(clamp(p - int2(1, 0), int2(0), m))).rgb;\n"
-     "        float3 e = base.read(uint2(clamp(p + int2(1, 0), int2(0), m))).rgb;\n"
-     "        float3 so = base.read(uint2(clamp(p + int2(0, 1), int2(0), m))).rgb;\n"
+     "    float3 col = picture(base, info, skin, a.skin, p);\n"
+     // Characters' pixels come from the scattered skin picture, and are sharpened like the
+     // rest (in red for the options' "show").
+     "    if (a.skin > 1.5 && info.read(uint2(p)).w < -0.5) col = float3(1.0, 0.1, 0.1);\n"
+     "    else if (a.sharpen > 0.0) {\n"
+     "        float3 n = picture(base, info, skin, a.skin, clamp(p - int2(0, 1), int2(0), m));\n"
+     "        float3 w = picture(base, info, skin, a.skin, clamp(p - int2(1, 0), int2(0), m));\n"
+     "        float3 e = picture(base, info, skin, a.skin, clamp(p + int2(1, 0), int2(0), m));\n"
+     "        float3 so = picture(base, info, skin, a.skin, clamp(p + int2(0, 1), int2(0), m));\n"
      "        float3 mn = min(min(min(n, w), min(e, so)), col), mx = max(max(max(n, w), max(e, so)), col);\n"
      "        float3 k = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1e-4))) * (-1.0 / mix(8.0, 5.0, a.sharpen));\n"
      "        col = saturate(((n + w + e + so) * k + col) / (1.0 + 4.0 * k));\n"
      "    }\n"
      "    if (a.strength > 0.0) {\n"
-     "        float4 f = info.read(uint2(p));\n"
-     "        float4 r = f.w > 0.004 ? ssr.sample(s, in.pos.xy / a.full) : float4(0.0);\n"
+     "        float4 f = info.read(uint2(p)), r = 0.0;\n"
+     "        float F = 1.0;\n"
+     "        if (f.w > 0.004) {\n"
+     // Bilinear from the half-resolution pixels around, leaving out those that are not
+     // reflective (an object in front), so their edges do not bleed in.
+     "            float2 h = (float2(p) + 0.5) * 0.5 - 0.5, t = fract(h);\n"
+     "            int2 b = int2(floor(h)), hs = int2(a.hsize) - 1;\n"
+     "            float fs = 0.0, ws = 0.0;\n"
+     "            for (int j = 0; j < 2; j++)\n"
+     "                for (int i = 0; i < 2; i++) {\n"
+     "                    uint2 q = uint2(clamp(b + int2(i, j), int2(0), hs));\n"
+     "                    float4 v = ssr.read(q);\n"
+     "                    if (v.w < 0.0) continue;\n"
+     "                    float w = (i ? t.x : 1.0 - t.x) * (j ? t.y : 1.0 - t.y);\n"
+     "                    r += v * w, fs += aux.read(q).y * w, ws += w;\n"
+     "                }\n"
+     "            if (ws > 1e-4) r /= ws, F = fs / ws;\n"
+     "        }\n"
      "        if (a.show > 1.5) col = float3(f.w, r.a, length(f.rgb));\n"
-     "        else if (a.show > 0.0) col = f.w > 0.004 ? r.rgb : col * 0.25;\n"
-     "        else col += a.strength * (max(f.w, 0.0) * r.rgb - r.a * f.rgb);\n"
+     "        else if (a.show > 0.0) col = f.w > 0.004 ? F * r.rgb : col * 0.25;\n"
+     "        else if (f.w > 0.004) col += a.strength * (F * (max(f.w, 0.0) * r.rgb + (1.0 - r.a) * f.rgb) - f.rgb);\n"
      "    }\n"
+     "    if (a.fog > 0.0) {\n"
+     "        constexpr sampler ls(filter::linear, address::clamp_to_edge);\n"
+     "        float4 f = fogt.sample(ls, (float2(p) + 0.5) / a.full);\n"
+     "        col = col * f.w + f.rgb;\n"
+     "    }\n"
+     "    if (a.tonemap > 2.5) col = pbr_neutral(saturate(col), a.tonemap, a.expand);\n"
+     "    else if (a.tonemap > 0.0) col = gt7(saturate(col), a.tonemap, a.expand);\n"
      "    return float4(saturate(col), c.a); }\n";
 
-// kind 0: trace; 1: filter; 2: post_apply, in the game's pass with its depth attachment (`depth`).
+// kind 0: trace (a second target for the ray's length and Fresnel factor); 1: filter;
+// 2: post_apply, in the game's pass with its depth attachment (`depth`).
+#define SSR_AUX_FORMAT MTLPixelFormatRG16Float
 static id<MTLRenderPipelineState> ssr_pipeline(int kind, MTLPixelFormat color, int samples, MTLPixelFormat depth)
 {
     static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *cache;
@@ -1801,11 +2034,12 @@ static id<MTLRenderPipelineState> ssr_pipeline(int kind, MTLPixelFormat color, i
                                                (unsigned long)depth];
     id<MTLRenderPipelineState> p = cache[key];
     if (p) return p;
-    static NSString *const names[] = {@"ssr_trace", @"ssr_blur", @"post_apply"};
+    static NSString *const names[] = {@"ssr_trace", @"ssr_blur", @"post_apply", @"hdr_present"};
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [lib newFunctionWithName:@"ssr_vs"];
     d.fragmentFunction = [lib newFunctionWithName:names[kind]];
     d.colorAttachments[0].pixelFormat = color;
+    if (kind == 0) d.colorAttachments[1].pixelFormat = SSR_AUX_FORMAT;
     d.rasterSampleCount = (NSUInteger)samples;
     d.depthAttachmentPixelFormat = depth;
     d.stencilAttachmentPixelFormat = depth;
@@ -1816,14 +2050,19 @@ static id<MTLRenderPipelineState> ssr_pipeline(int kind, MTLPixelFormat color, i
     return p;
 }
 
-// One full-screen pass of ssr_pipeline `kind` into `target`.
-static void ssr_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTexture> t1, id<MTLTexture> t2,
-                     const struct ssr_params *a)
+// One full-screen pass of ssr_pipeline `kind` into `target` (and `target2` for the trace).
+static void ssr_pass(int kind, id<MTLTexture> target, id<MTLTexture> target2, id<MTLTexture> t0, id<MTLTexture> t1,
+                     id<MTLTexture> t2, const struct ssr_params *a)
 {
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = target;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    if (target2) {
+        rp.colorAttachments[1].texture = target2;
+        rp.colorAttachments[1].loadAction = MTLLoadActionDontCare;
+        rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+    }
     id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
     [e setRenderPipelineState:ssr_pipeline(kind, target.pixelFormat, 1, MTLPixelFormatInvalid)];
     [e setFragmentTexture:t0 atIndex:0];
@@ -1834,13 +2073,354 @@ static void ssr_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLT
     [e endEncoding];
 }
 
+// --- volumetric light and skin -----------------------------------------------------------
+//
+// Volumetric light (BL_FOG, fog_run): a thin haze lit by the map's own lights. The map's
+// file has every light its compiler baked (bl_bsp.c), with its colour, falloff and spot
+// cone; the brightest 24 that the camera's part of the map can see, put into view space
+// with the world view's camera (view_rows), light the air along each pixel's view ray up
+// to what the pixel shows: 16 steps offset by interleaved gradient noise, each adding
+// what every light sends towards the camera there (Henyey-Greenstein, mostly forwards),
+// at half resolution; then a depth-aware 3x3 filter. post_apply adds it, and dims what
+// lies behind a little. Lights are not shadowed in the haze: a light beyond a wall
+// (the map's tree says so) fades to 0.3 of its haze.
+//
+// Skin (BL_SSS, skin_run): light that enters skin comes out again a little way off, red
+// furthest. The world view's skinned draws (characters) write into the reflection info
+// the light on them alone, their shader run again with its colour texture read as white
+// (d3d_shader_variant skin), marked with -1. Two passes blur that light, across then
+// down, over a width in world units (so less with distance), red the widest and blue
+// the narrowest, keeping to the marked pixels at the same depth; the second multiplies
+// it by the skin's own colour (the picture divided by the unblurred light), so the
+// texture stays sharp, where that colour looks like skin (in YCbCr), and adds skin's
+// shine from the map's lights (wetter on the lips, picked out by their colour; broken up
+// by the texture's fine detail, dimmed in creases) and a little light at its edges, with
+// normals from the depth smoothed over a world unit. post_apply uses it for the marked pixels.
+
+// post_apply's inputs (post_run): the world view, the reflections and their aux, the
+// volumetric light, the scattered skin.
+static id<MTLTexture> post_base, post_ssr, post_aux, post_fog, post_skin;
+
+#define FOG_LIGHTS 24
+struct fog_light { float pos[4], color[4], dir[4], att[4]; };  // see FL in fx_source
+struct fx_params {
+    float full[2], half[2];
+    float p00, p11;
+    float density, dist;   // fog: per world unit; how far to trace
+    float steps, nlights;  // fog
+    float width, strength; // skin: blur width (world units); how much of it to use
+    float dir[2];          // skin: blur direction (1 0 or 0 1)
+    float final, sheen;    // skin: the second pass (mixes in); strength of the shine (0 none)
+};
+
+static NSString *const fx_source =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct FP { float2 full, hsize; float p00, p11, density, dist, steps, nlights, width, strength; float2 dir;\n"
+     "            float final, sheen; };\n"
+     // pos.w: range (0 none); color.w: spot's full cone (cosine); dir.w: its zero cone;
+     // att.w: its exponent. Points have dir 0.
+     "struct FL { float4 pos, color, dir, att; };\n"
+     "struct V { float4 pos [[position]]; };\n"
+     "vertex V fx_vs(uint id [[vertex_id]]) {\n"
+     "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
+     "static float ign(float2 p) { return fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715)))); }\n"
+     "fragment float4 fog_scatter(V in [[stage_in]], texture2d<float> zt [[texture(0)]], constant FP &a [[buffer(0)]],\n"
+     "                            constant FL *L [[buffer(1)]]) {\n"
+     "    uint2 p = uint2(in.pos.xy);\n"
+     "    float w = zt.read(p).x;\n"
+     "    if (w <= 0.0) w = a.dist;\n"
+     "    float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.hsize.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.hsize.y);\n"
+     "    float3 ray = float3(ndc.x / a.p00, ndc.y / a.p11, 1.0);\n"
+     "    float rl = length(ray), T = min(w, a.dist), dt = T / a.steps;\n"
+     "    float3 vd = ray / rl, acc = 0.0;\n"
+     "    float j = ign(float2(p));\n"
+     "    const float g = 0.35, g1 = 1.0 - g * g, g2 = 1.0 + g * g;\n"
+     "    int n = int(a.nlights), steps = int(a.steps);\n"
+     "    for (int i = 0; i < steps; i++) {\n"
+     "        float3 P = ray * ((float(i) + j) * dt);\n"
+     "        for (int k = 0; k < n; k++) {\n"
+     "            float3 v = L[k].pos.xyz - P;\n"
+     "            float d2 = max(dot(v, v), 64.0), d = sqrt(d2);\n"
+     "            float3 l = v / d;\n"
+     "            float f = 1.0 / (L[k].att.x + L[k].att.y * d + L[k].att.z * d2);\n"
+     "            if (L[k].pos.w > 0.0) { float x = d / L[k].pos.w; f *= saturate(1.0 - x * x * x * x); }\n"
+     "            if (dot(L[k].dir.xyz, L[k].dir.xyz) > 0.25) {\n"
+     "                float c = dot(-l, L[k].dir.xyz), inner = L[k].color.w, outer = L[k].dir.w;\n"
+     "                if (c <= outer) continue;\n"
+     "                if (c < inner) f *= (c - outer) / max(inner - outer, 1e-4);\n"
+     "                if (L[k].att.w > 0.0 && L[k].att.w != 1.0) f *= pow(c, L[k].att.w);\n"
+     "            }\n"
+     "            float ph = g1 / pow(g2 - 2.0 * g * dot(l, vd), 1.5);\n"
+     "            acc += L[k].color.rgb * (f * ph);\n"
+     "        }\n"
+     "    }\n"
+          // Rolled off so that where the lights pile up the haze nears white without passing it.
+     "    return float4(1.0 - exp(-acc * (a.density * dt * rl)), exp(-0.5 * a.density * rl * T)); }\n"
+     "fragment float4 fog_blur(V in [[stage_in]], texture2d<float> ft [[texture(0)]], texture2d<float> zt [[texture(1)]],\n"
+     "                         constant FP &a [[buffer(0)]]) {\n"
+     "    int2 p = int2(in.pos.xy), m = int2(a.hsize) - 1;\n"
+     "    float w0 = zt.read(uint2(p)).x;\n"
+     "    float4 s = 0.0; float ws = 0.0;\n"
+     "    for (int y = -1; y <= 1; y++)\n"
+     "        for (int x = -1; x <= 1; x++) {\n"
+     "            uint2 q = uint2(clamp(p + int2(x, y), int2(0), m));\n"
+     "            float w = zt.read(q).x;\n"
+     "            float k = (x == 0 ? 2.0 : 1.0) * (y == 0 ? 2.0 : 1.0);\n"
+     "            k *= w0 <= 0.0 && w <= 0.0 ? 1.0 : exp(-abs(w - w0) / max(w0, 1.0) * 20.0);\n"
+     "            s += ft.read(q) * k, ws += k;\n"
+     "        }\n"
+     "    return s / ws; }\n"
+     // The skin's normals for its shine (half resolution): from view-space positions a
+     // world unit apart, wide enough to span the model's flat faces, then smoothed.
+     "static float3 hpos(constant FP &a, texture2d<float> zt, int2 p) {\n"
+     "    p = clamp(p, int2(0), int2(a.hsize) - 1);\n"
+     "    float w = zt.read(uint2(p)).x;\n"
+     "    float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.hsize.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.hsize.y);\n"
+     "    return float3(ndc.x * w / a.p00, ndc.y * w / a.p11, w); }\n"
+     "fragment float4 skin_normal(V in [[stage_in]], texture2d<float> zt [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
+     "                            constant FP &a [[buffer(0)]]) {\n"
+     "    int2 p = int2(in.pos.xy);\n"
+     "    float iw = info.read(uint2(min(p * 2, int2(a.full) - 1))).w;\n"
+     "    float3 P = hpos(a, zt, p);\n"
+     "    if (iw > -0.5 || iw < -1.5 || P.z <= 0.0) return 0.0;\n"
+     "    int st = int(clamp(round(a.p00 * a.hsize.x * 0.5 / P.z), 1.0, 8.0));\n"
+     "    float3 l = hpos(a, zt, p - int2(st, 0)), r = hpos(a, zt, p + int2(st, 0));\n"
+     "    float3 u = hpos(a, zt, p - int2(0, st)), b = hpos(a, zt, p + int2(0, st));\n"
+     "    float lim = 0.05 * P.z + 1.0;\n"
+     "    float3 dx = abs(r.z - P.z) < lim && abs(l.z - P.z) < lim ? r - l : abs(r.z - P.z) < abs(l.z - P.z) ? r - P : P - l;\n"
+     "    float3 dy = abs(b.z - P.z) < lim && abs(u.z - P.z) < lim ? b - u : abs(b.z - P.z) < abs(u.z - P.z) ? b - P : P - u;\n"
+     "    float3 N = normalize(cross(dx, dy));\n"
+     // How far the point lies behind its neighbours (a crease: beside the nose, under the
+     // lips), 0..1 over half a world unit, in w as 1 + that.
+     "    float cav = 0.0, cn = 0.0;\n"
+     "    float3 q[4] = {l, r, u, b};\n"
+     "    for (int i = 0; i < 4; i++)\n"
+     "        if (abs(q[i].z - P.z) < lim) cav += P.z - q[i].z, cn += 1.0;\n"
+     "    cav = cn > 0.0 ? saturate(cav / cn / 0.5) : 0.0;\n"
+     "    return float4(dot(N, P) > 0.0 ? -N : N, 1.0 + cav); }\n"
+     // How much a colour looks like skin, pale to dark, in YCbCr; blonde and red hair, more
+     // yellow (lower Cb), are left out.
+     "static float skin_tone(float3 c) {\n"
+     "    float cb = 0.5 - 0.1687 * c.r - 0.3313 * c.g + 0.5 * c.b, cr = 0.5 + 0.5 * c.r - 0.4187 * c.g - 0.0813 * c.b;\n"
+     "    return smoothstep(0.505, 0.53, cr) * (1.0 - smoothstep(0.68, 0.72, cr)) *\n"
+     "           smoothstep(0.33, 0.37, cb) * (1.0 - smoothstep(0.50, 0.52, cb)); }\n"
+     // Pass 1 (across) blurs the light alone (src: the reflection info); pass 2 (down)
+     // blurs pass 1, then multiplies the blurred light by the skin's own colour (the
+     // picture divided by its unblurred light), so the texture stays sharp.
+     "fragment float4 skin_blur(V in [[stage_in]], texture2d<float> src [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
+     "                          texture2d<float> zt [[texture(2)]], texture2d<float> orig [[texture(3)]],\n"
+     "                          texture2d<float> nt [[texture(4)]], constant FP &a [[buffer(0)]],\n"
+     "                          constant FL *L [[buffer(1)]]) {\n"
+     "    int2 p = int2(in.pos.xy), m = int2(a.full) - 1;\n"
+     "    float4 f = info.read(uint2(p)), c = src.read(uint2(p));\n"
+     "    bool fin = a.final > 0.5;\n"
+     "    if (f.w > -0.5 || f.w < -1.5) return fin ? orig.read(uint2(p)) : c;\n"
+     "    float w = zt.read(uint2(clamp(p / 2, int2(0), int2(a.hsize) - 1))).x;\n"
+     "    float3 s = c.rgb, ws = 1.0;\n"
+     // Pixels for one width at this depth.
+     "    float px = w > 0.0 ? a.width * (a.dir.x > 0.5 ? a.p00 * a.full.x : a.p11 * a.full.y) * 0.5 / w : 0.0;\n"
+     "    if (px > 0.3) {\n"
+     "        px = min(px, 12.0);\n"
+     "        const float3 sigma = float3(1.0, 0.45, 0.3);\n"
+     "        for (int i = -6; i <= 6; i++) {\n"
+     "            if (i == 0) continue;\n"
+     "            float x = float(i) / 3.0;\n"  // up to two widths either side
+     "            int2 q = clamp(p + int2(round(a.dir * x * px)), int2(0), m);\n"
+     "            float3 v = c.rgb;\n"
+     "            float qw = info.read(uint2(q)).w;\n"
+     "            float wq = zt.read(uint2(clamp(q / 2, int2(0), int2(a.hsize) - 1))).x;\n"
+     "            if (qw < -0.5 && qw > -1.5 && abs(wq - w) < 0.03 * w + 2.0) v = src.read(uint2(q)).rgb;\n"
+     "            float3 k = exp(-x * x / (2.0 * sigma * sigma));\n"
+     "            s += v * k, ws += k;\n"
+     "        }\n"
+     "    }\n"
+     "    s /= ws;\n"
+     "    if (!fin) return float4(s, 1.0);\n"
+     "    float4 o = orig.read(uint2(p));\n"
+     "    if (max(max(f.r, f.g), f.b) < 0.02) return o;\n"
+     "    float3 albedo = clamp(o.rgb / max(f.rgb, 1e-3), 0.0, 4.0);\n"
+     // Skin by its own colour, not the light on it.
+     "    float3 al = saturate(albedo);\n"
+     "    float tone = skin_tone(al);\n"
+     "    float3 col = mix(o.rgb, saturate(albedo * s), a.strength * tone);\n"
+     // The shine: skin's two specular lobes (broad and soft, narrower and brighter;
+     // lips one tight wet one), Schlick's Fresnel from skin's 2.8% head on, lit by the
+     // map's lights but as bright as the game's own light here (its share among them),
+     // so it follows the game's lighting. Then a little light at the edges, where skin
+     // turns away from the camera.
+     "    constexpr sampler ls(filter::linear, address::clamp_to_edge);\n"
+     "    float4 nn = nt.sample(ls, (float2(p) + 0.5) / a.full);\n"
+     "    if (a.sheen > 0.0 && nn.w > 0.5 && tone > 0.0) {\n"
+     "        float3 N = normalize(nn.xyz);\n"
+     "        float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.full.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.full.y);\n"
+     "        float3 P = float3(ndc.x * w / a.p00, ndc.y * w / a.p11, w), V = -normalize(P);\n"
+     "        float cr = 0.5 + 0.5 * al.r - 0.4187 * al.g - 0.0813 * al.b;\n"
+     "        float lips = smoothstep(0.60, 0.63, cr);\n"
+     "        const float3 lw = float3(0.2126, 0.7152, 0.0722);\n"
+     "        float3 sp = 0.0; float E = 0.0;\n"
+     "        for (int k = 0; k < int(a.nlights); k++) {\n"
+     "            float3 v = L[k].pos.xyz - P;\n"
+     "            float d2 = max(dot(v, v), 64.0), d = sqrt(d2);\n"
+     "            float3 l = v / d;\n"
+     "            float e = 1.0 / (L[k].att.x + L[k].att.y * d + L[k].att.z * d2);\n"
+     "            if (L[k].pos.w > 0.0) { float x = d / L[k].pos.w; e *= saturate(1.0 - x * x * x * x); }\n"
+     "            if (dot(L[k].dir.xyz, L[k].dir.xyz) > 0.25) {\n"
+     "                float cs = dot(-l, L[k].dir.xyz), inner = L[k].color.w, outer = L[k].dir.w;\n"
+     "                if (cs <= outer) continue;\n"
+     "                if (cs < inner) e *= (cs - outer) / max(inner - outer, 1e-4);\n"
+     "            }\n"
+     "            float li = dot(L[k].color.rgb, lw) * e;\n"
+     "            E += li;\n"
+     "            float ndl = saturate(dot(N, l));\n"
+     "            if (ndl <= 0.0) continue;\n"
+     "            float3 H = normalize(l + V);\n"
+     "            float nh = saturate(dot(N, H)), vh = saturate(dot(V, H));\n"
+     "            float F = 0.028 + 0.972 * pow(1.0 - vh, 5.0);\n"
+     "            float lobe = mix(0.6 * pow(nh, 12.0) * 2.5 + 0.4 * pow(nh, 48.0) * 7.0, pow(nh, 128.0) * 17.0, lips);\n"
+     "            sp += L[k].color.rgb / max(dot(L[k].color.rgb, lw), 1e-4) * (li * ndl * lobe * F);\n"
+     "        }\n"
+     "        float lum = dot(f.rgb, lw);\n"
+     // Pores: the texture's own fine detail (its brightness against its neighbours'),
+     // fixed to the skin, breaks the shine up; creases lose most of it.
+     "        float ad = 0.0;\n"
+     "        for (int i = 0; i < 4; i++) {\n"
+     "            int2 q = clamp(p + int2(i == 0 ? 1 : i == 1 ? -1 : 0, i == 2 ? 1 : i == 3 ? -1 : 0), int2(0), m);\n"
+     "            float4 fq = info.read(uint2(q));\n"
+     "            ad += dot(clamp(orig.read(uint2(q)).rgb / max(fq.rgb, 1e-3), 0.0, 4.0), lw);\n"
+     "        }\n"
+     "        float pore = clamp(dot(albedo, lw) / max(ad * 0.25, 1e-3), 0.0, 2.0);\n"
+     "        float crease = 1.0 - 0.8 * saturate(nn.w - 1.0);\n"
+     "        float grain = mix(1.0, pore * pore, 0.6 * (1.0 - lips));\n"
+     "        if (E > 1e-6) col += a.sheen * (1.0 + 2.0 * lips) * tone * lum * grain * crease * sp / E;\n"
+     "        float rim = pow(1.0 - saturate(dot(N, V)), 3.0);\n"
+     "        col += 0.12 * rim * tone * crease * al * s;\n"
+     "    }\n"
+     "    return float4(saturate(col), o.a); }\n";
+
+// kind 0: fog_scatter, 1: fog_blur, 2: skin_blur, 3: skin_normal, 4: fog_blur again (for
+// the normals).
+static id<MTLRenderPipelineState> fx_pipeline(int kind, MTLPixelFormat color)
+{
+    static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *cache;
+    static id<MTLLibrary> lib;
+    if (!cache) {
+        cache = [NSMutableDictionary new];
+        NSError *error = nil;
+        lib = [mtl newLibraryWithSource:fx_source options:nil error:&error];
+        if (!lib) bl_fatal("volumetric light shader: %s", error.localizedDescription.UTF8String);
+    }
+    NSString *key = [NSString stringWithFormat:@"%d/%lu", kind, (unsigned long)color];
+    id<MTLRenderPipelineState> p = cache[key];
+    if (p) return p;
+    static NSString *const names[] = {@"fog_scatter", @"fog_blur", @"skin_blur", @"skin_normal", @"fog_blur"};
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [lib newFunctionWithName:@"fx_vs"];
+    d.fragmentFunction = [lib newFunctionWithName:names[kind]];
+    d.colorAttachments[0].pixelFormat = color;
+    NSError *error = nil;
+    p = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!p) bl_fatal("volumetric light pipeline: %s", error.localizedDescription.UTF8String);
+    cache[key] = p;
+    return p;
+}
+
+static void fx_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTexture> t1, id<MTLTexture> t2,
+                    id<MTLTexture> t3, id<MTLTexture> t4, const struct fx_params *a, const void *lights,
+                    size_t lights_len)
+{
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = target;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:fx_pipeline(kind, target.pixelFormat)];
+    id<MTLTexture> t[5] = {t0, t1, t2, t3, t4};
+    for (int i = 0; i < 5; i++) [e setFragmentTexture:t[i] ? t[i] : t0 atIndex:(NSUInteger)i];
+    [e setFragmentBytes:a length:sizeof *a atIndex:0];
+    if (lights) [e setFragmentBytes:lights length:lights_len atIndex:1];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+}
+
+// The map's brightest lights for this frame's camera, in view space (bl_bsp_lights once
+// a frame, which also fades lights in and out): for the haze and the skin's shine.
+static struct fog_light frame_lights[FOG_LIGHTS];
+static int frame_nlights;
+static float frame_cam[3];
+static int view_lights(void)
+{
+    static unsigned long done = ~0ul;
+    if (done == frames) return frame_nlights;
+    done = frames;
+    // The camera's world position: the view rows are a rotation (orthonormal) and a shift.
+    float *cam = frame_cam;
+    for (int k = 0; k < 3; k++)
+        cam[k] = -(view_rows[0][k] * view_rows[0][3] + view_rows[1][k] * view_rows[1][3] + view_rows[2][k] * view_rows[2][3]);
+    struct bl_light l[FOG_LIGHTS];
+    int n = bl_bsp_lights(cam, l, FOG_LIGHTS);
+    struct fog_light *fl = frame_lights;
+    for (int i = 0; i < n; i++) {
+        for (int r = 0; r < 3; r++) {
+            fl[i].pos[r] = view_rows[r][0] * l[i].pos[0] + view_rows[r][1] * l[i].pos[1] + view_rows[r][2] * l[i].pos[2] +
+                           view_rows[r][3];
+            fl[i].dir[r] = l[i].spot ? view_rows[r][0] * l[i].dir[0] + view_rows[r][1] * l[i].dir[1] +
+                                           view_rows[r][2] * l[i].dir[2]
+                                     : 0;
+            fl[i].color[r] = l[i].color[r] * l[i].vis;
+            fl[i].att[r] = l[i].att[r];
+        }
+        fl[i].pos[3] = l[i].radius, fl[i].color[3] = l[i].inner, fl[i].dir[3] = l[i].outer, fl[i].att[3] = l[i].exponent;
+    }
+    return frame_nlights = n;
+}
+
+static void fog_run(id<MTLTexture> z, NSUInteger hw, NSUInteger hh, struct ssr_params *p)
+{
+    int n = view_lights();
+    if (!n) return;
+    const float *cam = frame_cam;
+    const struct fog_light *fl = frame_lights;
+    LOG_ONCE("[metal] volumetric light: %d lights, camera %g %g %g\n", n, cam[0], cam[1], cam[2]);
+    struct fx_params a = {{p->full[0], p->full[1]}, {(float)hw, (float)hh}, view_proj.p00, view_proj.p11,
+                          env_fog_density, env_fog_dist, 16, (float)n};
+    id<MTLTexture> raw = ao_texture(9, MTLPixelFormatRGBA16Float, hw, hh);
+    post_fog = ao_texture(10, MTLPixelFormatRGBA16Float, hw, hh);
+    fx_pass(0, raw, z, nil, nil, nil, nil, &a, fl, sizeof fl[0] * (size_t)n);
+    fx_pass(1, post_fog, raw, z, nil, nil, nil, &a, NULL, 0);
+    p->fog = 1;
+}
+
+static void skin_run(id<MTLTexture> color, id<MTLTexture> z, NSUInteger hw, NSUInteger hh, struct ssr_params *p)
+{
+    struct fx_params a = {{p->full[0], p->full[1]}, {(float)hw, (float)hh}, view_proj.p00, view_proj.p11};
+    a.width = env_sss_width, a.strength = env_sss_strength < 0 ? 0 : env_sss_strength > 1 ? 1 : env_sss_strength;
+    id<MTLTexture> info = info_texture(color, 1);
+    id<MTLTexture> across = ao_texture(11, MTLPixelFormatRGBA16Float, color.width, color.height);
+    post_skin = ao_texture(12, MTLPixelFormatRGBA16Float, color.width, color.height);
+    // Normals for the shine, half resolution, smoothed over the model's flat faces.
+    id<MTLTexture> nraw = ao_texture(13, MTLPixelFormatRGBA16Float, hw, hh);
+    id<MTLTexture> normals = ao_texture(14, MTLPixelFormatRGBA16Float, hw, hh);
+    int n = env_sss_sheen > 0 ? view_lights() : 0;
+    a.nlights = (float)n, a.sheen = n ? env_sss_sheen : 0;
+    if (n) {
+        fx_pass(3, nraw, z, info, nil, nil, nil, &a, NULL, 0);
+        fx_pass(4, normals, nraw, z, nil, nil, nil, &a, NULL, 0);
+    }
+    a.dir[0] = 1, a.dir[1] = 0, a.final = 0;
+    fx_pass(2, across, info, info, z, post_base, normals, &a, frame_lights, sizeof frame_lights[0]);
+    a.dir[0] = 0, a.dir[1] = 1, a.final = 1;
+    fx_pass(2, post_skin, across, info, z, post_base, normals, &a, n ? frame_lights : NULL,
+            sizeof frame_lights[0] * (size_t)(n ? n : 1));
+    p->skin = env_sss_show ? 2 : 1;
+}
+
 // --- the world view's end ----------------------------------------------------------------
 
 // What the game's next pass on the back buffer draws first: post_apply (its copy of the
 // world view and reflections), then the occlusion multiplied in (ao_apply).
 static struct ao_params ao_result_params;
 static struct ssr_params post_params;
-static id<MTLTexture> post_base, post_ssr;
 
 static void post_run(struct d3d_state *s)
 {
@@ -1856,12 +2436,12 @@ static void post_run(struct d3d_state *s)
     id<MTLTexture> depth = samples > 1 ? ms_texture(ds) : target_texture(ds);
     if (depth.width != color.width || depth.height != color.height) return;
     NSUInteger hw = (color.width + 1) / 2, hh = (color.height + 1) / 2;
-    int reflect = env_ssr && info_frame == frames;
+    int reflect = env_ssr && info_frame == frames, skin = env_sss && info_frame == frames;
     id<MTLTexture> z = ao_texture(0, MTLPixelFormatR32Float, hw, hh);
     struct ao_params a = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, view_proj.alpha,
                           view_proj.beta, view_proj.p00, view_proj.p11, env_ao_radius,
                           1 / (env_ao_radius * env_ao_radius), 0.2f * (float)hh, env_ao_strength};
-    if (env_ao || reflect) ao_pass(0, samples > 1, z, depth, nil, &a);
+    if (env_ao || reflect || env_fog || skin) ao_pass(0, samples > 1, z, depth, nil, &a);
     if (env_ao) {
         id<MTLTexture> raw = ao_texture(1, MTLPixelFormatR16Float, hw, hh);
         id<MTLTexture> soft = ao_texture(2, MTLPixelFormatRG32Float, hw, hh);
@@ -1869,7 +2449,7 @@ static void post_run(struct d3d_state *s)
         ao_pass(2, 0, soft, raw, z, &a);
         ao_result = soft, ao_result_params = a;
     }
-    if (!reflect && !env_sharpen) return;
+    if (!reflect && !env_sharpen && !env_tonemap && !env_hdr && !env_fog && !skin) return;
     post_base = ao_texture(3, color.pixelFormat, color.width, color.height);
     id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
     [blit copyFromTexture:color toTexture:post_base];
@@ -1877,14 +2457,18 @@ static void post_run(struct d3d_state *s)
     float sharpen = env_sharpen_strength < 0 ? 0 : env_sharpen_strength > 1 ? 1 : env_sharpen_strength;
     struct ssr_params p = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, view_proj.p00,
                            view_proj.p11, reflect ? env_ssr_strength : 0, env_sharpen ? sharpen : 0, 2000,
-                           (float)env_ssr_show};
-    post_ssr = post_base;  // bound but unread without reflections
+                           (float)env_ssr_show, env_ssr_fresnel, env_ssr_blur, (float)env_tonemap, env_tonemap_expand,
+                           0, 0};
+    post_ssr = post_aux = post_fog = post_skin = post_base;  // bound but unread without them
     if (reflect) {
         id<MTLTexture> raw = ao_texture(4, MTLPixelFormatRGBA16Float, hw, hh);
+        post_aux = ao_texture(6, SSR_AUX_FORMAT, hw, hh);
         post_ssr = ao_texture(5, MTLPixelFormatRGBA16Float, hw, hh);
-        ssr_pass(0, raw, z, info_texture(color, 1), post_base, &p);
-        ssr_pass(1, post_ssr, raw, z, nil, &p);
+        ssr_pass(0, raw, post_aux, z, info_texture(color, 1), post_base, &p);
+        ssr_pass(1, post_ssr, nil, raw, z, post_aux, &p);
     }
+    if (env_fog) fog_run(z, hw, hh, &p);
+    if (skin) skin_run(color, z, hw, hh, &p);
     post_params = p, post_result = 1;
 }
 
@@ -1900,8 +2484,11 @@ static void post_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int 
     [e setViewport:(MTLViewport){0, 0, color.width, color.height, 0, 1}];
     [e setScissorRect:(MTLScissorRect){0, 0, color.width, color.height}];
     [e setFragmentTexture:post_base atIndex:0];
-    [e setFragmentTexture:post_params.strength > 0 ? info_texture(color, 1) : post_base atIndex:1];
+    [e setFragmentTexture:post_params.strength > 0 || post_params.skin > 0 ? info_texture(color, 1) : post_base atIndex:1];
     [e setFragmentTexture:post_ssr atIndex:2];
+    [e setFragmentTexture:post_aux atIndex:3];
+    [e setFragmentTexture:post_fog atIndex:4];
+    [e setFragmentTexture:post_skin atIndex:5];
     [e setFragmentBytes:&post_params length:sizeof post_params atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     post_result = 0;
@@ -2097,6 +2684,11 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     if (enc_info) {
         k->info = !rs[27] && (rs[168] & 7) && !(ps->info.color_outputs & 2) ? 2 : 1;
         k->psv.reflection_info = k->info == 2;
+        // Characters: skinned, their vertices carrying blend weights or bone indices.
+        if (env_sss && k->info == 2 && s->vs)
+            for (int i = 0; i < 16; i++)
+                if ((vs->info.input_mask & (1u << i)) && (vs->info.input_usage[i] == 1 || vs->info.input_usage[i] == 2))
+                    k->psv.skin = 1;
     }
 
     id<MTLFunction> vf = shader_function(vs, &k->vsv), pf = shader_function(ps, &k->psv);
@@ -2180,7 +2772,7 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         }
         if (proj > 0 && aspect > proj * 1.01f) vp.clip_y = aspect / proj;
     }
-    if ((env_ao || env_ssr || env_sharpen) && perspective && to_back_buffer && fabsf(w_row[3]) > 1e-4f && s->viewport[2] == rtt.width &&
+    if ((env_ao || env_ssr || env_sharpen || env_tonemap || env_hdr || env_fog || env_sss) && perspective && to_back_buffer && fabsf(w_row[3]) > 1e-4f && s->viewport[2] == rtt.width &&
         s->viewport[3] == rtt.height && u2f(s->viewport[4]) == 0 && u2f(s->viewport[5]) >= 0.99f) {
         const float(*r)[4] = vs->ff_vertex ? vc : vc + 8;
         note_projection(r[0], r[1], r[2], r[3], vp.clip_y);
@@ -2614,11 +3206,33 @@ static void count_presented(id<CAMetalDrawable> drawable)
     }];
 }
 
+// HDR output (BL_HDR): hdr_present from `pic` into `out`, brightening what is still the
+// world view (`world`, nil for none).
+static void hdr_draw(id<MTLTexture> pic, id<MTLTexture> world, id<MTLTexture> out, int preview)
+{
+    float headroom = env_hdr_headroom > 0 ? env_hdr_headroom : layer ? bl_cocoa_edr_headroom() : 4;
+    LOG_ONCE("[metal] HDR: headroom %g\n", headroom);
+    float hp[8] = {headroom, env_hdr_peak, env_hdr_knee, world ? 1.0f : 0.0f, (float)preview};
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = out;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:ssr_pipeline(3, out.pixelFormat, 1, MTLPixelFormatInvalid)];
+    [e setFragmentTexture:pic atIndex:0];
+    [e setFragmentTexture:world ? world : pic atIndex:1];
+    [e setFragmentBytes:hp length:sizeof hp atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+}
+
 // The drawable is 10-bit with deep colour: a blit needs equal formats, a draw converts.
-static void copy_to_drawable(id<MTLTexture> t, id<CAMetalDrawable> drawable)
+static void copy_to_drawable(id<MTLTexture> t, id<MTLTexture> world, id<CAMetalDrawable> drawable)
 {
     end_pass();
-    if (t.pixelFormat == drawable.texture.pixelFormat) {
+    if (drawable.texture.pixelFormat == MTLPixelFormatRGBA16Float) {
+        hdr_draw(t, world, drawable.texture, 0);
+    } else if (t.pixelFormat == drawable.texture.pixelFormat) {
         id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
         [blit copyFromTexture:t toTexture:drawable.texture];
         [blit endEncoding];
@@ -2672,6 +3286,10 @@ void d3d_render_present(struct d3d_state *s)
     struct obj *bb = s->back_buffer;
     id<MTLTexture> back = bb ? target_texture(bb) : nil;
     if (back && frame_squeeze < 1) menu_bars(back, frame_squeeze);
+    id<MTLTexture> world = hdr_world_frame + 1 == frames && hdr_world && back && hdr_world.width == back.width &&
+                                   hdr_world.height == back.height
+                               ? hdr_world
+                               : nil;
     static float shown_squeeze = 1;
     if (frame_squeeze != shown_squeeze) {
         shown_squeeze = frame_squeeze;
@@ -2686,6 +3304,12 @@ void d3d_render_present(struct d3d_state *s)
         char path[1024];
         snprintf(path, sizeof path, "%s/frame_%lu.png", dir, frames);
         write_png(read_target(back), back.width, back.height, path);
+        if (env_hdr) {
+            id<MTLTexture> pv = ao_texture(8, MTLPixelFormatBGRA8Unorm, back.width, back.height);
+            hdr_draw(back, world, pv, 1);
+            snprintf(path, sizeof path, "%s/frame_%lu_hdr.png", dir, frames);
+            write_png(read_target(pv), back.width, back.height, path);
+        }
         id<MTLTexture> off = last_offscreen_target ? target_texture(last_offscreen_target) : nil;
         if (off && off.pixelFormat == MTLPixelFormatBGRA8Unorm) {
             snprintf(path, sizeof path, "%s/frame_%lu_rt.png", dir, frames);
@@ -2694,9 +3318,10 @@ void d3d_render_present(struct d3d_state *s)
     }
     if (layer && back) {
         @autoreleasepool {
+            layer_format();
             id<CAMetalDrawable> drawable = [layer nextDrawable];
             if (drawable && drawable.texture.width == back.width && drawable.texture.height == back.height) {
-                copy_to_drawable(back, drawable);
+                copy_to_drawable(back, world, drawable);
                 present(drawable);
             }
             next_frame();
@@ -2815,9 +3440,10 @@ void d3d_render_present_pixels(const void *pixels, uint32_t w, uint32_t h, int b
         write_png(read_target(screen), screen.width, screen.height, path);
     }
     @autoreleasepool {
+        layer_format();
         id<CAMetalDrawable> drawable = [layer nextDrawable];
         if (drawable && drawable.texture.width == sw && drawable.texture.height == sh) {
-            copy_to_drawable(screen, drawable);
+            copy_to_drawable(screen, nil, drawable);
             present(drawable);
         }
         next_frame();
