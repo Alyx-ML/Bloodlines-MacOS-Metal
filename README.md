@@ -70,6 +70,13 @@ Options (environment variables):
 | `BL_PAD_LOOK=n` | controller look speed, default 1400 |
 | `BL_DATA_DIR=dir` | where saves and settings go (`off` = the game folder) |
 
+Upscaled textures: export with `tools/tex_extract.py --map NAME`, put the upscaled PNG
+next to its export (an upscaler's `-suffix` on the name is fine), then run
+`tools/tex_pack.py`. It writes the upscaled textures to `build/hires/`, and the renderer
+draws each in place of the game's texture whose contents match the original exactly. The
+game's files are not touched: the game places wall and floor textures by their size, so
+only the GPU sees the larger ones.
+
 Controllers (Xbox, PlayStation, MFi) are mapped to the default key bindings; the
 layout is at the top of `runtime/bl_gamecontroller.m`. Debugging switches are
 listed at the top of `runtime/d3d9/metal_render.m`.

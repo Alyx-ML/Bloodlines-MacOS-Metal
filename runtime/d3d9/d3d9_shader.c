@@ -250,6 +250,68 @@ uint32_t d3d_shader_env_maps(const uint32_t *code)
     return sampled & ~vector;
 }
 
+// A source token read as it is: no modifier, no relative address, x and y unswizzled.
+static int plain_source(uint32_t t) { return !(t >> 24 & 0xF) && !(t & 0x2000) && (t >> 16 & 0xF) == 0x4; }
+
+int d3d_shader_sample_coord(const uint32_t *code, int stage)
+{
+    struct parser ps;
+    struct insn in;
+    char err[128];
+    int coord = -1;
+    if (start(&ps, code, err, sizeof err) || !ps.pixel) return -1;
+    while (next(&ps, &in) > 0) {
+        if (sampled_stage(&ps, &in) != stage) continue;
+        int k;
+        if (ps.major == 1 && ps.minor < 4) k = in.op == OP_TEX ? stage : -1;
+        else if (in.op != OP_TEX || (ps.major == 2 && in.control)) k = -1;  // texldp, texldb
+        else k = reg_type(in.p[1]) == REG_TEXTURE && plain_source(in.p[1]) ? (int)reg_num(in.p[1]) : -1;
+        if (k < 0 || (coord >= 0 && coord != k)) return -1;
+        coord = k;
+    }
+    return coord;
+}
+
+int d3d_shader_lightmap_coord(const uint32_t *code, int out, int lm, int off)
+{
+    struct parser ps;
+    struct insn in;
+    char err[128];
+    int kind = 0;
+    uint32_t is_off = 0;  // temporaries holding a copy of v<off>
+    if (start(&ps, code, err, sizeof err) || ps.pixel) return 0;
+    while (next(&ps, &in) > 0) {
+        if (in.op == OP_DCL || in.op == OP_DEF || in.op == OP_DEFI || in.op == OP_DEFB || !in.nparams) continue;
+        for (int i = 1; i < in.nparams; i++)
+            if (in.p[i] & 0x2000) return 0;  // relative addressing (SM2 inserts its token)
+        uint32_t d = in.p[0];
+        int dt = reg_type(d), dn = (int)reg_num(d);
+#define IS_IN(t, n) (reg_type(t) == REG_INPUT && (int)reg_num(t) == (n) && plain_source(t))
+#define IS_OFF(t) (off >= 0 && (IS_IN(t, off) || (reg_type(t) == REG_TEMP && reg_num(t) < 32 && \
+                                                     (is_off >> reg_num(t) & 1) && plain_source(t))))
+        if (dt == REG_TEMP && dn < 32) {
+            if (in.op == OP_MOV && IS_IN(in.p[1], off) && off >= 0) is_off |= 1u << dn;
+            else is_off &= ~(1u << dn);
+            continue;
+        }
+        if (dt != REG_TEXCRDOUT || dn != out) continue;
+        if (d >> 20 & 0xF) return 0;  // result modifier
+        int k = 0;
+        if (in.op == OP_MOV && IS_IN(in.p[1], lm)) k = 1;
+        else if (in.op == OP_ADD && ((IS_IN(in.p[1], lm) && IS_OFF(in.p[2])) || (IS_OFF(in.p[1]) && IS_IN(in.p[2], lm))))
+            k = 2;
+        else if (in.op == OP_MAD && IS_IN(in.p[3], lm) &&
+                 ((IS_OFF(in.p[1]) && reg_type(in.p[2]) == REG_CONST) ||
+                  (reg_type(in.p[1]) == REG_CONST && IS_OFF(in.p[2]))))
+            k = 2;
+#undef IS_OFF
+#undef IS_IN
+        if (!k || (kind && kind != k)) return 0;
+        kind = k;
+    }
+    return kind;
+}
+
 // --- code generation -------------------------------------------------------------
 
 struct gen {
@@ -452,6 +514,10 @@ static void sample(struct gen *g, uint32_t stage, const char *coord, const char 
         snprintf(buf, len, "bl_shadow_once(_sh, _shd, tex%u, smp%u, (%s).xy, in.pos, sp)", stage, stage, coord);
         return;
     }
+    if (g->v && stage < 8 && (g->v->lightmap & (1u << stage)) && k == D3D_TEX_2D) {
+        snprintf(buf, len, "bl_lightmap(tex%u, smp%u, bl_lr, (%s).xy)", stage, stage, coord);
+        return;
+    }
     if (g->white_base && stage == 0 && k == D3D_TEX_2D) {
         snprintf(buf, len, "float4(1.0, 1.0, 1.0, tex0.sample(smp0, (%s).xy%s).w)", coord, extra ? extra : "");
         return;
@@ -504,6 +570,31 @@ static const char *const header =
     "static inline bool bl_cmp(uint f, float a, float b) {\n"
     "    switch (f) { case 1: return false; case 2: return a < b; case 3: return a == b; case 4: return a <= b;\n"
     "    case 5: return a > b; case 6: return a != b; case 7: return a >= b; default: return true; }\n"
+    "}\n";
+
+// Lightmaps read smoothly (variant lightmap; metal_render.m, lightmaps): Catmull-Rom over
+// 4x4 texels, which passes through each texel (small shadows keep their depth, unlike a
+// B-spline's blur) without bilinear's creases, held within the four nearest texels so it
+// cannot ring. Every texel read is kept inside the surface's own rectangle of the page
+// (the rectangle of the texel the coordinate falls in; none known: bilinear), so no light
+// comes in from the surfaces packed next to it.
+static const char *const lightmap_msl =
+    "static float4 bl_lightmap(texture2d<float> t, sampler s, texture2d<ushort> lr, float2 uv) {\n"
+    "    float2 sz = float2(t.get_width(), t.get_height()), p = uv * sz;\n"
+    "    int4 r = int4(lr.read(uint2(clamp(p, float2(0.0), sz - 1.0))));\n"
+    "    if (r.z <= r.x) return t.sample(s, uv);\n"
+    "    float2 q = p - 0.5, f = q - floor(q);\n"
+    "    float2 w[4] = {f * (-0.5 + f * (1.0 - 0.5 * f)), 1.0 + f * f * (-2.5 + 1.5 * f),\n"
+    "                   f * (0.5 + f * (2.0 - 1.5 * f)), f * f * (-0.5 + 0.5 * f)};\n"
+    "    int2 b = int2(floor(q)) - 1, lo = r.xy, hi = r.zw - 1;\n"
+    "    float4 sum = 0.0, mn = INFINITY, mx = -INFINITY;\n"
+    "    for (int y = 0; y < 4; y++)\n"
+    "        for (int x = 0; x < 4; x++) {\n"
+    "            float4 c = t.read(uint2(clamp(b + int2(x, y), lo, hi)));\n"
+    "            sum += w[x].x * w[y].y * c;\n"
+    "            if ((x == 1 || x == 2) && (y == 1 || y == 2)) mn = min(mn, c), mx = max(mx, c);\n"
+    "        }\n"
+    "    return clamp(sum, mn, mx);\n"
     "}\n";
 
 // Soft shadows (variant shadow_receiver; metal_render.m, shadows): percentage-closer
@@ -1043,6 +1134,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
     if (g.ps.pixel && !g.info.color_outputs) g.info.color_outputs = 1;
     put(o, "%s", header);
     if (g.ps.pixel && v && v->shadow_receiver) put(o, "%s", shadow_msl);
+    if (g.ps.pixel && v && v->lightmap) put(o, "%s", lightmap_msl);
     if (!g.ps.pixel) {
         if (g.info.input_mask) put(o, "struct BLVSIn {\n");
         for (int i = 0; i < D3D_SHADER_MAX_INPUTS; i++) {
@@ -1139,6 +1231,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (detail && v->hair >= 2)
             put(o, ",\n                         depth2d<float> bl_hd [[texture(14)]]");
         if (v && v->shadow_receiver) put(o, ",\n                         constant BLShadowParams &sp [[buffer(2)]]");
+        if (v && v->lightmap) put(o, ",\n                         texture2d<ushort> bl_lr [[texture(13)]]");
         put(o, ") {\n");
         o->indent = 1;
         if (g.env) {
@@ -1189,7 +1282,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         for (int i = 0; i < 4; i++)
             if (g.info.color_outputs & (1u << i)) line(o, "out.c%d = oc%d;", i, i);
         // -1.25: shone here (ps_detail), so the skin pass does not add its own shine; -1.4:
-        // hair too, which the sharpening leaves alone (its fine strands turn to dark specks).
+        // hair, shone here too.
         if (skin)
             line(o, "out.c1 = float4(max(_l, 0.0), %s);",
                  detail && g.base_coord[0] ? (v->hair ? "-1.4" : "-1.25") : "-1.0");

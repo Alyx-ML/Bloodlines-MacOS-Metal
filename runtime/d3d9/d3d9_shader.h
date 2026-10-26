@@ -69,6 +69,10 @@ struct d3d_shader_variant {
     // Pixel: a shadow caster drawn into the atlas. Its alpha becomes 1 - depth, how near
     // to the light the caster is, which those lookups read.
     uint8_t shadow_caster;
+    // Pixel: samplers (bit n) that read a lightmap page (metal_render.m, lightmaps). Their
+    // reads become bl_lightmap, a smooth (Catmull-Rom) read kept inside the
+    // surface's rectangle of the page, which [[texture(13)]] holds for each of its texels.
+    uint8_t lightmap;
 };
 
 // Soft shadows from the atlas (variant shadow_receiver): the atlas is seen as 8x8 cells
@@ -90,6 +94,13 @@ struct d3d_shadow_params {
 // Pixel shader samplers that read a reflection cubemap: cube samplers whose result is
 // not used as a vector (normalisation cubemaps are read with _bx2).
 uint32_t d3d_shader_env_maps(const uint32_t *code);
+// Pixel: the texture coordinate t<n> every read of the stage uses as it is (no
+// projection, swizzle or arithmetic), or -1.
+int d3d_shader_sample_coord(const uint32_t *code, int stage);
+// Vertex: what output oT<out> is made from: 1 only ever a copy of input v<lm>; 2 v<lm>
+// plus v<off> (bump-mapped lightmaps: the page's copies side by side), scaled or not by
+// a constant; 0 anything else.
+int d3d_shader_lightmap_coord(const uint32_t *code, int out, int lm, int off);
 // Returns 0 on success, else fills err.
 int d3d_shader_parse(const uint32_t *code, struct d3d_shader_info *info, char *err, int errlen);
 // MSL source (malloc'd) with entry point bl_main; NULL and err on failure.

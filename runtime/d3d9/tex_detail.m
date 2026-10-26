@@ -249,7 +249,8 @@ static id<MTLTexture> load_color(id<MTLDevice> dev, const char *rel)
     return load_rgba(dev, path);
 }
 
-static id<MTLTexture> load_rgba(id<MTLDevice> dev, const char *path)
+// RGBA8 pixels of a PNG (malloc'd), or NULL.
+static uint8_t *load_pixels(const char *path, size_t *pw, size_t *ph)
 {
     NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
     CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
@@ -265,10 +266,17 @@ static id<MTLTexture> load_rgba(id<MTLDevice> dev, const char *path)
                         ? CGDataProviderCopyData(CGImageGetDataProvider(img))
                         : NULL;
     CGImageRelease(img);
-    if (!raw) return nil;
+    if (!raw) return NULL;
     uint8_t *px = malloc(w * h * 4);
     for (size_t y = 0; y < h; y++) memcpy(px + y * w * 4, CFDataGetBytePtr(raw) + y * row, w * 4);
     CFRelease(raw);
+    *pw = w, *ph = h;
+    return px;
+}
+
+// A mipmapped texture of RGBA8 pixels (which it overwrites with the smaller levels).
+static id<MTLTexture> make_rgba(id<MTLDevice> dev, uint8_t *px, size_t w, size_t h)
+{
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                     width:w height:h mipmapped:YES];
     td.usage = MTLTextureUsageShaderRead;
@@ -293,7 +301,60 @@ static id<MTLTexture> load_rgba(id<MTLDevice> dev, const char *path)
                 }
         pw = lw, ph = lh;
     }
+    return t;
+}
+
+static id<MTLTexture> load_rgba(id<MTLDevice> dev, const char *path)
+{
+    size_t w, h;
+    uint8_t *px = load_pixels(path, &w, &h);
+    if (!px) return nil;
+    id<MTLTexture> t = make_rgba(dev, px, w, h);
     free(px);
+    return t;
+}
+
+// The mean colour of a picture's solid pixels (alpha over 200); 0 without any.
+static int solid_mean(const uint8_t *px, size_t n, double mean[3])
+{
+    double sum[3] = {0};
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++)
+        if (px[i * 4 + 3] > 200) k++, sum[0] += px[i * 4], sum[1] += px[i * 4 + 1], sum[2] += px[i * 4 + 2];
+    for (int c = 0; c < 3; c++) mean[c] = k ? sum[c] / (double)k : 0;
+    return k > 0;
+}
+
+// The game's hair under strips, in their colour: its upscaled texture (path) lifted where
+// it is darker than HAIR_BASE_SHADE of the strips' mean colour, to that (keeping some of
+// its own variation), and left alone where lighter (the fringe's locks). The game's own
+// (Jeanette's pigtail cores and scalp, about a third as bright as the strips) showed as
+// black between strips and along their edges.
+#define HAIR_BASE_SHADE 0.8
+static id<MTLTexture> hair_base_color(id<MTLDevice> dev, const char *path, const char *strips)
+{
+    size_t w, h, sw, sh;
+    uint8_t *px = load_pixels(path, &w, &h), *sp = load_pixels(strips, &sw, &sh);
+    double want[3], have[3];
+    id<MTLTexture> t = nil;
+    if (px && sp && solid_mean(sp, sw * sh, want) && solid_mean(px, w * h, have)) {
+        double lum = (have[0] + have[1] + have[2]) / 3;
+        size_t lifted = 0;
+        for (size_t i = 0; i < w * h; i++) {
+            uint8_t *q = px + i * 4;
+            double l = (q[0] + q[1] + q[2]) / 3.0, var = lum > 1 ? fmin(l / lum, 1.5) : 1;
+            int up = 0;
+            for (int c = 0; c < 3; c++) {
+                double f = HAIR_BASE_SHADE * want[c] * (0.85 + 0.15 * var);
+                if (q[c] < f) q[c] = (uint8_t)fmin(f + 0.5, 255), up = 1;
+            }
+            lifted += up;
+        }
+        fprintf(stderr, "[detail] hair under strips: %.0f%% of its texture lifted to the strips' colour\n",
+                100.0 * (double)lifted / (double)(w * h));
+        t = make_rgba(dev, px, w, h);
+    }
+    free(px), free(sp);
     return t;
 }
 
@@ -394,6 +455,9 @@ const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, const void *key, ui
                 if (nv) {
                     snprintf(u, path + sizeof path - u, "_hair.png");
                     m->tex = load_rgba(dev, path);
+                    char base[1600];
+                    snprintf(base, sizeof base, "%.*s_u.png", (int)(u - path), path);
+                    if (m->tex) m->base_color = hair_base_color(dev, base, path);
                     if (!m->tex) free(m), m = NULL;
                 }
             }

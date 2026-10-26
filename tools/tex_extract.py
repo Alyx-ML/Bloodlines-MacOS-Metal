@@ -11,14 +11,24 @@ picture) and a .ttz (the mipmaps, zlib-compressed, smallest first); the largest 
 the end of the .ttz.
 
     python3 tools/tex_extract.py [--game DIR] [--out DIR] [--match SUBSTRING ...]
+    python3 tools/tex_extract.py --map sm_asylum_1 [--game DIR] [--out DIR]
+    python3 tools/tex_extract.py --list build/logs/not_upscaled.txt --map sm_asylum_1
 
-Default: the character textures (materials/models/character/). Writes <out>/<path>.png
-and <out>/index.json (name, width, height, and an 8x8 colour signature the renderer uses
-to recognise the texture once the game has loaded it).
+Default: the character textures (materials/models/character/). With --map, the colour
+textures ($basetexture, $basetexture2) of everything a map shows apart from characters
+and weapons: its brushes (the texture data lump; tool textures left out) and its models,
+static props (the game lump's sprp) and entities (the entity lump's "model" keys), whose
+materials are each texture name in the .mdl looked up in each of its material folders.
+With --list, the textures named in a file, one per line: the renderer's list of what it
+drew without an upscale (runtime/d3d9/tex_hires.m), characters and weapons left out. They
+are added to the folder: exports already there and the rest of index.json are kept.
+Writes <out>/<path>.png and <out>/index.json (name, width, height, and an 8x8 colour
+signature the renderer uses to recognise the texture once the game has loaded it).
 """
 import argparse
 import json
 import os
+import re
 import struct
 import sys
 import zlib
@@ -157,15 +167,88 @@ def signature(rgba):
     return a.reshape(8, h // 8, 8, w // 8, 3).mean((1, 3)).round(4).reshape(-1).tolist()
 
 
+def exists(game, idx, name):
+    return name in idx or os.path.exists(os.path.join(game, "Unofficial_Patch", name))
+
+
+def map_textures(game, idx, name):
+    """The texture paths (materials/..., no extension) of a map's colour textures."""
+    d = read(game, idx, "maps/%s.bsp" % name)
+    if not d or d[:4] != b"VBSP":
+        sys.exit("no maps/%s.bsp" % name)
+    lump = [struct.unpack_from("<ii", d, 8 + 16 * i) for i in range(64)]
+    # Brushes. Materials under maps/<name>/ are the compiler's copies with cubemaps baked
+    # in; the originals are listed too.
+    o, n = lump[43]
+    so, sn = lump[44]
+    strs = d[o:o + n]
+    mats = set()
+    for x in struct.unpack_from("<%di" % (sn // 4), d, so):
+        m = strs[x:strs.index(b"\0", x)].decode("latin1").lower().replace("\\", "/")
+        if not m.startswith(("maps/", "tools/")):
+            mats.add(m)
+    # Models: static props and entities.
+    models = set()
+    go = lump[35][0]
+    for i in range(struct.unpack_from("<i", d, go)[0]):
+        gid, _, _, fo, _ = struct.unpack_from("<4sHHii", d, go + 4 + 16 * i)
+        if gid == b"prps":
+            for k in range(struct.unpack_from("<i", d, fo)[0]):
+                models.add(d[fo + 4 + 128 * k:fo + 132 + 128 * k].split(b"\0")[0].decode("latin1").lower())
+    o, n = lump[0]
+    models |= {m.lower() for m in re.findall(r'"model"\s+"(models/[^"]+\.mdl)"', d[o:o + n].decode("latin1"))}
+    for m in sorted(models):
+        if m.startswith(("models/character/", "models/weapons/")):
+            continue
+        md = read(game, idx, m)
+        if not md:
+            continue
+        strings = {s.decode("latin1").lower() for s in re.findall(rb"([a-zA-Z0-9_/\\.-]+)\0", md)}
+        dirs = {s.replace("\\", "/") for s in strings if s.endswith(("/", "\\"))}
+        for dr in dirs:
+            for s in strings:
+                if exists(game, idx, "materials/%s%s.vmt" % (dr, s)):
+                    mats.add(dr + s)
+    textures = set()
+    for m in mats:
+        vmt = read(game, idx, "materials/%s.vmt" % m)
+        if not vmt:
+            continue
+        for t in re.findall(r'"?\$basetexture2?"?\s+"?([^"\s]+)', vmt.decode("latin1"), re.I):
+            textures.add("materials/" + t.lower().replace("\\", "/").lstrip("/"))
+    return sorted(textures)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--game", default=os.path.abspath(os.path.join(HERE, "..", "..")))
-    ap.add_argument("--out", default=os.path.join(HERE, "..", "build", "textures", "characters"))
+    ap.add_argument("--out")
     ap.add_argument("--match", nargs="*", default=["materials/models/character/"])
+    ap.add_argument("--map")
+    ap.add_argument("--list")
     args = ap.parse_args()
+    if not args.out:
+        args.out = os.path.join(HERE, "..", "build", "textures", "maps/" + args.map if args.map else
+                                "drawn" if args.list else "characters")
     idx = vpk_index(args.game)
-    names = sorted(k[:-4] for k in idx if k.endswith(".tth") and any(m in k for m in args.match))
-    index, skipped = [], 0
+    index, skipped, kept = [], 0, 0
+    if args.list:
+        with open(args.list) as f:
+            names = sorted({ln.strip().lower() for ln in f if ln.strip()} - {""})
+        names = [n for n in names if not n.startswith(("materials/models/character/", "materials/models/weapons/"))]
+        try:
+            with open(os.path.join(args.out, "index.json")) as f:
+                index = json.load(f)
+        except FileNotFoundError:
+            pass
+        have = {e["name"] for e in index}
+        kept = len([n for n in names if n[len("materials/"):] in have])
+        names = [n for n in names if n[len("materials/"):] not in have]
+    elif args.map:
+        names = map_textures(args.game, idx, args.map)
+    else:
+        names = sorted(k[:-4] for k in idx if k.endswith(".tth") and any(m in k for m in args.match))
+    added = 0
     for n in names:
         tth, ttz = read(args.game, idx, n + ".tth"), read(args.game, idx, n + ".ttz")
         img = texture(tth, ttz) if tth and ttz else None
@@ -177,9 +260,11 @@ def main():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         Image.fromarray(img, "RGBA").save(path)
         index.append({"name": rel, "w": int(img.shape[1]), "h": int(img.shape[0]), "sig": signature(img)})
+        added += 1
+    os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "index.json"), "w") as f:
         json.dump(index, f)
-    print(f"{len(index)} textures written to {os.path.abspath(args.out)} ({skipped} skipped)")
+    print(f"{added} textures written to {os.path.abspath(args.out)} ({skipped} skipped, {kept} already there)")
 
 
 if __name__ == "__main__":

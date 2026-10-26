@@ -34,6 +34,7 @@ struct bl_hair_mesh {
     uint32_t nbase;
     const float *base;  // nbase x xyz
     id<MTLTexture> tex;
+    id<MTLTexture> base_color;  // with strips: the game's hair under them in their colour, or nil
 };
 
 // The hair mesh for the texture `key` (w x h), or NULL; after bl_detail_normal saw it.

@@ -1776,3 +1776,62 @@ player's machine from their own game files (`BL_HAIR_MESH`, default on; 0 off).
 - Sharpening (`BL_SHARPEN`, its check box and the pass in post_apply) is removed. That
   was another session's change; it goes in with these because the effect list, the
   check boxes and post_apply are built on it.
+
+## 2026-10-26: baked light read smoothly (BL_LIGHTMAP_SMOOTH); prop smoothing off
+
+- Prop smoothing (`BL_PROP_TESS`) is now off by default: in the user's own play it spoiled
+  the textures of many props. A per-model approach made offline (Blender) and checked by
+  eye is the proposed replacement; nothing of it is built yet.
+- The map's lightmaps sit in shared pages, each surface's rectangle packed edge to edge
+  (sm_asylum_1: one 512x256 page). Bilinear filtering shows their low resolution as
+  blocks and steps. `metal_render.m` `lightmap_for` finds the draws that read a page (a
+  one-level 32-bit texture sampled with TEXCOORD1 as it is, which
+  `d3d_shader_sample_coord` and `d3d_shader_lightmap_coord` check in the shaders' bytecode),
+  joins the triangles that share lightmap coordinates into surfaces, and notes each
+  surface's rectangle on every texel of it in an RGBA16Uint texture the page's size (once
+  per vertex and index range). The shaders' reads of the page become `bl_lightmap`
+  (d3d9_shader.c): Catmull-Rom over 4x4 texels, clamped to the four nearest so it does not
+  ring, every read kept inside the surface's rectangle. A first try with a cubic B-spline
+  blurred away small shadows (the bar stools' on the counter front) and was replaced.
+- `BL_LIGHTMAP_SMOOTH_AT=n` (debugging) turns it on from frame n, for a before and after
+  in one run.
+- Verified: headless sm_asylum_1, frames 780 (off) and 840 (on) of one run: 3,333
+  surfaces on the page, 97 texels claimed by two (read bilinear); the counter front's
+  shadows keep their depth with smoother edges; the floor barely changes (its glow is
+  mostly reflection).
+- Bump-mapped surfaces read three copies of their lightmap, one per bump direction, side
+  by side on the page after the flat one: their vertex shaders add TEXCOORD2, the step to
+  the next copy, scaled by a constant, to TEXCOORD1 (`d3d_shader_lightmap_coord` checks
+  this pattern). Their rectangles are noted for all four copies, and every sampler of the
+  draw that reads the page is smoothed. `BL_DRAW_DUMP=lightmap` dumps, and the log names
+  once per pair of shaders, any draw still reading a known page plain.
+- Verified: headless sm_asylum_1, frames 780 (off) and 840 (on) of one run: no draw read
+  the page plain after the switch; the bump-mapped frieze above the bar is smoother with
+  no seams or wrong colours. Not verified: other maps, a window run, frame rate.
+- The smoother lightmaps kept reading surfaces again: in a long window run the surface
+  count climbed from about 9,000 to 382,000, more than the page has texels. Two causes in
+  `lightmap_for`. Some world geometry is drawn from dynamic buffers that are filled
+  somewhere new each frame, so a key made of the buffer, the range and a sample of its
+  indices was new every time. And the key's padding was never cleared, so equal keys
+  could still compare unequal. Ranges of static buffers keep the old key, now with its
+  padding cleared. Ranges of dynamic buffers are keyed by a hash of the lightmap
+  coordinates read from them. A page's set of known draws is emptied if it ever reaches
+  65,536; reading a draw again does no harm. A surface now counts only when it notes a
+  texel nothing noted before, and the log adds how many draws were read.
+- Built; not run. A window run's log should show the surfaces and draws-read counts
+  levelling off once the map has been looked around.
+
+## 2026-10-26: hair under-layer lifted
+
+- Jeanette's hair cards sit over the game's own hair triangles, whose texture
+  (`jeanette_hair_1`) is much darker than the cards (mean colour about 67,52,36 against
+  180,143,105). Where the cards thin out, that dark core showed through as black streaks.
+  `tex_detail.m` `hair_base_color` now makes a copy of the base texture in which texels
+  darker than 0.8 of the cards' mean colour are lifted up to it (keeping a little of
+  their own variation); lighter texels, such as the fringe locks, are left as they are.
+  The renderer draws the base triangles with that copy. A first try that scaled the whole
+  texture turned the fringe almost white and was replaced.
+- Verified: headless sm_asylum_1, Jeanette close up: 80% of the base texture's texels
+  lifted; fewer black streaks at the pigtail ends, fringe unchanged. The dark-speck count
+  is not a reliable measure here (her pose differs between runs). Not verified: a window
+  run.

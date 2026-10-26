@@ -19,7 +19,8 @@
 //   BL_DRAW_STATS=n[+k]      log the draws of frame n (and the k-1 frames after it)
 //   BL_DRAW_DUMP=n[,m...]    log the vertices, constants and shaders of draws n, m...; with "p<count>[:k]",
 //                            of the k-th (default first) draw in frame BL_DRAW_STATS with that many primitives
-//                            (with BL_DUMP_DIR, its 32-bit textures are also written as PNGs)
+//                            (with BL_DUMP_DIR, its 32-bit textures are also written as PNGs); with
+//                            "lightmap", of the first draw in that frame reading a lightmap page unsmoothed
 //   BL_TEX_STATS=1           with BL_DRAW_STATS, log the mean brightness of each 32-bit texture drawn
 //   BL_SHADOW_SHOW=1         draw shadow receivers opaque instead of darkening
 //   BL_FPS_MAX=n             with a window, present at most n frames a second (default 60, 0 = no cap)
@@ -59,13 +60,16 @@
 //   BL_TAA_JITTER=n          the temporal anti-aliasing's offset (pixels, default 0.5; see the TAA
 //                            section), negative flips it for MetalFX
 //   BL_GPU_STATS=1          log the mean GPU time per frame every 100 frames
-//   BL_PROP_TESS=0|1         props split and rounded like characters (BL_TESS per edge; default on)
+//   BL_PROP_TESS=0|1         props split and rounded like characters (BL_TESS per edge; default off)
+//   BL_LIGHTMAP_SMOOTH=0|1   the map's baked light read smoothly (see the lightmaps section; default on)
 //   BL_BLOOM=0|1|show        bright lights glow (see the bloom section), over the options' check box
 //                            (on until unticked); BL_BLOOM_STRENGTH (default 0.35), BL_BLOOM_THRESHOLD (0.6)
 //   BL_EXPOSURE=0|1|show     eye adaptation: the view brightens in the dark and dims in bright places
 //                            (see the bloom section), over the options' check box (on until unticked);
 //                            BL_EXPOSURE_RANGE (lo,hi: 0.8,1.3)
 //   BL_BLOOM_AT=n            debugging: bloom and eye adaptation only from frame n
+//   BL_LIGHTMAP_SMOOTH_AT=n  debugging: only from frame n (before and after in one run)
+//   BL_UPSCALE=0            the game's own colour textures: no upscales (characters, build/hires)
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
@@ -81,6 +85,7 @@
 
 #include "bl_bsp.h"
 #import "tex_detail.h"
+#import "tex_hires.h"
 #include "prop_smooth.h"
 #include "bl_cocoa.h"
 #include "bl_win32.h"
@@ -102,11 +107,13 @@ static float env_hair_root = 1.0f;    // BL_HAIR_ROOT: hair darker where it lies
 static float env_hair_glow = 1.0f;    // BL_HAIR_GLOW: light through hair from behind
 static int env_hair_mesh = 1;         // BL_HAIR_MESH=0: the game's own hair, not the strips made for it
 static int env_tess = 3;            // BL_TESS: characters' triangles split this many times per edge, rounded (0 off)
-static int env_prop_tess = 1;       // BL_PROP_TESS: props' too (prop_swap_for)
+static int env_prop_tess = 0;       // BL_PROP_TESS: props' too (prop_swap_for)
+static int env_lightmap_smooth = 1;  // BL_LIGHTMAP_SMOOTH (lightmap_for)
+static long env_lightmap_at;         // BL_LIGHTMAP_SMOOTH_AT
 static int env_bloom, env_bloom_show, env_exposure, env_exposure_show;  // BL_BLOOM, BL_EXPOSURE (the effects table)
 static long env_bloom_at;  // BL_BLOOM_AT
 static float env_bloom_strength = 0.35f, env_bloom_threshold = 0.6f, env_exposure_lo = 0.8f, env_exposure_hi = 1.3f;
-static int env_upscale_off;  // BL_UPSCALE=0: the game's own colour textures for characters
+static int env_upscale_off;  // BL_UPSCALE=0: the game's own colour textures (characters, tex_hires.h)
 static int env_sss_eyes = 1;  // BL_SSS_EYES=0: no eye highlights
 static int enc_info;                       // and whether it draws reflection info (info_texture)
 #define INFO_FORMAT MTLPixelFormatRGBA16Float
@@ -436,15 +443,24 @@ static id<MTLTexture> texture_of(struct obj *tex)
     }
     if (tex->dirty && !rt) {
         uint32_t faces = tex->type == OBJ_CUBETEXTURE ? 6 : 1;
+        int top = tex->subs[0]->dirty;
         for (uint32_t f = 0; f < faces; f++)
             for (uint32_t l = 0; l < tex->levels; l++) {
                 struct obj *s = tex->subs[f * tex->levels + l];
                 if (s->dirty) upload_level(t, tf, s, f, l);
             }
         tex->dirty = 0;
+        // An upscaled texture for what the game put in the top level (not for textures it
+        // rewrites as it goes, D3DUSAGE_DYNAMIC).
+        if (top && tex->type == OBJ_TEXTURE && !(tex->usage & 0x200) && !env_upscale_off) {
+            if (tex->hires) CFRelease(tex->hires);
+            id<MTLTexture> h = bl_hires_texture(mtl, tex->width, tex->height, tex->format, bl_g2h(tex->subs[0]->mem),
+                                                tex->subs[0]->pitch);
+            tex->hires = h ? (__bridge_retained void *)h : NULL;
+        }
     }
     tex->used = 1;
-    return t;
+    return tex->hires ? (__bridge id<MTLTexture>)tex->hires : t;
 }
 
 // Render target surfaces: their own texture, or a level of the texture they belong to.
@@ -502,6 +518,10 @@ struct element { uint16_t stream, offset; uint8_t type, method, usage, index; };
     struct d3d_shader_variant early_variant;
     id early_function;  // id<MTLFunction> or NSNull, written by the background block
     _Atomic int early_state;  // 0 queued, 1 compiling in the background, 2 taken by a draw
+    // For lightmap_for: pixel, the coordinate t<n> each of stages 0-7 reads as it is (-1
+    // none); vertex, what each oT<n> is made from (d3d_shader_sample_coord, _lightmap_coord).
+    int8_t lm_reg[8];
+    int lm_known;
 }
 @end
 @implementation BLShader
@@ -1098,6 +1118,8 @@ static void ensure_device(void)
     if (getenv("BL_HAIR_FADE")) env_hair_fade = (float)atof(getenv("BL_HAIR_FADE"));
     if (getenv("BL_TESS")) env_tess = atoi(getenv("BL_TESS"));
     if (getenv("BL_PROP_TESS")) env_prop_tess = atoi(getenv("BL_PROP_TESS"));
+    if (getenv("BL_LIGHTMAP_SMOOTH")) env_lightmap_smooth = atoi(getenv("BL_LIGHTMAP_SMOOTH"));
+    if (getenv("BL_LIGHTMAP_SMOOTH_AT")) env_lightmap_at = atol(getenv("BL_LIGHTMAP_SMOOTH_AT"));
     if (getenv("BL_BLOOM_AT")) env_bloom_at = atol(getenv("BL_BLOOM_AT"));
     if (getenv("BL_BLOOM_STRENGTH")) env_bloom_strength = (float)atof(getenv("BL_BLOOM_STRENGTH"));
     if (getenv("BL_BLOOM_THRESHOLD")) env_bloom_threshold = (float)atof(getenv("BL_BLOOM_THRESHOLD"));
@@ -1258,8 +1280,10 @@ static void flush_clears(struct d3d_state *s)
     end_pass();
 }
 
+static void lightmap_forget(struct obj *o);
 void d3d_render_free(struct obj *o)
 {
+    if (o->hires) CFRelease(o->hires), o->hires = NULL;
     if (!o->gpu) return;
     id t = (__bridge_transfer id)o->gpu;  // released when t goes out of scope
     (void)t;
@@ -1268,6 +1292,7 @@ void d3d_render_free(struct obj *o)
     if (clear_color_target == o) clear_color_target = NULL;
     if (clear_depth_target == o) clear_depth_target = NULL;
     if (shadow_atlas == o) shadow_atlas = NULL;
+    lightmap_forget(o);
 }
 
 // Full screen when the game asks for it (no -window), unless BL_FULLSCREEN says otherwise.
@@ -3719,8 +3744,13 @@ struct hair_swap {
     id<MTLTexture> tex;
     id<MTLBuffer> base_ib;  // with strips: the game's triangles drawn under them (nil: all)
     uint32_t nbase_idx;
+    id<MTLTexture> base_tex;  // and their colour texture, matched to the strips (nil: the game's)
 };
 static struct hair_swap *hair_swap;  // the draw's, while d3d_render_draw draws it
+// The lightmap page the draw reads smoothly (lightmap_for), and the samplers (bit n) reading it.
+static struct lightmap_page *lightmap_draw;
+static uint32_t lightmap_stages;
+static id<MTLTexture> lightmap_rects(struct lightmap_page *p);
 
 // Hair's two passes (solid, then the blended see-through rest), except for strips: their
 // blended pass, drawn in no order across thousands of layered cards, shows the dark
@@ -3888,6 +3918,7 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     }
     k->write_mask = rs[168] & 15;
     shadow_variant(s, ps, k);
+    if (lightmap_draw && ps->code) k->psv.lightmap = (uint8_t)lightmap_stages;
     k->point = type == 1;
     for (int b = 0; b < 16; b++) k->stride[b] = (uint16_t)s->stream_stride[b];
     k->stride[16] = 16;
@@ -3921,6 +3952,7 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
                                           t0->subs[0]->pitch, &color);
             detail_color = env_upscale_off ? nil : color;
             if (hair_swap && hair_swap->tex) detail_color = hair_swap->tex;
+            if (hair_swap && !hair_swap->vb && hair_swap->base_tex && !env_upscale_off) detail_color = hair_swap->base_tex;
             // Hair: alpha-tested and without a map of its own (hair textures get none),
             // fading near what was drawn before it once hair_before_draw has its depth.
             if (!detail_map) {
@@ -4091,6 +4123,7 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     if (k->psv.detail) detail_bind(e);
     if (k->psv.hair >= 2) [e setFragmentTexture:hair_depth atIndex:14];
     shadow_draw(s, e, k, vs->ff_vertex ? (const float(*)[4])vc : (const float(*)[4])vc + 8, &vp);
+    if (k->psv.lightmap) [e setFragmentTexture:lightmap_rects(lightmap_draw) atIndex:13];
 
     for (uint32_t i = 0; i < D3D_SHADER_MAX_SAMPLERS; i++) {
         if (!(ps->info.sampler_mask & (1u << i))) continue;
@@ -4331,10 +4364,284 @@ static struct hair_swap *hair_swap_for(struct d3d_state *s, struct element *el, 
         fprintf(stderr, "[metal] hair: %u of the game's %u triangles kept under the strips\n", nk / 3, count);
     }
     free(ids), free(mp);
-    hs->vb = out, hs->nidx = m->nidx, hs->tex = m->tex;
+    hs->vb = out, hs->nidx = m->nidx, hs->tex = m->tex, hs->base_tex = m->base_color;
     hs->ib = [mtl newBufferWithBytes:m->idx length:(NSUInteger)m->nidx * 4 options:MTLResourceStorageModeShared];
     hair_swaps[kd] = [NSValue valueWithPointer:hs];
     return hs;
+}
+
+// --- lightmaps --------------------------------------------------------------------
+//
+// The map's baked light: each surface reads its own rectangle of a shared lightmap page,
+// low resolution and packed edge to edge, so bilinear filtering shows the texels as
+// blocks and steps. With BL_LIGHTMAP_SMOOTH (default on) the shaders read it with a cubic
+// (Catmull-Rom, d3d9_shader.c bl_lightmap) whose reads stay inside the surface's rectangle.
+// The rectangles come from the draws: a sampler reading a one-level 32-bit texture with
+// the vertices' TEXCOORD1 as it is (copied through by the vertex shader) reads a page, as
+// does one reading TEXCOORD1 plus a multiple of TEXCOORD2 (bump-mapped surfaces: their
+// flat lightmap and one per bump direction side by side, TEXCOORD2 apart),
+// the triangles joined by shared lightmap coordinates are one surface, and the bounds
+// of those coordinates its rectangle. Each range of static buffers is read once, and so
+// is each set of coordinates drawn from dynamic ones (Source builds some of the world in
+// a dynamic buffer every frame, somewhere new each time); every texel of the rectangle notes it (x0, y0, x1, y1 in texels, in an RGBA16Uint
+// texture the size of the page; 0 where no surface is known yet, or two disagree).
+struct lightmap_page {
+    uint32_t w, h;
+    uint16_t *rects;            // 4 per texel
+    id<MTLTexture> gpu;
+    uint32_t dirty[4];          // rows and columns changed since the upload: x0, y0, x1, y1
+    NSMutableSet<NSData *> *ranges;  // draws already read (emptied at LIGHTMAP_MAX_RANGES)
+};
+#define LIGHTMAP_MAX_RANGES 65536
+static NSMutableDictionary<NSValue *, NSValue *> *lightmap_pages;  // by page (struct obj *)
+static uint32_t lightmap_surfaces, lightmap_clashes;  // surfaces that noted a new texel
+static uint32_t lightmap_reads;  // draws whose coordinates were read
+static int lightmap_missed;  // the draw reads a page with a sampler bl_lightmap does not (BL_DRAW_DUMP=lightmap)
+
+// Debugging: draws that read a known page plain, logged once per pair of shaders.
+static void lightmap_note_missed(struct d3d_state *s)
+{
+    lightmap_missed = 0;
+    if (!lightmap_pages.count || !s->ps) return;
+    BLShader *ps = shader_of(s->ps);
+    for (int i = 0; i < 8; i++)
+        if ((ps->info.sampler_mask & (1u << i)) && s->texture[i] && !(lightmap_draw && (lightmap_stages >> i & 1)) &&
+            lightmap_pages[[NSValue valueWithPointer:s->texture[i]]])
+            lightmap_missed = 1;
+    static uint32_t seen[64][2];
+    static int nseen;
+    if (!lightmap_missed || nseen == 64) return;
+    uint32_t vg = s->vs ? s->vs->guest : 0, pg = s->ps->guest;
+    for (int i = 0; i < nseen; i++)
+        if (seen[i][0] == vg && seen[i][1] == pg) return;
+    seen[nseen][0] = vg, seen[nseen][1] = pg, nseen++;
+    fprintf(stderr, "[metal] lightmap read plain: frame %lu draw %lu vs %#x ps %#x\n", frames, draws + 1, vg, pg);
+}
+
+static void lightmap_forget(struct obj *o)
+{
+    NSValue *key = [NSValue valueWithPointer:o];
+    struct lightmap_page *p = lightmap_pages ? [lightmap_pages[key] pointerValue] : NULL;
+    if (!p) return;
+    [lightmap_pages removeObjectForKey:key];
+    if (lightmap_draw == p) lightmap_draw = NULL;
+    free(p->rects);
+    p->gpu = nil, p->ranges = nil;
+    free(p);
+}
+
+static id<MTLTexture> lightmap_rects(struct lightmap_page *p)
+{
+    if (!p->gpu) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Uint
+                                                                                     width:p->w height:p->h mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModeShared;
+        p->gpu = [mtl newTextureWithDescriptor:d];
+        p->dirty[0] = p->dirty[1] = 0, p->dirty[2] = p->w, p->dirty[3] = p->h;
+    }
+    if (p->dirty[2] > p->dirty[0]) {
+        uint32_t x = p->dirty[0], y = p->dirty[1], w = p->dirty[2] - x, h = p->dirty[3] - y;
+        [p->gpu replaceRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0
+                    withBytes:p->rects + ((size_t)y * p->w + x) * 4 bytesPerRow:(NSUInteger)p->w * 8];
+        p->dirty[0] = p->w, p->dirty[1] = p->h, p->dirty[2] = p->dirty[3] = 0;
+    }
+    return p->gpu;
+}
+
+// A vertex shader's input with this TEXCOORD index, or -1.
+static int texcoord_input(BLShader *sh, int index)
+{
+    for (int i = 0; i < 16; i++)
+        if ((sh->info.input_mask & (1u << i)) && sh->info.input_usage[i] == 5 && sh->info.input_index[i] == index)
+            return i;
+    return -1;
+}
+
+static int lightmap_reg(BLShader *sh, int n)
+{
+    if (!sh->lm_known) {
+        for (int i = 0; i < 8; i++)
+            sh->lm_reg[i] = (int8_t)(sh->info.pixel ? d3d_shader_sample_coord(sh->code, i)
+                                                    : d3d_shader_lightmap_coord(sh->code, i, texcoord_input(sh, 1),
+                                                                                texcoord_input(sh, 2)));
+        sh->lm_known = 1;
+    }
+    return sh->lm_reg[n];
+}
+
+static uint64_t lightmap_uv_key(const float *uv)
+{
+    uint32_t u, v;
+    memcpy(&u, &uv[0], 4), memcpy(&v, &uv[1], 4);
+    return (uint64_t)u << 32 | v;
+}
+static int lightmap_corner_cmp(const void *a, const void *b)
+{
+    uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0];
+    return x < y ? -1 : x > y;
+}
+static uint32_t lightmap_root(uint32_t *up, uint32_t i)
+{
+    while (up[i] != i) i = up[i] = up[up[i]];
+    return i;
+}
+
+static struct lightmap_page *lightmap_for(struct d3d_state *s, struct element *el, int nel, uint32_t start,
+                                          uint32_t count, int32_t base_vertex)
+{
+    if (!env_lightmap_smooth || (long)frames < env_lightmap_at || !s->vs || !s->ps || !s->indices || !count) return NULL;
+    BLShader *vs = shader_of(s->vs), *ps = shader_of(s->ps);
+    if (!vs->code || !ps->code) return NULL;
+    // TEXCOORD1 the lightmap coordinates, TEXCOORD2 (bump-mapped) the step to the next of
+    // the surface's copies side by side on the page.
+    int uv_el = -1, off_el = -1;
+    for (int i = 0; i < nel; i++)
+        if (el[i].usage == 5 && el[i].type == 1 && (el[i].index == 1 || el[i].index == 2))  // FLOAT2
+            *(el[i].index == 1 ? &uv_el : &off_el) = i;
+    if (uv_el < 0 || texcoord_input(vs, 1) < 0) return NULL;
+    struct obj *tex = NULL;
+    uint32_t stages = 0;
+    int bumped = 0;
+    for (int i = 0; i < 8; i++) {
+        struct obj *t = s->texture[i];
+        if (!(ps->info.sampler_mask & (1u << i)) || !t || t->type != OBJ_TEXTURE || t->levels != 1 || t->format != 21 ||
+            (t->usage & 1) || !t->subs || !t->subs[0] || (ps->info.major == 1 && (s->tss[i][24] & 256)) ||
+            (tex && t != tex))
+            continue;
+        int tk = lightmap_reg(ps, i), kind = tk >= 0 && tk < 8 ? lightmap_reg(vs, tk) : 0;
+        if (!kind || (kind == 2 && off_el < 0)) continue;
+        tex = t, stages |= 1u << i, bumped |= kind == 2;
+    }
+    if (!stages) return NULL;
+    if (!lightmap_pages) lightmap_pages = [NSMutableDictionary new];
+    NSValue *pk = [NSValue valueWithPointer:tex];
+    struct lightmap_page *p = [lightmap_pages[pk] pointerValue];
+    if (!p) {
+        p = calloc(1, sizeof *p);
+        p->w = tex->width, p->h = tex->height;
+        p->rects = calloc((size_t)p->w * p->h * 4, sizeof *p->rects);
+        p->dirty[0] = p->w, p->dirty[1] = p->h;
+        p->ranges = [NSMutableSet new];
+        lightmap_pages[pk] = [NSValue valueWithPointer:p];
+    }
+    lightmap_stages = stages;
+
+    // This range read already?
+    int b = el[uv_el].stream;
+    struct obj *v = s->stream[b], *ibo = s->indices;
+    uint32_t stride = s->stream_stride[b];
+    if (!v || !v->mem || !stride || !ibo->mem) return p;
+    int is32 = ibo->format == 102;  // D3DFMT_INDEX32
+    uint32_t isz = is32 ? 4 : 2, ni = count * 3;
+    if ((uint64_t)start * isz + (uint64_t)ni * isz > ibo->size) return p;
+    const uint8_t *ip = (const uint8_t *)bl_g2h(ibo->mem) + (size_t)start * isz;
+#define IDX(i) (is32 ? ((const uint32_t *)ip)[i] : ((const uint16_t *)ip)[i])
+    struct {
+        void *vb, *ib;
+        uint32_t off, stride, rewrites, start, count, sample[8];
+        int32_t base, bumped;
+    } key;
+    memset(&key, 0, sizeof key);  // padding too: the key is compared as bytes
+    key.vb = v, key.ib = ibo, key.off = s->stream_offset[b] + el[uv_el].offset, key.stride = stride;
+    key.rewrites = (uint32_t)v->rewrites, key.start = start, key.count = count, key.base = base_vertex;
+    key.bumped = bumped;
+    // The step to the copies, read with the coordinates (same stream: Source's world vertices).
+    int step = bumped && el[off_el].stream == b ? (int)el[off_el].offset - (int)el[uv_el].offset : 0;
+    if (bumped && !step) return p;
+    // Dynamic buffers are known by the coordinates read from them instead (below).
+    int dynamic = (v->usage & 0x200) || v->rewrites >= 8 || (ibo->usage & 0x200);  // D3DUSAGE_DYNAMIC
+    NSData *kd = nil;
+    if (!dynamic) {
+        for (int i = 0; i < 8; i++) key.sample[i] = IDX((uint32_t)i * (ni - 1) / 7);
+        kd = [NSData dataWithBytes:&key length:sizeof key];
+        if ([p->ranges containsObject:kd]) return p;
+    }
+
+    // Corners joined within a triangle and where their lightmap coordinates are the same.
+    uint64_t(*corner)[2] = malloc(sizeof *corner * ni);
+    uint32_t *up = malloc(sizeof *up * ni);
+    float(*uv)[2] = malloc(sizeof *uv * ni), (*dv)[2] = malloc(sizeof *dv * ni);
+    const uint8_t *vd = (const uint8_t *)bl_g2h(v->mem) + key.off;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < ni; i++) {
+        int64_t vi = (int64_t)base_vertex + IDX(i);
+        if (vi < 0 || (uint64_t)vi * stride + key.off - el[uv_el].offset + stride > v->size) break;
+        memcpy(uv[i], vd + (size_t)vi * stride, 8);
+        if (step) memcpy(dv[i], vd + (size_t)vi * stride + step, 8);
+        corner[i][0] = lightmap_uv_key(uv[i]), corner[i][1] = i;
+        up[i] = i - i % 3;
+        n = i + 1;
+    }
+#undef IDX
+    n -= n % 3;
+    if (dynamic) {
+        struct { uint64_t hash; uint32_t n; int32_t bumped; } ck = {0xcbf29ce484222325ull, n, bumped};
+        for (uint32_t i = 0; i < n; i++) {
+            ck.hash = (ck.hash ^ corner[i][0]) * 0x100000001b3ull, ck.hash ^= ck.hash >> 29;
+            if (step) ck.hash = (ck.hash ^ lightmap_uv_key(dv[i])) * 0x100000001b3ull, ck.hash ^= ck.hash >> 29;
+        }
+        kd = [NSData dataWithBytes:&ck length:sizeof ck];
+        if ([p->ranges containsObject:kd]) {
+            free(uv), free(dv), free(up), free(corner);
+            return p;
+        }
+    }
+    if (p->ranges.count >= LIGHTMAP_MAX_RANGES) [p->ranges removeAllObjects];
+    [p->ranges addObject:kd];
+    lightmap_reads++;
+    qsort(corner, n, sizeof *corner, lightmap_corner_cmp);
+    for (uint32_t i = 1; i < n; i++)
+        if (corner[i][0] == corner[i - 1][0]) {
+            uint32_t a = lightmap_root(up, (uint32_t)corner[i][1]), c = lightmap_root(up, (uint32_t)corner[i - 1][1]);
+            if (a != c) up[a] = c;
+        }
+    // Each surface's bounds, in texels: its coordinates are at texel centres.
+    float(*box)[4] = malloc(sizeof *box * (n ? n : 1));
+    for (uint32_t i = 0; i < n; i++) box[i][0] = box[i][1] = INFINITY, box[i][2] = box[i][3] = -INFINITY;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t r = lightmap_root(up, i);
+        float x = uv[i][0] * (float)p->w, y = uv[i][1] * (float)p->h;
+        box[r][0] = fminf(box[r][0], x), box[r][1] = fminf(box[r][1], y);
+        box[r][2] = fmaxf(box[r][2], x), box[r][3] = fmaxf(box[r][3], y);
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (lightmap_root(up, i) != i) continue;
+        float *bx = box[i];
+        if (!(bx[0] >= -0.01f * p->w && bx[2] <= 1.01f * p->w && bx[1] >= -0.01f * p->h && bx[3] <= 1.01f * p->h))
+            continue;  // not a page's coordinates
+        int x0 = (int)floorf(bx[0] + 1e-3f), y0 = (int)floorf(bx[1] + 1e-3f);
+        int x1 = (int)ceilf(bx[2] - 1e-3f), y1 = (int)ceilf(bx[3] - 1e-3f);
+        x0 = x0 < 0 ? 0 : x0, y0 = y0 < 0 ? 0 : y0;
+        x1 = x1 > (int)p->w ? (int)p->w : x1, y1 = y1 > (int)p->h ? (int)p->h : y1;
+        if (x1 <= x0 || y1 <= y0) continue;
+        int fresh = 0;
+        // Bump-mapped: the flat copy and the three for the bump directions, a step apart.
+        int sx = step ? (int)lroundf(dv[i][0] * (float)p->w) : 0, sy = step ? (int)lroundf(dv[i][1] * (float)p->h) : 0;
+        for (int c = 0; c < (step ? 4 : 1); c++) {
+            int cx0 = x0 + c * sx, cy0 = y0 + c * sy, cx1 = x1 + c * sx, cy1 = y1 + c * sy;
+            if (cx0 < 0 || cy0 < 0 || cx1 > (int)p->w || cy1 > (int)p->h) break;
+            uint16_t r[4] = {(uint16_t)cx0, (uint16_t)cy0, (uint16_t)cx1, (uint16_t)cy1};
+            for (int y = cy0; y < cy1; y++)
+                for (int x = cx0; x < cx1; x++) {
+                    uint16_t *t = p->rects + ((size_t)y * p->w + x) * 4;
+                    if (!t[2]) memcpy(t, r, sizeof r), fresh = 1;
+                    else if (memcmp(t, r, sizeof r) && t[2] != t[0]) {
+                        // Two surfaces claim the texel: neither rectangle is sure there, and
+                        // it is read bilinear (x1 = x0).
+                        t[0] = t[1] = t[2] = t[3] = 1;
+                        lightmap_clashes++;
+                    }
+                }
+            if ((uint32_t)cx0 < p->dirty[0]) p->dirty[0] = (uint32_t)cx0;
+            if ((uint32_t)cy0 < p->dirty[1]) p->dirty[1] = (uint32_t)cy0;
+            if ((uint32_t)cx1 > p->dirty[2]) p->dirty[2] = (uint32_t)cx1;
+            if ((uint32_t)cy1 > p->dirty[3]) p->dirty[3] = (uint32_t)cy1;
+        }
+        lightmap_surfaces += fresh;
+    }
+    free(box), free(uv), free(dv), free(up), free(corner);
+    return p;
 }
 
 // Props smoothed (prop_smooth.c, BL_PROP_TESS): the world view's rigid models (no bones in
@@ -4455,11 +4762,13 @@ void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
         int nel = vertex_elements(s, el, 64);
         hs = hair_swap_for(s, el, nel, start, count, base_vertex);
         if (!hs) ps = prop_swap_for(s, el, nel, start, count, base_vertex);
+        if (!hs && !ps) lightmap_draw = lightmap_for(s, el, nel, start, count, base_vertex);
     }
+    lightmap_note_missed(s);
     if (!hs) {
         prop_swap = ps;
         render_draw(s, type, base_vertex, min_index, nverts, start, count, indexed);
-        prop_swap = NULL;
+        prop_swap = NULL, lightmap_draw = NULL;
         return;
     }
     if (!hs->nidx) {  // nothing of it kept
@@ -4470,7 +4779,7 @@ void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
     // blended as hair (both sides), whatever the game set.
     if (hs->vb && hs->base_ib) {
         // The base pushed a little behind, as the strips lie on it (the fringe's on its locks).
-        struct hair_swap base = {.ib = hs->base_ib, .nidx = hs->nbase_idx};
+        struct hair_swap base = {.ib = hs->base_ib, .nidx = hs->nbase_idx, .base_tex = hs->base_tex};
         uint32_t *rs = s->rs, bias[2] = {rs[195], rs[175]};
         float b = 64.0f / 16777215.0f, sl = 2.0f;
         memcpy(&rs[195], &b, 4), memcpy(&rs[175], &sl, 4);
@@ -4536,8 +4845,9 @@ static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex,
     }
     const char *dd = env_draw_dump;
     static int dumped_by_prims;
-    static int dumped_shadow, dumped_caster;
-    int dump = dd && !strcmp(dd, "shadow")
+    static int dumped_shadow, dumped_caster, dumped_lightmap;
+    int dump = dd && !strcmp(dd, "lightmap") ? (long)frames == draw_stats_frame && lightmap_missed && !dumped_lightmap++
+             : dd && !strcmp(dd, "shadow")
                    ? (long)frames == draw_stats_frame &&
                          ((draw_reads_atlas(s) && !dumped_shadow++) ||
                           (s->render_target[0] && s->render_target[0]->owner == shadow_atlas && !dumped_caster++))
@@ -4951,6 +5261,12 @@ static void menu_bars(id<MTLTexture> t, float squeeze)
 
 void d3d_render_present(struct d3d_state *s)
 {
+    static uint32_t lightmap_logged;
+    if (lightmap_reads != lightmap_logged && frames % 300 == 0) {
+        fprintf(stderr, "[metal] lightmaps: %lu pages, %u surfaces, %u texels claimed twice, %u draws read\n",
+                (unsigned long)lightmap_pages.count, lightmap_surfaces, lightmap_clashes, lightmap_reads);
+        lightmap_logged = lightmap_reads;
+    }
     ensure_device();
     if (env_exposure && frames % 300 == 0 && frames && (long)frames >= env_bloom_at) {
         const float *eye = exposure_buffer().contents;
