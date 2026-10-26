@@ -1746,3 +1746,33 @@ player's machine from their own game files (`BL_HAIR_MESH`, default on; 0 off).
   and in game, against the old AO: no grain at the collar, no halos, no facets. Then the
   user's own window run: approved. Not verified: other maps, and the cost (timing runs
   were shared with other GPU work).
+
+## 2026-10-26: bloom and eye adaptation (BL_BLOOM, BL_EXPOSURE); sharpening removed
+
+- Bloom without HDR (the HDR path is broken for now): after the post effects, a bright
+  pass on the SDR colour (threshold 0.6, soft knee, weighted by 1/(1 + brightness) so
+  single bright pixels don't flicker), six levels of downsampling and a tent upsample
+  back to half size, added to the picture at strength 0.35. `BL_BLOOM=0|1|show`,
+  `BL_BLOOM_STRENGTH`, `BL_BLOOM_THRESHOLD`.
+- Eye adaptation: a compute pass takes the geometric mean brightness of 64x36 points of
+  the picture, weighted towards the centre, and aims the exposure at
+  (0.095 / mean)^0.4, held between 0.8 and 1.3, easing there over about half a second
+  (and jumping straight there after a pause, such as a load). The value stays on the GPU.
+  Without tone mapping a soft shoulder keeps the brightened picture from clipping.
+  `BL_EXPOSURE=0|1|show`, `BL_EXPOSURE_RANGE`. `BL_BLOOM_AT=n` (debugging) turns both on
+  from frame n.
+- A first test run hung at start-up: the exposure log in `d3d_render_present` asked for
+  its buffer before the Metal device existed. It now waits for the device.
+- Verified: headless sm_asylum_1 bar entrance, frames 780 (off) and 900 (on) of one run:
+  exposure 1.14 (picture brightness 0.068), the green neon under the counter glows softly
+  onto the panel and stool tops, mean picture level 21.8 to 24.5 of 255. Then the user's
+  own window run: the exposure went from 0.80 to 1.18 between lit areas, the bar and the
+  streets, as meant. Not verified: frame rate.
+- Bloom and eye adaptation are now check boxes on the Visual options tab ("Bloom" and
+  "Eye Adaptation", below "Shadows" in the right-hand column, `bl_vgui.c`), saved in the
+  registry like the other effects (values `Bloom`, `EyeAdaptation`). Unlike the others
+  they are on until unticked. `BL_BLOOM` and `BL_EXPOSURE`, when set, still win over the
+  boxes. Built; not yet seen in a window.
+- Sharpening (`BL_SHARPEN`, its check box and the pass in post_apply) is removed. That
+  was another session's change; it goes in with these because the effect list, the
+  check boxes and post_apply are built on it.

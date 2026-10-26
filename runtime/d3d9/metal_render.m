@@ -38,8 +38,6 @@
 //                            "hits": red the reflection weight, green where rays met the picture,
 //                            blue what the cubemaps added; BL_SSR_STRENGTH (default 1) scales them,
 //                            BL_SSR_FRESNEL (3) and BL_SSR_BLUR (0.02) tune them
-//   BL_SHARPEN=0|1           sharpening of the world view (see post_apply), over the options'
-//                            check box; BL_SHARPEN_STRENGTH (0..1, default 0.5)
 //   BL_HDR=0|1               HDR output on screens that have it (see hdr_present), over the
 //                            options' check box; BL_HDR_PEAK, BL_HDR_KNEE, BL_HDR_HEADROOM tune it
 //   BL_FOG=0|1               volumetric light: the map's lights in a thin haze (see fog_run), over
@@ -62,6 +60,12 @@
 //                            section), negative flips it for MetalFX
 //   BL_GPU_STATS=1          log the mean GPU time per frame every 100 frames
 //   BL_PROP_TESS=0|1         props split and rounded like characters (BL_TESS per edge; default on)
+//   BL_BLOOM=0|1|show        bright lights glow (see the bloom section), over the options' check box
+//                            (on until unticked); BL_BLOOM_STRENGTH (default 0.35), BL_BLOOM_THRESHOLD (0.6)
+//   BL_EXPOSURE=0|1|show     eye adaptation: the view brightens in the dark and dims in bright places
+//                            (see the bloom section), over the options' check box (on until unticked);
+//                            BL_EXPOSURE_RANGE (lo,hi: 0.8,1.3)
+//   BL_BLOOM_AT=n            debugging: bloom and eye adaptation only from frame n
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
@@ -99,6 +103,9 @@ static float env_hair_glow = 1.0f;    // BL_HAIR_GLOW: light through hair from b
 static int env_hair_mesh = 1;         // BL_HAIR_MESH=0: the game's own hair, not the strips made for it
 static int env_tess = 3;            // BL_TESS: characters' triangles split this many times per edge, rounded (0 off)
 static int env_prop_tess = 1;       // BL_PROP_TESS: props' too (prop_swap_for)
+static int env_bloom, env_bloom_show, env_exposure, env_exposure_show;  // BL_BLOOM, BL_EXPOSURE (the effects table)
+static long env_bloom_at;  // BL_BLOOM_AT
+static float env_bloom_strength = 0.35f, env_bloom_threshold = 0.6f, env_exposure_lo = 0.8f, env_exposure_hi = 1.3f;
 static int env_upscale_off;  // BL_UPSCALE=0: the game's own colour textures for characters
 static int env_sss_eyes = 1;  // BL_SSS_EYES=0: no eye highlights
 static int enc_info;                       // and whether it draws reflection info (info_texture)
@@ -130,11 +137,11 @@ static float frame_squeeze = 1;       // menu draws this frame were narrowed to 
 static int deep_color;  // 16-bit back buffer, 10-bit window (BL_DEEP_COLOR, default on)
 
 // Effects at the end of the world view, before the view model and HUD (post_run):
-// ambient occlusion, screen-space reflections, sharpening, volumetric light and skin.
+// ambient occlusion, screen-space reflections, volumetric light and skin.
 // view_state: 0 no world view yet this frame, 1 world drawn (view_proj holds its
 // projection), 2 done for this frame.
-static int env_ao, env_ao_show, env_ssr, env_ssr_show, env_sharpen, env_tonemap, env_hdr, env_fog, env_sss, env_sss_show;
-static float env_ao_radius, env_ao_strength, env_ao_thickness, env_ssr_strength, env_ssr_fresnel, env_ssr_blur, env_sharpen_strength,
+static int env_ao, env_ao_show, env_ssr, env_ssr_show, env_tonemap, env_hdr, env_fog, env_sss, env_sss_show;
+static float env_ao_radius, env_ao_strength, env_ao_thickness, env_ssr_strength, env_ssr_fresnel, env_ssr_blur,
     env_tonemap_expand, env_hdr_peak, env_hdr_knee, env_hdr_headroom, env_fog_density, env_fog_dist, env_sss_width,
     env_sss_strength, env_sss_sheen;
 static int view_state;
@@ -143,7 +150,7 @@ static struct { float alpha, beta, p00, p11; } view_proj;
 // position (dot with xyz, plus w).
 static float view_rows[3][4];
 static id<MTLTexture> ao_result;  // waiting to be multiplied in at the next pass on the back buffer
-static int post_result;           // reflections or sharpening waiting for that pass too
+static int post_result;           // reflections, fog, skin or tone mapping waiting for that pass too
 static void ao_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int has_depth);
 static void post_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int has_depth);
 static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h);
@@ -161,8 +168,8 @@ static void taa_frame_end(void);
 // The Visual options tab's check boxes (bl_vgui.c, read once a frame by bl_vgui_poll)
 // set the effects and save them in the registry; the environment, when set, wins over both.
 #define EFFECT_KEY "HKCU\\Software\\Troika\\Vampire\\Native"
-enum { BL_EFFECT_AO, BL_EFFECT_SSR, BL_EFFECT_SHARPEN, BL_EFFECT_HDR, BL_EFFECT_FOG, BL_EFFECT_SSS, BL_EFFECT_SHADOWS,
-       BL_EFFECTS };
+enum { BL_EFFECT_AO, BL_EFFECT_SSR, BL_EFFECT_HDR, BL_EFFECT_FOG, BL_EFFECT_SSS, BL_EFFECT_SHADOWS,
+       BL_EFFECT_BLOOM, BL_EFFECT_EXPOSURE, BL_EFFECTS };
 static int env_shadows;  // the shadows section's switch
 // The shadows section (below the stretch copies): the atlas's scale, its receivers, contact shadows.
 static struct obj *shadow_atlas;
@@ -177,14 +184,16 @@ static void shadow_match_depth(struct obj *color, struct obj *depth);
 static int contact_on(void);
 static id<MTLTexture> contact_result;  // waiting to be multiplied in, like ao_result
 static void contact_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int has_depth);
-static const struct { const char *env, *value; int *on, *show; } effects[BL_EFFECTS] = {
+// Off until ticked, except where `def` says otherwise.
+static const struct { const char *env, *value; int *on, *show, def; } effects[BL_EFFECTS] = {
     {"BL_AO", "AmbientOcclusion", &env_ao, &env_ao_show},
     {"BL_SSR", "Reflections", &env_ssr, &env_ssr_show},
-    {"BL_SHARPEN", "Sharpening", &env_sharpen, NULL},
     {"BL_HDR", "HDR", &env_hdr, NULL},
     {"BL_FOG", "VolumetricLight", &env_fog, NULL},
     {"BL_SSS", "SkinScattering", &env_sss, &env_sss_show},
     {"BL_SHADOWS", "Shadows", &env_shadows, NULL},
+    {"BL_BLOOM", "Bloom", &env_bloom, &env_bloom_show, 1},
+    {"BL_EXPOSURE", "EyeAdaptation", &env_exposure, &env_exposure_show, 1},
 };
 static int effects_loaded, effect_forced[BL_EFFECTS];
 void bl_vgui_poll(void);
@@ -198,7 +207,7 @@ static void effect_settings(void)
         int show = !e ? 0 : !strcmp(e, "show") ? 1 : !strcmp(e, "hits") ? 2 : 0;
         effect_forced[i] = e != NULL;
         if (effects[i].show) *effects[i].show = show;
-        *effects[i].on = e ? atoi(e) != 0 || show : bl_reg_get_dword(EFFECT_KEY, effects[i].value, 0) != 0;
+        *effects[i].on = e ? atoi(e) != 0 || show : bl_reg_get_dword(EFFECT_KEY, effects[i].value, effects[i].def) != 0;
     }
 }
 
@@ -1073,7 +1082,6 @@ static void ensure_device(void)
     env_ssr_strength = getenv("BL_SSR_STRENGTH") ? (float)atof(getenv("BL_SSR_STRENGTH")) : 1;
     env_ssr_fresnel = getenv("BL_SSR_FRESNEL") ? (float)atof(getenv("BL_SSR_FRESNEL")) : 3;
     env_ssr_blur = getenv("BL_SSR_BLUR") ? (float)atof(getenv("BL_SSR_BLUR")) : 0.02f;
-    env_sharpen_strength = getenv("BL_SHARPEN_STRENGTH") ? (float)atof(getenv("BL_SHARPEN_STRENGTH")) : 0.5f;
     const char *tm = getenv("BL_TONEMAP");
     env_tonemap = !tm                   ? 0
                   : !strcmp(tm, "gt7")  ? 1
@@ -1090,6 +1098,10 @@ static void ensure_device(void)
     if (getenv("BL_HAIR_FADE")) env_hair_fade = (float)atof(getenv("BL_HAIR_FADE"));
     if (getenv("BL_TESS")) env_tess = atoi(getenv("BL_TESS"));
     if (getenv("BL_PROP_TESS")) env_prop_tess = atoi(getenv("BL_PROP_TESS"));
+    if (getenv("BL_BLOOM_AT")) env_bloom_at = atol(getenv("BL_BLOOM_AT"));
+    if (getenv("BL_BLOOM_STRENGTH")) env_bloom_strength = (float)atof(getenv("BL_BLOOM_STRENGTH"));
+    if (getenv("BL_BLOOM_THRESHOLD")) env_bloom_threshold = (float)atof(getenv("BL_BLOOM_THRESHOLD"));
+    if (getenv("BL_EXPOSURE_RANGE")) sscanf(getenv("BL_EXPOSURE_RANGE"), "%f,%f", &env_exposure_lo, &env_exposure_hi);
     if (getenv("BL_HAIR_SOFT")) env_hair_soft = (float)atof(getenv("BL_HAIR_SOFT"));
     if (getenv("BL_HAIR_STRANDS")) env_hair_strands = (float)atof(getenv("BL_HAIR_STRANDS"));
     if (getenv("BL_HAIR_ROOT")) env_hair_root = (float)atof(getenv("BL_HAIR_ROOT"));
@@ -2037,7 +2049,7 @@ static void ao_occlusion(id<MTLTexture> raw, id<MTLTexture> z, const struct ao_p
     [e endEncoding];
 }
 
-// --- screen-space reflections and sharpening ------------------------------------------
+// --- screen-space reflections ----------------------------------------------------------
 //
 // The game's shiny surfaces add a reflection cubemap to their colour: a picture of the
 // room from one point, the same wherever it is seen from. With reflections on, the world
@@ -2050,8 +2062,7 @@ static void ao_occlusion(id<MTLTexture> raw, id<MTLTexture> z, const struct ao_p
 // surfaces dropped; a filter that blurs more the further the ray went (sharp where things
 // touch the surface, soft further off) and keeps to similar depths; and, at full
 // resolution in the game's next pass on the back buffer, post_apply: a copy of the world
-// view, sharpened (BL_SHARPEN, contrast adaptive like AMD's CAS), plus the reflections,
-// upsampled from the reflective half-resolution pixels only. Elsewhere (off screen,
+// view plus the reflections, upsampled from the reflective half-resolution pixels only. Elsewhere (off screen,
 // behind things) the cubemap stays. Both are stronger at grazing angles (Schlick's
 // Fresnel term, which the game's cubemaps lack).
 // BL_SSR=show shows the reflections alone, BL_SSR=hits what the trace had to go on;
@@ -2062,19 +2073,19 @@ struct ssr_params {
     float full[2], half[2];  // back buffer and half-resolution sizes
     float p00, p11;          // projection scales in x and y
     float strength;          // of the reflections; 0: none this frame
-    float sharpen;           // 0..1; 0: none
     float max_dist, show;    // longest ray (world units); show the reflections (1) or the trace's inputs (2)
     float fresnel, blur;     // extra reflection at a grazing angle; blur radius per half-resolution pixel of ray
     float tonemap, expand;   // tone mapping: 0 off, 1 GT7, 3 Khronos PBR Neutral; 2 and 4 the same after
                              // expanding highlights by `expand` (0..1)
     float fog, skin;         // add the volumetric light (fog_run); use the scattered skin (skin_run)
+    float bloom, exposure;   // add the glow this much (bloom_run); scale by the eye's exposure (1; 2 show it)
 };
 
 static NSString *const ssr_source =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
-     "struct SP { float2 full, hsize; float p00, p11, strength, sharpen, max_dist, show, fresnel, blur, tonemap, expand,\n"
-     "            fog, skin; };\n"
+     "struct SP { float2 full, hsize; float p00, p11, strength, max_dist, show, fresnel, blur, tonemap, expand,\n"
+     "            fog, skin, bloom, exposure; };\n"
      "struct V { float4 pos [[position]]; };\n"
      "vertex V ssr_vs(uint id [[vertex_id]]) {\n"
      "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
@@ -2293,34 +2304,20 @@ static NSString *const ssr_source =
      "    }\n"
      "    return float4(o, 1.0); }\n"
      // Full resolution, in the game's next pass on the back buffer: the world view again,
-     // sharpened, with the reflections in place of that share of the cubemaps.
+     // with the reflections in place of that share of the cubemaps.
      "static float3 picture(texture2d<float> base, texture2d<float> info, texture2d<float> skin, float sk, int2 q) {\n"
      "    return sk > 0.0 && info.read(uint2(q)).w < -0.5 ? skin.read(uint2(q)).rgb : base.read(uint2(q)).rgb; }\n"
-     "static bool hair_at(texture2d<float> info, int2 q) { float w = info.read(uint2(q)).w; return w < -1.3 && w > -1.5; }\n"
      "fragment float4 post_apply(V in [[stage_in]], texture2d<float> base [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
      "                           texture2d<float> ssr [[texture(2)]], texture2d<float> aux [[texture(3)]],\n"
      "                           texture2d<float> fogt [[texture(4)]], texture2d<float> skin [[texture(5)]],\n"
-     "                           constant SP &a [[buffer(0)]]) {\n"
-     "    int2 p = int2(in.pos.xy), m = int2(a.full) - 1;\n"
+     "                           texture2d<float> glow [[texture(6)]], constant SP &a [[buffer(0)]],\n"
+     "                           constant float *eye [[buffer(1)]]) {\n"
+     "    int2 p = int2(in.pos.xy);\n"
      "    float4 c = base.read(uint2(p));\n"
+     // Characters' pixels come from the scattered skin picture (in red for the options'
+     // "show"). (Without reflections or skin the info texture is not bound.)
      "    float3 col = picture(base, info, skin, a.skin, p);\n"
-     // Characters' pixels come from the scattered skin picture, and are sharpened like the
-     // rest (in red for the options' "show"), except hair and the pixels beside it, whose
-     // fine strands sharpening turns into dark specks. (Without reflections or skin the
-     // info texture is not bound; base's alpha is never below -1.3.)
-     "    bool hair = a.sharpen > 0.0 && (hair_at(info, p) || hair_at(info, clamp(p - int2(0, 1), int2(0), m)) ||\n"
-     "                hair_at(info, clamp(p - int2(1, 0), int2(0), m)) || hair_at(info, clamp(p + int2(1, 0), int2(0), m)) ||\n"
-     "                hair_at(info, clamp(p + int2(0, 1), int2(0), m)));\n"
      "    if (a.skin > 1.5 && info.read(uint2(p)).w < -0.5) col = float3(1.0, 0.1, 0.1);\n"
-     "    else if (a.sharpen > 0.0 && !hair) {\n"
-     "        float3 n = picture(base, info, skin, a.skin, clamp(p - int2(0, 1), int2(0), m));\n"
-     "        float3 w = picture(base, info, skin, a.skin, clamp(p - int2(1, 0), int2(0), m));\n"
-     "        float3 e = picture(base, info, skin, a.skin, clamp(p + int2(1, 0), int2(0), m));\n"
-     "        float3 so = picture(base, info, skin, a.skin, clamp(p + int2(0, 1), int2(0), m));\n"
-     "        float3 mn = min(min(min(n, w), min(e, so)), col), mx = max(max(max(n, w), max(e, so)), col);\n"
-     "        float3 k = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1e-4))) * (-1.0 / mix(8.0, 5.0, a.sharpen));\n"
-     "        col = saturate(((n + w + e + so) * k + col) / (1.0 + 4.0 * k));\n"
-     "    }\n"
      "    if (a.strength > 0.0) {\n"
      "        float4 f = info.read(uint2(p)), r = 0.0;\n"
      "        float F = 1.0;\n"
@@ -2348,6 +2345,17 @@ static NSString *const ssr_source =
      "        constexpr sampler ls(filter::linear, address::clamp_to_edge);\n"
      "        float4 f = fogt.sample(ls, (float2(p) + 0.5) / a.full);\n"
      "        col = col * f.w + f.rgb;\n"
+     "    }\n"
+     // The eye's exposure, then the glow (bloom section), and a soft shoulder so what they
+     // push past white rolls off instead of clipping (without tone mapping, which has its own).
+     "    if (a.exposure > 0.0 || a.bloom > 0.0) {\n"
+     "        constexpr sampler gs(filter::linear, address::clamp_to_edge);\n"
+     "        if (a.exposure > 0.0) col *= eye[0];\n"
+     "        if (a.bloom > 1.5) col = glow.sample(gs, (float2(p) + 0.5) / a.full).rgb;\n"
+     "        else if (a.bloom > 0.0) col += a.bloom * glow.sample(gs, (float2(p) + 0.5) / a.full).rgb;\n"
+     "        float m = max(max(col.r, col.g), col.b), k = 0.75;\n"
+     "        if (a.tonemap == 0.0 && m > k) col *= (k + (1.0 - k) * (1.0 - exp(-(m - k) / (1.0 - k)))) / m;\n"
+     "        if (a.exposure > 1.5 && p.y < 12) col = float(p.x) < a.full.x * eye[0] * 0.5 ? float3(1.0, 0.8, 0.0) : float3(0.1);\n"
      "    }\n"
      "    if (a.tonemap > 2.5) col = pbr_neutral(saturate(col), a.tonemap, a.expand);\n"
      "    else if (a.tonemap > 0.0) col = gt7(saturate(col), a.tonemap, a.expand);\n"
@@ -3250,6 +3258,226 @@ static void taa_frame_end(void)
     taa_jitter[1] = fabsf(scale) * (halton(taa_phase, 3) - 0.5f);
 }
 
+// --- bloom and eye adaptation ---------------------------------------------------------
+//
+// Both work on the world view's own colours (post_run's copy, before the HUD), with no HDR:
+// - Bloom (BL_BLOOM, bloom_run): what is brighter than BL_BLOOM_THRESHOLD (by luminance,
+//   with a soft knee; each pixel weighted down by its brightness against single-pixel
+//   flicker) is halved in size six times and spread back up, each level adding the next
+//   one's blur (dual filtering), and post_apply adds BL_BLOOM_STRENGTH of it: lamps, neon
+//   and lit windows glow into the dark around them.
+// - Eye adaptation (BL_EXPOSURE, exposure_run): the view's brightness, the geometric mean
+//   of 64x36 points weighted to the middle, against a typical Bloodlines scene (0.095 in
+//   the game's colours, measured over many views): the exposure goes some of the way
+//   towards evening it out (the 0.4th power, within BL_EXPOSURE_RANGE), over about a
+//   second and a half, so a dark street lifts a little and a lit room dims. It stays on
+//   the GPU (a buffer post_apply reads); "show" draws it as a bar at the top.
+// post_apply scales the colour by the exposure, adds the glow, and rolls off what that
+// pushes past white.
+static id<MTLTexture> post_glow;
+#define BLOOM_LEVELS 6
+#define EXPOSURE_REF 0.095f
+
+static id<MTLTexture> bloom_texture(int i, NSUInteger w, NSUInteger h)
+{
+    static id<MTLTexture> t[2 * BLOOM_LEVELS + 1];
+    MTLPixelFormat pf = i == 2 * BLOOM_LEVELS ? MTLPixelFormatR16Float : MTLPixelFormatRGBA16Float;
+    if (!t[i] || t[i].width != w || t[i].height != h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h
+                                                                                 mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        t[i] = [mtl newTextureWithDescriptor:td];
+    }
+    return t[i];
+}
+
+struct bloom_params {
+    float src[2];             // the source's size in pixels
+    float threshold, knee;    // bright pass
+    float ref, power;         // exposure: the typical brightness, how far to even it out
+    float lo, hi;             // and its range
+    float rate;               // the share of the way to go this frame (0: jump there)
+    float pad[3];
+};
+
+static NSString *const bloom_source =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct BP { float2 src; float threshold, knee, ref, power, lo, hi, rate; float3 pad; };\n"
+     "struct V { float4 pos [[position]]; };\n"
+     "vertex V bloom_vs(uint id [[vertex_id]]) {\n"
+     "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
+     "constexpr sampler ls(filter::linear, address::clamp_to_edge);\n"
+     "static float luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }\n"
+     // Half size: four bilinear reads (a 4x4 box), each the bright part of its colour,
+     // weighted by 1 / (1 + luminance) so one bright pixel does not flicker as a blob.
+     "fragment float4 bloom_bright(V in [[stage_in]], texture2d<float> src [[texture(0)]], constant BP &b [[buffer(0)]]) {\n"
+     "    float2 uv = in.pos.xy * 2.0 / b.src, d = 1.0 / b.src;\n"
+     "    float3 sum = 0.0; float ws = 0.0;\n"
+     "    for (int i = 0; i < 4; i++) {\n"
+     "        float3 c = src.sample(ls, uv + d * float2(i & 1 ? 1.0 : -1.0, i & 2 ? 1.0 : -1.0)).rgb;\n"
+     "        float l = luma(c), x = clamp(l - b.threshold + b.knee, 0.0, 2.0 * b.knee);\n"
+     "        float k = max(x * x / (4.0 * b.knee + 1e-5), l - b.threshold) / max(l, 1e-4);\n"
+     "        float w = 1.0 / (1.0 + l);\n"
+     "        sum += c * max(k, 0.0) * w, ws += w;\n"
+     "    }\n"
+     "    return float4(sum / ws, 1.0); }\n"
+     // Half size again: the centre and four diagonal reads (dual filtering's down step).
+     "fragment float4 bloom_down(V in [[stage_in]], texture2d<float> src [[texture(0)]], constant BP &b [[buffer(0)]]) {\n"
+     "    float2 uv = in.pos.xy * 2.0 / b.src, d = 1.0 / b.src;\n"
+     "    float3 c = src.sample(ls, uv).rgb * 4.0;\n"
+     "    c += src.sample(ls, uv + float2(-d.x, -d.y)).rgb + src.sample(ls, uv + float2(d.x, -d.y)).rgb;\n"
+     "    c += src.sample(ls, uv + float2(-d.x, d.y)).rgb + src.sample(ls, uv + float2(d.x, d.y)).rgb;\n"
+     "    return float4(c / 8.0, 1.0); }\n"
+     // Back up: this level plus the smaller one's blur (a tent of nine reads).
+     "fragment float4 bloom_up(V in [[stage_in]], texture2d<float> here [[texture(0)]], texture2d<float> small [[texture(1)]],\n"
+     "                         constant BP &b [[buffer(0)]]) {\n"
+     "    float2 uv = in.pos.xy / b.src, d = 1.0 / b.src;\n"
+     "    float3 c = small.sample(ls, uv).rgb * 4.0;\n"
+     "    c += (small.sample(ls, uv + float2(-d.x, 0.0)).rgb + small.sample(ls, uv + float2(d.x, 0.0)).rgb +\n"
+     "          small.sample(ls, uv + float2(0.0, -d.y)).rgb + small.sample(ls, uv + float2(0.0, d.y)).rgb) * 2.0;\n"
+     "    c += small.sample(ls, uv - d).rgb + small.sample(ls, uv + d).rgb + small.sample(ls, uv + float2(d.x, -d.y)).rgb +\n"
+     "         small.sample(ls, uv + float2(-d.x, d.y)).rgb;\n"
+     "    return float4(here.read(uint2(in.pos.xy)).rgb + c / 16.0, 1.0); }\n"
+     // 64x36 points of the view: the log of their luminance (four reads each).
+     "fragment float bloom_lum(V in [[stage_in]], texture2d<float> src [[texture(0)]], constant BP &b [[buffer(0)]]) {\n"
+     "    float2 uv = in.pos.xy / float2(64.0, 36.0), d = 0.25 / float2(64.0, 36.0);\n"
+     "    float l = 0.0;\n"
+     "    for (int i = 0; i < 4; i++) l += luma(src.sample(ls, uv + d * float2(i & 1 ? 1.0 : -1.0, i & 2 ? 1.0 : -1.0)).rgb);\n"
+     "    return log(max(l * 0.25, 1e-3)); }\n"
+     // One group: the weighted mean, the exposure it asks for, and a step towards it.
+     "kernel void bloom_adapt(texture2d<float> lt [[texture(0)]], device float *eye [[buffer(1)]],\n"
+     "                        constant BP &b [[buffer(0)]], uint t [[thread_index_in_threadgroup]]) {\n"
+     "    threadgroup float sl[256], sw[256];\n"
+     "    float l = 0.0, w = 0.0;\n"
+     "    for (uint i = t; i < 64 * 36; i += 256) {\n"
+     "        float2 q = (float2(i % 64, i / 64) + 0.5) / float2(64.0, 36.0) * 2.0 - 1.0;\n"
+     "        float k = clamp(1.0 - 0.5 * dot(q, q), 0.25, 1.0);\n"
+     "        l += k * lt.read(uint2(i % 64, i / 64)).x, w += k;\n"
+     "    }\n"
+     "    sl[t] = l, sw[t] = w;\n"
+     "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "    for (uint s = 128; s > 0; s >>= 1) {\n"
+     "        if (t < s) sl[t] += sl[t + s], sw[t] += sw[t + s];\n"
+     "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "    }\n"
+     "    if (t == 0) {\n"
+     "        float mean = exp(sl[0] / sw[0]), want = clamp(pow(b.ref / mean, b.power), b.lo, b.hi);\n"
+     "        eye[0] = b.rate <= 0.0 || !(eye[0] > 0.0) ? want : mix(eye[0], want, b.rate);\n"
+     "        eye[1] = mean;\n"
+     "    }\n"
+     "}\n";
+
+static id<MTLLibrary> bloom_library(void)
+{
+    static id<MTLLibrary> lib;
+    if (!lib) {
+        NSError *error = nil;
+        lib = [mtl newLibraryWithSource:bloom_source options:nil error:&error];
+        if (!lib) bl_fatal("bloom shader: %s", error.localizedDescription.UTF8String);
+    }
+    return lib;
+}
+
+// 0 bright, 1 down, 2 up (RGBA16Float), 3 luminance (R16Float).
+static id<MTLRenderPipelineState> bloom_pipeline(int kind)
+{
+    static id<MTLRenderPipelineState> p[4];
+    if (p[kind]) return p[kind];
+    static NSString *const names[] = {@"bloom_bright", @"bloom_down", @"bloom_up", @"bloom_lum"};
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [bloom_library() newFunctionWithName:@"bloom_vs"];
+    d.fragmentFunction = [bloom_library() newFunctionWithName:names[kind]];
+    d.colorAttachments[0].pixelFormat = kind == 3 ? MTLPixelFormatR16Float : MTLPixelFormatRGBA16Float;
+    NSError *error = nil;
+    p[kind] = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!p[kind]) bl_fatal("bloom pipeline: %s", error.localizedDescription.UTF8String);
+    return p[kind];
+}
+
+static void bloom_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTexture> t1, const struct bloom_params *b)
+{
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = target;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:bloom_pipeline(kind)];
+    [e setFragmentTexture:t0 atIndex:0];
+    [e setFragmentTexture:t1 atIndex:1];
+    [e setFragmentBytes:b length:sizeof *b atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+}
+
+static struct bloom_params bloom_base(void)
+{
+    struct bloom_params b = {{0, 0}, env_bloom_threshold, 0.2f, EXPOSURE_REF, 0.4f, env_exposure_lo, env_exposure_hi, 0};
+    return b;
+}
+
+// The glow at half size (post_apply adds it).
+static id<MTLTexture> bloom_run(id<MTLTexture> color)
+{
+    struct bloom_params b = bloom_base();
+    id<MTLTexture> down[BLOOM_LEVELS], src = color;
+    NSUInteger w = color.width, h = color.height;
+    for (int i = 0; i < BLOOM_LEVELS; i++) {
+        w = (w + 1) / 2, h = (h + 1) / 2;
+        down[i] = bloom_texture(i, w ? w : 1, h ? h : 1);
+        b.src[0] = (float)src.width, b.src[1] = (float)src.height;
+        bloom_pass(i ? 1 : 0, down[i], src, nil, &b);
+        src = down[i];
+    }
+    id<MTLTexture> up = down[BLOOM_LEVELS - 1];
+    for (int i = BLOOM_LEVELS - 2; i >= 0; i--) {
+        id<MTLTexture> out = bloom_texture(BLOOM_LEVELS + i, down[i].width, down[i].height);
+        b.src[0] = (float)down[i].width, b.src[1] = (float)down[i].height;
+        bloom_pass(2, out, down[i], up, &b);
+        up = out;
+    }
+    return up;
+}
+
+static id<MTLBuffer> exposure_buffer(void)
+{
+    static id<MTLBuffer> buf;
+    if (!buf) {
+        buf = [mtl newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        float one[4] = {1, EXPOSURE_REF, 0, 0};
+        memcpy(buf.contents, one, sizeof one);
+    }
+    return buf;
+}
+
+// The eye's exposure for this frame, into exposure_buffer.
+static void exposure_run(id<MTLTexture> color)
+{
+    static id<MTLComputePipelineState> adapt;
+    static double last;
+    if (!adapt) {
+        NSError *error = nil;
+        adapt = [mtl newComputePipelineStateWithFunction:[bloom_library() newFunctionWithName:@"bloom_adapt"]
+                                                   error:&error];
+        if (!adapt) bl_fatal("eye adaptation: %s", error.localizedDescription.UTF8String);
+    }
+    struct bloom_params b = bloom_base();
+    double now = CFAbsoluteTimeGetCurrent(), dt = last ? now - last : 0;
+    last = now;
+    // About 1.5 s to adapt (63% in 0.5 s); a long gap (a load, a menu) jumps there.
+    b.rate = dt > 0.5 ? 0 : (float)(1 - exp(-dt / 0.5));
+    id<MTLTexture> lum = bloom_texture(2 * BLOOM_LEVELS, 64, 36);
+    bloom_pass(3, lum, color, nil, &b);
+    id<MTLComputeCommandEncoder> e = [command_buffer() computeCommandEncoder];
+    [e setComputePipelineState:adapt];
+    [e setTexture:lum atIndex:0];
+    [e setBytes:&b length:sizeof b atIndex:0];
+    [e setBuffer:exposure_buffer() offset:0 atIndex:1];
+    [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e endEncoding];
+}
+
 // --- the world view's end ----------------------------------------------------------------
 
 // What the game's next pass on the back buffer draws first: post_apply (its copy of the
@@ -3285,16 +3513,16 @@ static void post_run(struct d3d_state *s)
         ao_result = soft, ao_result_params = a;
     }
     if (contact) contact_run(color, z, &a);
-    if (!reflect && !env_sharpen && !env_tonemap && !env_hdr && !env_fog && !skin) return;
+    int bloom = env_bloom && (long)frames >= env_bloom_at, eye = env_exposure && (long)frames >= env_bloom_at;
+    if (!reflect && !env_tonemap && !env_hdr && !env_fog && !skin && !bloom && !eye) return;
     post_base = ao_texture(3, color.pixelFormat, color.width, color.height);
     id<MTLBlitCommandEncoder> blit = [command_buffer() blitCommandEncoder];
     [blit copyFromTexture:color toTexture:post_base];
     [blit endEncoding];
-    float sharpen = env_sharpen_strength < 0 ? 0 : env_sharpen_strength > 1 ? 1 : env_sharpen_strength;
     struct ssr_params p = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, view_proj.p00,
-                           view_proj.p11, reflect ? env_ssr_strength : 0, env_sharpen ? sharpen : 0, 2000,
+                           view_proj.p11, reflect ? env_ssr_strength : 0, 2000,
                            (float)env_ssr_show, env_ssr_fresnel, env_ssr_blur, (float)env_tonemap, env_tonemap_expand,
-                           0, 0};
+                           0, 0, 0, 0};
     post_ssr = post_aux = post_fog = post_skin = post_base;  // bound but unread without them
     if (reflect) {
         id<MTLTexture> raw = ao_texture(4, MTLPixelFormatRGBA16Float, hw, hh);
@@ -3320,6 +3548,9 @@ static void post_run(struct d3d_state *s)
     }
     if (env_fog) fog_run(z, hw, hh, &p);
     if (skin) skin_run(color, z, hw, hh, &p);
+    post_glow = post_base;
+    if (bloom) post_glow = bloom_run(post_base), p.bloom = env_bloom_show ? 2 : env_bloom_strength;
+    if (eye) exposure_run(post_base), p.exposure = env_exposure_show ? 2 : 1;
     post_params = p, post_result = 1;
 }
 
@@ -3340,7 +3571,9 @@ static void post_apply(id<MTLRenderCommandEncoder> e, id<MTLTexture> color, int 
     [e setFragmentTexture:post_aux atIndex:3];
     [e setFragmentTexture:post_fog atIndex:4];
     [e setFragmentTexture:post_skin atIndex:5];
+    [e setFragmentTexture:post_glow atIndex:6];
     [e setFragmentBytes:&post_params length:sizeof post_params atIndex:0];
+    [e setFragmentBuffer:exposure_buffer() offset:0 atIndex:1];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     post_result = 0;
 }
@@ -4719,6 +4952,10 @@ static void menu_bars(id<MTLTexture> t, float squeeze)
 void d3d_render_present(struct d3d_state *s)
 {
     ensure_device();
+    if (env_exposure && frames % 300 == 0 && frames && (long)frames >= env_bloom_at) {
+        const float *eye = exposure_buffer().contents;
+        fprintf(stderr, "[metal] eye: exposure %.2f, view brightness %.3f (typical %.3f)\n", eye[0], eye[1], EXPOSURE_REF);
+    }
     bl_vgui_poll();  // the options' check box
     if (view_state == 1) {  // a frame with no view model or HUD
         post_run(s);
