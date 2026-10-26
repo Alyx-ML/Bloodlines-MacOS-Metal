@@ -179,14 +179,66 @@ static void load_rough(const char *path, uint8_t *px, size_t w, size_t h)
 }
 
 static id<MTLTexture> load_map_at(id<MTLDevice> dev, const char *path);
+static void make_skin_mask(id<MTLDevice> dev, const char *rel);
 static id<MTLTexture> load_map(id<MTLDevice> dev, const char *rel)
 {
     char path[1600];
     snprintf(path, sizeof path, "%s/%s", dir, rel);
+    make_skin_mask(dev, rel);
     return load_map_at(dev, path);
 }
 
 id<MTLTexture> bl_load_normal_map(id<MTLDevice> dev, const char *path) { return load_map_at(dev, path); }
+
+id<MTLTexture> bl_load_height_map(id<MTLDevice> dev, const char *path)
+{
+    NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+    if (!src) return nil;
+    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+    CFRelease(src);
+    if (!img) return nil;
+    size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+    uint8_t *g = calloc(w * h, 1);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
+    CGContextRef cg = CGBitmapContextCreate(g, w, h, 8, w, cs, (CGBitmapInfo)kCGImageAlphaNone);
+    CGContextDrawImage(cg, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
+    CGContextRelease(cg), CGColorSpaceRelease(cs), CGImageRelease(img);
+    // The model's heights keep to a narrow band of greys: stretched, every material gets
+    // the whole depth.
+    size_t hist[256] = {0}, n = w * h, lo = 0, hi = 255, acc = 0;
+    for (size_t i = 0; i < n; i++) hist[g[i]]++;
+    for (lo = 0, acc = 0; lo < 255 && (acc += hist[lo]) < n / 100; lo++) {}
+    for (hi = 255, acc = 0; hi > 0 && (acc += hist[hi]) < n / 100; hi--) {}
+    if (hi > lo)
+        for (size_t i = 0; i < n; i++) {
+            int v = ((int)g[i] - (int)lo) * 255 / (int)(hi - lo);
+            g[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+        }
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                                                    width:w height:h mipmapped:YES];
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> t = [dev newTextureWithDescriptor:td];
+    size_t pw = w, ph = h;
+    for (NSUInteger level = 0;; level++) {
+        [t replaceRegion:MTLRegionMake2D(0, 0, pw, ph) mipmapLevel:level withBytes:g bytesPerRow:pw];
+        if (level + 1 >= t.mipmapLevelCount) break;
+        size_t lw = pw > 1 ? pw / 2 : 1, lh = ph > 1 ? ph / 2 : 1;
+        for (size_t y = 0; y < lh; y++)
+            for (size_t x = 0; x < lw; x++) {
+                unsigned v = 0;
+                for (int j = 0; j < 4; j++) {
+                    size_t sx = x * 2 + (j & 1), sy = y * 2 + (j >> 1);
+                    v += g[(sy < ph ? sy : ph - 1) * pw + (sx < pw ? sx : pw - 1)];
+                }
+                g[y * lw + x] = (uint8_t)((v + 2) / 4);  // in place: row y reads rows 2y, 2y+1
+            }
+        pw = lw, ph = lh;
+    }
+    free(g);
+    return t;
+}
 
 static id<MTLTexture> load_map_at(id<MTLDevice> dev, const char *path)
 {
@@ -323,6 +375,103 @@ static id<MTLTexture> load_rgba(id<MTLDevice> dev, const char *path)
     return t;
 }
 
+// Whether a texture is a face or a head by its file's name (all skin, no mask needed).
+static int face_name(const char *name)
+{
+    const char *file = strrchr(name, '/') ? strrchr(name, '/') + 1 : name;
+    return (strcasestr(file, "face") || strcasestr(file, "head")) && !strcasestr(file, "hair");
+}
+
+// Skin masks for body textures (bl_detail_skin_mask), by the map's path in the list.
+static NSMutableDictionary<NSString *, id<MTLTexture>> *masks;
+static os_unfair_lock mask_lock = OS_UNFAIR_LOCK_INIT;
+
+static float smooth01(float e0, float e1, float x)
+{
+    float t = fminf(fmaxf((x - e0) / (e1 - e0), 0), 1);
+    return t * t * (3 - 2 * t);
+}
+
+// Where a body texture (<name>.png beside <name>_n.png) shows skin (the rest is cloth for
+// the cloth weave), by its colour: warm
+// (red over green over blue, green a fair way above blue), a little saturated but not
+// strongly (white and grey cloth, jeans and black leather are out; so are reds), and not
+// too dark. Box-blurred and cut again so specks on cloth drop out and skin keeps clean
+// edges. At up to 512 across (an R8 texture); faces get none (all theirs is skin).
+static void make_skin_mask(id<MTLDevice> dev, const char *rel)
+{
+    // Faces: all skin. Tongues, teeth and eyes: neither skin nor cloth.
+    const char *file = strrchr(rel, '/') ? strrchr(rel, '/') + 1 : rel;
+    if (face_name(rel) || strcasestr(file, "tongue") || strcasestr(file, "teeth") || strcasestr(file, "eye")) return;
+    os_unfair_lock_lock(&mask_lock);
+    int have = masks[@(rel)] != nil;
+    os_unfair_lock_unlock(&mask_lock);
+    if (have) return;
+    char path[1600];
+    snprintf(path, sizeof path, "%s/%s", dir, rel);
+    char *u = strstr(path, "_n.png");
+    if (!u) return;
+    memmove(u, ".png", 5);
+    // The bytes as they are: bodies' alpha is often a shine mask, 0 over skin, and drawn
+    // through Core Graphics the colour would come out multiplied by it. Other layouts (no
+    // alpha) are drawn.
+    size_t w, h;
+    uint8_t *px = load_pixels(path, &w, &h);
+    if (!px) {
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+        CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+        if (!src) return;
+        CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+        CFRelease(src);
+        if (!img) return;
+        w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+        px = calloc(w * h, 4);
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        CGContextRef cg = CGBitmapContextCreate(px, w, h, 8, w * 4, cs, kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big);
+        CGContextSetBlendMode(cg, kCGBlendModeCopy);
+        CGContextDrawImage(cg, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
+        CGContextRelease(cg), CGColorSpaceRelease(cs), CGImageRelease(img);
+    }
+    size_t f = w > 512 || h > 512 ? 2 : 1, mw = w / f ? w / f : 1, mh = h / f ? h / f : 1;
+    float *m = calloc(mw * mh, sizeof *m), *tmp = malloc((mw > mh ? mw : mh) * sizeof *tmp);
+    for (size_t y = 0; y < mh; y++)
+        for (size_t x = 0; x < mw; x++) {
+            float c[3] = {0, 0, 0};
+            for (size_t j = 0; j < f; j++)
+                for (size_t i = 0; i < f; i++)
+                    for (int k = 0; k < 3; k++) c[k] += px[((y * f + j) * w + x * f + i) * 4 + k] / 255.0f;
+            float R = c[0] / (float)(f * f), G = c[1] / (float)(f * f), B = c[2] / (float)(f * f);
+            float mx = fmaxf(R, fmaxf(G, B)), mn = fminf(R, fminf(G, B)), sat = (mx - mn) / fmaxf(mx, 1e-3f);
+            float v = smooth01(0.06f, 0.10f, sat) * (1 - smooth01(0.45f, 0.6f, sat)) * smooth01(0.1f, 0.16f, R);
+            if (!(R >= G - 0.01f && G >= B - 0.02f)) v = 0;
+            m[y * mw + x] = v * smooth01(0.15f, 0.3f, (G - B) / fmaxf(R - B, 1e-3f));
+        }
+    free(px);
+    int r = (int)lrint(5.0 * (double)w / 1024.0 / (double)f);
+    if (r < 1) r = 1;
+    for (size_t y = 0; y < mh; y++) box(m + y * mw, mw, 1, r, tmp);
+    for (size_t x = 0; x < mw; x++) box(m + x, mh, mw, r, tmp);
+    uint8_t *out = malloc(mw * mh);
+    size_t skin = 0;
+    for (size_t i = 0; i < mw * mh; i++) {
+        out[i] = (uint8_t)lrintf(smooth01(0.5f, 0.8f, m[i]) * 255);
+        skin += out[i] > 127;
+    }
+    free(m), free(tmp);
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                                                    width:mw height:mh mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> t = [dev newTextureWithDescriptor:td];
+    [t replaceRegion:MTLRegionMake2D(0, 0, mw, mh) mipmapLevel:0 withBytes:out bytesPerRow:mw];
+    free(out);
+    os_unfair_lock_lock(&mask_lock);
+    if (!masks) masks = [NSMutableDictionary new];
+    masks[@(rel)] = t;
+    os_unfair_lock_unlock(&mask_lock);
+    fprintf(stderr, "[detail] skin mask %zux%zu for %s: %.0f%% skin\n", mw, mh, rel, 100.0 * (double)skin / (double)(mw * mh));
+}
+
 // The mean colour of a picture's solid pixels (alpha over 200); 0 without any.
 static int solid_mean(const uint8_t *px, size_t n, double mean[3])
 {
@@ -334,7 +483,7 @@ static int solid_mean(const uint8_t *px, size_t n, double mean[3])
     return k > 0;
 }
 
-// The game's hair under strips, in their colour: its upscaled texture (path) lifted where
+// The game's hair under strips, in their colour: its texture as exported (path) lifted where
 // it is darker than HAIR_BASE_SHADE of the strips' mean colour, to that (keeping some of
 // its own variation), and left alone where lighter (the fringe's locks). The game's own
 // (Jeanette's pigtail cores and scalp, about a third as bright as the strips) showed as
@@ -480,9 +629,29 @@ id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t sta
                        : "",
                 r ? ", loaded ahead" : "");
     }
+    int face = name && face_name(name);
     cache[cache_key(key, stamp, w, h)] = @[result ? (id)result : [NSNull null], *color ? (id)*color : [NSNull null],
-                 name ? (id)[NSString stringWithUTF8String:name] : [NSNull null]];
+                 name ? (id)[NSString stringWithUTF8String:name] : [NSNull null], @(face)];
     return result;
+}
+
+int bl_detail_is_face(const void *key, uint32_t w, uint32_t h)
+{
+    if (!cache) return 0;
+    NSArray *hit = cache_find(key, 0, w, h);
+    if (!hit || hit.count < 4) return 0;
+    return [hit[3] boolValue];
+}
+
+id<MTLTexture> bl_detail_skin_mask(const void *key, uint32_t w, uint32_t h)
+{
+    if (!cache) return nil;
+    NSArray *hit = cache_find(key, 0, w, h);
+    if (!hit || hit.count < 3 || hit[2] == [NSNull null]) return nil;
+    os_unfair_lock_lock(&mask_lock);
+    id<MTLTexture> t = masks[hit[2]];
+    os_unfair_lock_unlock(&mask_lock);
+    return t;
 }
 
 id<MTLTexture> bl_detail_flat(id<MTLDevice> dev)
@@ -541,7 +710,7 @@ const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, const void *key, ui
                     snprintf(u, path + sizeof path - u, "_hair.png");
                     m->tex = load_rgba(dev, path);
                     char base[1600];
-                    snprintf(base, sizeof base, "%.*s_u.png", (int)(u - path), path);
+                    snprintf(base, sizeof base, "%.*s.png", (int)(u - path), path);
                     if (m->tex) m->base_color = hair_base_color(dev, base, path);
                     if (!m->tex) free(m), m = NULL;
                 }

@@ -42,37 +42,51 @@ void bl_vgui_GetCursorLine_c(_cpu *cpu)
     eax = (uint32_t)lo;
 }
 
-// COptionsSubVisual, the Visual tab of the options dialog, gets "Ambient Occlusion",
-// "Reflections", "HDR", "Volumetric Light", "Skin Scattering", "Shadows", "Bloom",
-// "Eye Adaptation", "Bounced Light" and "Global Illumination" check boxes under "Combat effects". Like the tab's other
-// settings they take effect as soon as they are clicked: bl_vgui_poll, once a frame,
-// passes a change to the renderer, which saves it (bl_effect_enabled, bl_effect_set in
-// metal_render.m). The page's OnResetData (0x1001bd30) is replaced to create the boxes:
-// it does what the original did (the controls' own reset, through the aliases in
-// modules/GameUI/global_aliases.manual.sci), then adds the boxes the first time. Its
-// destructor (0x1001bcd0) is replaced to forget the boxes with the page.
+// The options dialog gets an "Enhanced" tab after "Visual", holding the renderer's
+// effects as check boxes in three headed columns: "Lighting" (Global Illumination, Bounced
+// Light, Ambient Occlusion, Volumetric Light), "Camera" (HDR, Bloom, Eye Adaptation,
+// Sharpening) and "Surfaces & Characters" (Shadows, Reflections, Skin Scattering, Smooth
+// Characters, Skin Detail).
+// Like the Visual tab's settings they take effect as soon as they are clicked:
+// bl_vgui_poll, once a frame, passes a change to the renderer, which saves it
+// (bl_effect_enabled, bl_effect_set in metal_render.m).
+// - PropertyDialog::AddPage (0x10024eb0) is replaced (bl_vgui_AddPage_c): it does what
+//   the original did, and after the options dialog's Visual tab adds the Enhanced one, a
+//   plain vgui::PropertyPage.
+// - COptionsSubVisual's OnResetData (0x1001bd30) is replaced: it does what the original
+//   did (the controls' own reset, through the aliases in
+//   modules/GameUI/global_aliases.manual.sci), then the first time makes the boxes on the
+//   Enhanced tab, placed and lettered like the Visual tab's controls (whose fonts and size
+//   are set by then). Its destructor (0x1001bcd0) is replaced to forget the boxes: the
+//   dialog deletes both pages together.
 //
-// Page fields: +0x80 shadows combo box, +0x84 "Combat effects" box, +0x88..+0x94
+// Visual page fields: +0x80 shadows combo box, +0x84 "Combat effects" box, +0x88..+0x94
 // sliders. The box is a plain vgui::CheckButton (0xfc bytes): SetFont at vtable +0x1d8,
 // GetFont at +0x1dc, SetSelected(bool) at +0x23c; IsSelected() reads the byte at +0xba.
+// A vgui::Label (0xd4 bytes) is built with (parent, name, text). A PropertyPage is 0x7c
+// bytes, built with no arguments; the dialog's PropertySheet
+// (+0xe4) adds a page with AddPage(page, title, NULL) at vtable +0x1ac.
 #include "bl_vm.h"
 #include <math.h>
 
 extern char GameUI_operator_new[], GameUI_CheckButton_ctor[], GameUI_Panel_SetPos[], GameUI_Panel_GetPos[],
-    GameUI_Panel_SetSize[], GameUI_Panel_GetSize[], GameUI_PropertyPage_dtor[], GameUI_SubVisual_Update[],
-    GameUI_CvarSlider_Reset[], GameUI_CommandCombo_Reset[], GameUI_CvarToggle_Reset[];
+    GameUI_Panel_SetSize[], GameUI_Panel_GetSize[], GameUI_PropertyPage_ctor[], GameUI_PropertyPage_dtor[], GameUI_Label_ctor[],
+    GameUI_SubVisual_Update[], GameUI_CvarSlider_Reset[], GameUI_CommandCombo_Reset[], GameUI_CvarToggle_Reset[];
 int bl_effect_enabled(int effect);
 void bl_effect_set(int effect, int on);
 
 // In the order of the renderer's effects (BL_EFFECT_* in metal_render.m).
 static const char *const box_names[] = { "AmbientOcclusion", "Reflections", "HDR", "VolumetricLight",
                                          "SkinScattering", "Shadows", "Bloom", "EyeAdaptation",
-                                         "BouncedLight", "GlobalIllumination" };
+                                         "BouncedLight", "GlobalIllumination", "SmoothCharacters",
+                                         "SharpenAfterAA", "SkinDetail" };
 static const char *const box_texts[] = { "Ambient Occlusion", "Reflections", "HDR", "Volumetric Light",
                                          "Skin Scattering", "Shadows", "Bloom", "Eye Adaptation",
-                                         "Bounced Light", "Global Illumination" };
-#define NBOXES 10
-static uint32_t box_page, boxes[NBOXES];
+                                         "Bounced Light", "Global Illumination", "Smooth Characters",
+                                         "Sharpening", "Skin Detail" };
+#define NBOXES 13
+static uint32_t box_page, enhanced_page, boxes[NBOXES];
+#define LOG_ONCE_VGUI(...) do { static int once_; if (!once_++) fprintf(stderr, __VA_ARGS__); } while (0)
 
 static uint32_t call_this(void *cpu, const void *fn, uint32_t self, int nargs, const uint32_t *args)
 {
@@ -86,18 +100,20 @@ static uint32_t vcall(void *cpu, uint32_t self, uint32_t slot, int nargs, const 
     return bl_call_guest(cpu, field(field(self, 0), slot), BL_THISCALL, self, nargs, args);
 }
 
-// The boxes go where optionssubvisual.res leaves room, in its units (scaled to the
-// screen like the rest: "Combat effects" is 28 tall there): "Ambient Occlusion" just
-// below "Combat effects" (336,160 360x28), the others in a column to the right of the
-// "Shadow count" slider, from a row above it down to three below "Ambient Occlusion" (the
-// last just past the slider under it, which reaches 296; a box below that is cut off by
-// the page's bottom edge). In the page's
-// Copperplate font.
-// From Combat effects: x, y, width (0: Combat effects' own).
-static const int box_place[NBOXES][3] = { { 0, 28, 248 },     { 248, -112, 240 }, { 248, -84, 240 },
-                                           { 248, -56, 240 }, { 248, -28, 240 },  { 248, 0, 240 },
-                                           { 248, 28, 240 },  { 248, 56, 240 },   { 248, 84, 240 },
-                                           { 248, 112, 240 } };
+// Places in optionssubvisual.res units (scaled to the screen like the Visual tab, where
+// "Combat effects" is at 336,160 and 28 tall; the page runs from about -120 to 935
+// across and -15 to 300 down): three columns 300 apart around the page's middle, each a
+// heading and its boxes 40 apart (four, five in the last). x, y.
+#define COLUMN_W 290
+static const int heading_x[3] = { -24, 276, 576 };
+#define HEADING_Y 45
+static const char *const heading_texts[3] = { "Lighting", "Camera", "Surfaces & Characters" };
+static const int box_place[NBOXES][2] = { { -24, 165 }, { 576, 125 }, { 276, 85 },  { -24, 205 },
+                                           { 576, 165 }, { 576, 85 },  { 276, 125 }, { 276, 165 },
+                                           { -24, 125 }, { -24, 85 },  { 576, 205 }, { 276, 205 },
+                                           { 576, 245 } };
+
+// `page`: the Visual tab, whose "Combat effects" box gives the scale and the font.
 static void make_boxes(void *cpu, uint32_t page)
 {
     static uint32_t names[NBOXES], texts[NBOXES], out;
@@ -113,15 +129,30 @@ static void make_boxes(void *cpu, uint32_t page)
     double k = sz[1] / 28.0;
     uint32_t font = vcall(cpu, combat, 0x1dc, 0, NULL);
     box_page = page;
+    static uint32_t headings[3];
+    for (int i = 0; i < 3; i++) {
+        if (!headings[i]) headings[i] = bl_guest_strdup(heading_texts[i]);
+        uint32_t size = 0xd4;
+        uint32_t label = bl_call_guest(cpu, bl_h2g(GameUI_operator_new), BL_CDECL, 0, 1, &size);
+        if (!label) return;
+        uint32_t a[3] = { enhanced_page, headings[i], headings[i] };
+        call_this(cpu, GameUI_Label_ctor, label, 3, a);
+        uint32_t at[2] = { pos[0] + (uint32_t)(int32_t)floor((heading_x[i] - 336) * k + 0.5),
+                           pos[1] + (uint32_t)(int32_t)floor((HEADING_Y - 160) * k + 0.5) };
+        uint32_t wh[2] = { (uint32_t)(COLUMN_W * k + 0.5), sz[1] };
+        call_this(cpu, GameUI_Panel_SetPos, label, 2, at);
+        call_this(cpu, GameUI_Panel_SetSize, label, 2, wh);
+        vcall(cpu, label, 0x1d8, 1, &font);
+    }
     for (int i = 0; i < NBOXES; i++) {
         uint32_t size = 0xfc;
         uint32_t box = bl_call_guest(cpu, bl_h2g(GameUI_operator_new), BL_CDECL, 0, 1, &size);
         if (!box) return;
-        uint32_t a[3] = { page, names[i], texts[i] };
+        uint32_t a[3] = { enhanced_page, names[i], texts[i] };
         call_this(cpu, GameUI_CheckButton_ctor, box, 3, a);
-        uint32_t at[2] = { pos[0] + (uint32_t)(int32_t)floor(box_place[i][0] * k + 0.5),
-                           pos[1] + (uint32_t)(int32_t)floor(box_place[i][1] * k + 0.5) };
-        uint32_t wh[2] = { box_place[i][2] ? (uint32_t)(box_place[i][2] * k + 0.5) : sz[0], sz[1] };
+        uint32_t at[2] = { pos[0] + (uint32_t)(int32_t)floor((box_place[i][0] - 336) * k + 0.5),
+                           pos[1] + (uint32_t)(int32_t)floor((box_place[i][1] - 160) * k + 0.5) };
+        uint32_t wh[2] = { (uint32_t)(COLUMN_W * k + 0.5), sz[1] };
         call_this(cpu, GameUI_Panel_SetPos, box, 2, at);
         call_this(cpu, GameUI_Panel_SetSize, box, 2, wh);
         vcall(cpu, box, 0x1d8, 1, &font);
@@ -139,15 +170,36 @@ void bl_vgui_VisualReset_c(_cpu *cpu)
     for (int i = 0; i < 4; i++) call_this(cpu, GameUI_CvarSlider_Reset, field(page, sliders[i]), 0, NULL);
     call_this(cpu, GameUI_CommandCombo_Reset, field(page, 0x80), 0, NULL);
     call_this(cpu, GameUI_CvarToggle_Reset, field(page, 0x84), 0, NULL);
-    if (box_page != page || !boxes[0]) make_boxes(cpu, page);
+    if (enhanced_page && (box_page != page || !boxes[0])) make_boxes(cpu, page);
 }
 
-// The page's destructor body: the vtable it restores is the one already in place.
-// vgui deletes the box with the rest of the page's children.
+// PropertyDialog::AddPage(page, title) (thiscall).
+void bl_vgui_AddPage_c(_cpu *cpu)
+{
+    const uint32_t *args = REG2PTR(esp + 4);
+    uint32_t dialog = ecx, page = args[0], title = args[1];
+    uint32_t a[3] = { page, title, 0 };
+    vcall(cpu, field(dialog, 0xe4), 0x1ac, 3, a);
+    // The options dialog's Visual tab (by name: the module is not loaded at its own base).
+    if (!title || strcmp((const char *)bl_g2h(title), "#GameUI_Visual")) return;
+    static uint32_t name;
+    if (!name) name = bl_guest_strdup("Enhanced");
+    uint32_t size = 0x80;
+    uint32_t p = bl_call_guest(cpu, bl_h2g(GameUI_operator_new), BL_CDECL, 0, 1, &size);
+    if (!p) return;
+    call_this(cpu, GameUI_PropertyPage_ctor, p, 0, NULL);
+    enhanced_page = p;
+    uint32_t b[3] = { p, name, 0 };
+    vcall(cpu, field(dialog, 0xe4), 0x1ac, 3, b);
+    LOG_ONCE_VGUI("[vgui] options: Enhanced tab added\n");
+}
+
+// The Visual page's destructor body: the vtable it restores is the one already in place.
+// vgui deletes the boxes with the rest of the Enhanced page's children.
 void bl_vgui_VisualDestroy_c(_cpu *cpu)
 {
     uint32_t page = ecx;
-    if (box_page == page) box_page = 0, memset(boxes, 0, sizeof boxes);
+    if (box_page == page) box_page = 0, enhanced_page = 0, memset(boxes, 0, sizeof boxes);
     call_this(cpu, GameUI_PropertyPage_dtor, page, 0, NULL);
 }
 

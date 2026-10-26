@@ -9,3 +9,5 @@ loc_1001BDA0,GameUI_SubVisual_Update
 loc_1000F0B0,GameUI_CvarSlider_Reset
 loc_1000EBA0,GameUI_CommandCombo_Reset
 loc_1000F7E0,GameUI_CvarToggle_Reset
+loc_10025280,GameUI_PropertyPage_ctor
+loc_10023730,GameUI_Label_ctor

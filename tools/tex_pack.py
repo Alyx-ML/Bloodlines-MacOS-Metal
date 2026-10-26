@@ -21,7 +21,9 @@ The new size is the original's times the largest power of two that fits the PNG 
 must have the original's shape). Upscalers shift colours a little, so the PNG's colours
 are first matched to the original's: chaiNNer's wavelet colour fix (as in PBRify_Remix's
 "With Color Fix" chain), which keeps the PNG's fine detail and takes the broad colour from
-the original, with the edges wrapping as brush textures repeat. The mipmaps are made from
+the original, with the edges wrapping as brush textures repeat. A PNG named "<name>-replace.png"
+is a new picture drawn in the original's layout (from other sources, not an upscale): it
+keeps its own colours. The mipmaps are made from
 the result (Lanczos, alpha filtered apart from colour) and stored as BC7, encoded by
 tools/bc7_encode.c (compiled into build/tools).
 
@@ -204,7 +206,8 @@ def pack(job):
         tw, th = target_size(o, img)
         if (tw, th) != img.size:
             img = img.resize((tw, th), Image.LANCZOS)
-        tex = build(o, colour_fix(o, img))
+        replace = os.path.splitext(os.path.basename(png))[0].lower().endswith("-replace")
+        tex = build(o, img if replace else colour_fix(o, img))
         os.makedirs(os.path.dirname(tex_out), exist_ok=True)
         with open(tex_out, "wb") as f:
             f.write(tex)

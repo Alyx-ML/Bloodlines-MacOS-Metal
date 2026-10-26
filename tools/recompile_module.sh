@@ -83,10 +83,10 @@ INLINE="$HERE/build/runtime/sr_inline.bc"
 export LLVM ARM64_DL INLINE SR_INLINE
 ls "$NAME".part* | xargs -P "$JOBS" -I{} sh -c 'if [ -z "$SR_INLINE" ]; then cp "$1" "$1.linked.bc"; else
     "$LLVM/llvm-link" --only-needed --internalize "$1" "$INLINE" -o "$1.linked.bc"; fi &&
-    "$LLVM/opt" -O2 -mtriple=arm64-apple-macos14 --data-layout="$ARM64_DL" "$1.linked.bc" -o "$1.bc" &&
-    "$LLVM/llc" -O2 -mtriple=arm64-apple-macos14 -filetype=obj "$1.bc" -o "$1.o"' sh {}
+    "$LLVM/opt" -O2 -mtriple=arm64-apple-macos26 --data-layout="$ARM64_DL" "$1.linked.bc" -o "$1.bc" &&
+    "$LLVM/llc" -O2 -mtriple=arm64-apple-macos26 -filetype=obj "$1.bc" -o "$1.o"' sh {}
 ld -r -arch arm64 -o "$NAME.o" "$NAME".part*.o
 rm -f "$NAME".part*
-clang -std=c2x -O2 -arch arm64 -mmacosx-version-min=14.0 -Wall -I../../runtime -I../../third_party/SR/SR/llasm-support \
+clang -std=c2x -O2 -arch arm64 -mmacosx-version-min=26.0 -Wall -I../../runtime -I../../third_party/SR/SR/llasm-support \
     -DPTROFS_64BIT=1 -c "${NAME}_exports.c" -o "${NAME}_exports.o"
 echo "PROGRESS 100 $OUT/$NAME.o"

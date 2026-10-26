@@ -9,7 +9,9 @@ texture (or its upscale) lands exactly where it did.
 A recipe names the model and the changes, nothing else is decided by the script
 ("keep_others": true draws any part that is not round exactly as the original;
 "any_sides": true lets a ring take any number of sides from the original's up, not
-only multiples of it, for the lightest result):
+only multiples of it, for the lightest result; "smooth_outline": true rounds every bend
+of the profile the original shades smoothly; "tubes": true remodels a tube, joined on or alone,
+such as a lamp's bent arm, round along a smooth path):
     {"model": "models/scenery/furniture/barstool/barstool.mdl",
      "tolerance": 0.02,                   # in the model's units
      "round": [{"material": "barstool", "at": [2.431, -11.19], "radius": 0.6}]}
@@ -107,6 +109,8 @@ def axis_and_sides(v, split=True, loose=False):
     n = top[0][0]
     if n < 3:
         raise Refused("no rings of vertices")
+    if n < 6:  # a box or a wedge, square to an axis: rounding it would make it a drum
+        raise Refused(f"rings of only {n} sides: not round")
     full = [r for r in full if len(r) == n]
     centre = np.mean([r[:, :2].mean(0) for r in full], 0)
     ring = max(full, key=lambda r: np.hypot(*(r[:, :2] - centre).T).mean() if len(r) else 0)
@@ -251,6 +255,248 @@ def rounded(pts, rounds, tol):
             out.append(((c[0] + rad * math.cos(t), c[1] + rad * math.sin(t)), True))
     out.append((pts[-1], False))
     return out
+
+
+def ring_normals(v, vn, faces, centre, pts):
+    """For each profile point, the original's normal there in (radius, height) if all its
+    corners share one (the original shades smoothly through that ring), else None (a
+    crease, or a ring at the axis)."""
+    out = []
+    for r, z in pts:
+        ns = []
+        for f in faces:
+            for c in f:
+                p = v[c[0]]
+                d = p[:2] - centre
+                rr = math.hypot(*d)
+                if rr > 1e-6 and abs(p[2] - z) < 0.03 and abs(rr - r) < 0.06 + 0.01 * r:
+                    nn = vn[c[2]]
+                    ns.append((float(nn[:2] @ d / rr), float(nn[2])))
+        ns = np.array(ns)
+        if r < 0.1 or not len(ns) or np.ptp(ns, axis=0).max() > 0.15:
+            out.append(None)
+        else:
+            m = ns.mean(0)
+            out.append(m / np.linalg.norm(m))
+    return out
+
+
+def smoothed(prof, normal_at):
+    """The profile with every bend the original shades smoothly (one normal through the
+    ring) marked smooth, so it is shaded across rather than creased; the outline is unchanged."""
+    out = []
+    for j, (p, smooth) in enumerate(prof):
+        inner = 0 < j < len(prof) - 1
+        out.append((p, smooth or (inner and normal_at.get(tuple(p)) is not None)))
+    return out
+
+
+def catmull(p0, p1, p2, p3, s):
+    """The centripetal Catmull-Rom curve from p1 (s = 0) to p2 (s = 1): no loops or
+    overshoot however unevenly the points are spaced."""
+    t1 = max(np.linalg.norm(p1 - p0) ** 0.5, 1e-9)
+    t2 = t1 + max(np.linalg.norm(p2 - p1) ** 0.5, 1e-9)
+    t3 = t2 + max(np.linalg.norm(p3 - p2) ** 0.5, 1e-9)
+    t = t1 + (t2 - t1) * s
+    a1 = ((t1 - t) * p0 + t * p1) / t1
+    a2 = ((t2 - t) * p1 + (t - t1) * p2) / (t2 - t1)
+    a3 = ((t3 - t) * p2 + (t - t2) * p3) / (t3 - t2)
+    b1 = ((t2 - t) * a1 + t * a2) / t2
+    b2 = ((t3 - t) * a2 + (t - t1) * a3) / (t3 - t1)
+    return ((t2 - t) * b1 + (t - t1) * b2) / (t2 - t1)
+
+
+def spline(P, smooth, tol, before=None, after=None):
+    """Points along a smooth curve through P, as (point, span j, fraction s along it).
+    A span runs straight unless one of its ends is smooth; it curves through its
+    neighbours there, and past the ends through before/after (default: straight on), in
+    the fewest steps that keep within tol of the curve."""
+    P = [np.asarray(p, float) for p in P]
+    out = [(P[0], 0, 0.0)]
+    for j in range(len(P) - 1):
+        a, b = P[j], P[j + 1]
+        if not (smooth[j] or smooth[j + 1]):
+            out.append((b, j, 1.0))
+            continue
+        p0 = P[j - 1] if j > 0 and smooth[j] else (before if j == 0 and before is not None else 2 * a - b)
+        last = j + 2 == len(P)
+        p3 = P[j + 2] if not last and smooth[j + 1] else (after if last and after is not None else 2 * b - a)
+        fine_s = np.linspace(0, 1, 33)
+        fine = np.array([catmull(p0, a, b, p3, s) for s in fine_s])
+        for k in range(1, 33):
+            knots = np.array([catmull(p0, a, b, p3, i / k) for i in range(k + 1)])
+            seg = np.clip((fine_s * k).astype(int), 0, k - 1)
+            q0, d = knots[seg], knots[seg + 1] - knots[seg]
+            w = np.clip(((fine - q0) * d).sum(1) / np.maximum((d * d).sum(1), 1e-12), 0, 1)
+            if np.linalg.norm(fine - (q0 + d * w[:, None]), axis=1).max() <= tol:
+                break
+        out += [(knots[i], j, i / k) for i in range(1, k + 1)]
+    return out
+
+
+def auto_rounds(pts, normals):
+    """Roundings for the recipe's "smooth_outline": every bend the original shades
+    smoothly rounded as far as its two sides allow (an arc meeting each 0.44 of the way
+    along the shorter), so a coarse dome becomes a smooth one while long straight runs
+    stay straight; {profile index: radius}."""
+    out = {}
+    for j in range(1, len(pts) - 1):
+        if normals[j] is None:
+            continue
+        p, a, b = (np.array(pts[k], float) for k in (j, j - 1, j + 1))
+        la, lb = np.linalg.norm(a - p), np.linalg.norm(b - p)
+        half = math.acos(max(-1.0, min(1.0, float((a - p) @ (b - p) / (la * lb))))) / 2
+        if half < math.radians(89.5):
+            out[j] = 0.44 * min(la, lb) * math.tan(half)
+    return out
+
+
+def bent_path(C, sharp, rad, tol):
+    """Points along a tube's path through ring centres C whose rings at the indices in
+    sharp come in pairs either side of a sharp bend (a stair rail's turn down): each pair
+    becomes one corner where the straight runs either side meet, bent round as a pipe is
+    (twice the tube's radius), and the runs between curve smoothly through their rings as
+    in spline()."""
+    C = [np.asarray(c, float) for c in C]
+    pts, corner = [], []
+    j = 0
+    while j < len(C):
+        if j in sharp and j + 1 in sharp and 0 < j and j + 2 < len(C):
+            # where the lines through the runs either side come closest
+            a, da = C[j], C[j] - C[j - 1]
+            b, db = C[j + 1], C[j + 2] - C[j + 1]
+            M = np.stack([da, -db], 1)
+            s, t = np.linalg.lstsq(M, b - a, rcond=None)[0]
+            pts.append(((a + s * da) + (b + t * db)) / 2)
+            corner.append(True)
+            j += 2
+        else:
+            pts.append(C[j])
+            corner.append(False)
+            j += 1
+    out, run = [], [pts[0]]
+
+    def flush(run):
+        smooth = [0 < i < len(run) - 1 for i in range(len(run))]
+        seg = [p for p, _, _ in spline(run, smooth, tol)]
+        out.extend(seg if not out else seg[1:])
+
+    for i in range(1, len(pts)):
+        if not corner[i] or i == len(pts) - 1:
+            run.append(pts[i])
+            continue
+        K, d1, d2 = pts[i], pts[i] - pts[i - 1], pts[i + 1] - pts[i]
+        l1, l2 = np.linalg.norm(d1), np.linalg.norm(d2)
+        d1, d2 = d1 / l1, d2 / l2
+        bend = math.acos(max(-1.0, min(1.0, float(d1 @ d2))))
+        R = 2 * rad
+        L = min(R * math.tan(bend / 2), 0.45 * l1, 0.45 * l2)
+        R = L / math.tan(bend / 2)
+        run.append(K - d1 * L)
+        flush(run)
+        n1 = d2 - (d2 @ d1) * d1
+        n1 /= np.linalg.norm(n1)
+        c = K - d1 * L + R * n1
+        steps = arc_steps(R, bend, tol)
+        out.extend(c - R * (math.cos(f) * n1 - math.sin(f) * d1)
+                   for f in np.linspace(0, bend, steps + 1)[1:])
+        run = [K + d2 * L]
+    flush(run)
+    return np.array(out)
+
+
+def tube(v, faces, tol, any_sides):
+    """A part joined on (a lamp's arm) that is a tube, rings of the same few points along a
+    bent path, remodelled round and bent smoothly: a centripetal Catmull-Rom path through
+    the rings' centres, the radius changing between them as the original's does, and
+    circles kept square to the path. Its vertices, normals and faces (quads)."""
+    key = lambda i: tuple(np.round(v[i], 3))  # noqa: E731
+    edges = {tuple(sorted((key(f[a][0]), key(f[(a + 1) % len(f)][0])))) for f in faces for a in range(len(f))}
+    edges = [e for e in edges if e[0] != e[1]]
+    ls = np.sort([math.dist(*e) for e in edges])
+    gap = np.argmax(ls[1:] / ls[:-1])
+    if ls[gap + 1] < 2 * ls[gap]:
+        raise Refused("no rings told apart from the lengths between them")
+    cut = (ls[gap] + ls[gap + 1]) / 2
+    up = {}
+
+    def root(x):
+        while up.setdefault(x, x) != x:
+            x = up[x]
+        return x
+
+    for a, b in edges:
+        root(a), root(b)
+        if math.dist(a, b) < cut:
+            up[root(a)] = root(b)
+    groups = defaultdict(list)
+    for x in list(up):
+        groups[root(x)].append(x)
+    rings = list(groups.values())
+    # two rings closer than their sides are long (a sharp bend) are taken as one: part them
+    # by which ring along the tube each point leads to
+    m = Counter(len(r) for r in rings).most_common(1)[0][0]
+    ring_of = {x: k for k, r in enumerate(rings) for x in r}
+    leads = defaultdict(set)
+    for a, b in edges:
+        if ring_of[a] != ring_of[b]:
+            leads[a].add(ring_of[b]), leads[b].add(ring_of[a])
+    pairs = []
+    for r in [r for r in rings if len(r) == 2 * m]:
+        to = {frozenset(leads[x]) for x in r}
+        if len(to) == 2 and all(len(t) == 1 for t in to):
+            halves = [[x for x in r if leads[x] == t] for t in to]
+            if all(len(h) == m for h in halves):
+                rings.remove(r)
+                rings += halves
+                pairs.append((halves[0][0], halves[1][0]))
+    ring_of = {x: k for k, r in enumerate(rings) for x in r}
+    names = list(range(len(rings)))
+    sizes = {len(r) for r in rings}
+    if len(sizes) != 1 or min(sizes) < 3 or len(names) < 3:
+        raise Refused(f"not one tube: rings of {sorted(len(r) for r in rings)} points")
+    links = defaultdict(set)
+    for a, b in edges:
+        if ring_of[a] != ring_of[b]:
+            links[ring_of[a]].add(ring_of[b]), links[ring_of[b]].add(ring_of[a])
+    ends = [k for k in names if len(links[k]) == 1]
+    if any(len(s) > 2 for s in links.values()) or len(ends) != 2:
+        raise Refused("the tube's rings do not form one open chain")
+    chain = [ends[0]]
+    while len(chain) < len(names):
+        chain.append(next(k for k in links[chain[-1]] if k not in chain))
+    pts = [np.array(rings[k]) for k in chain]
+    C = [p.mean(0) for p in pts]
+    rad = [float(np.linalg.norm(p - c, axis=1).mean()) for p, c in zip(pts, C)]
+    m = len(pts[0])
+    sharp = {chain.index(ring_of[a]) for a, b in pairs} | {chain.index(ring_of[b]) for a, b in pairs}
+    if sharp:
+        X = bent_path(C, sharp, float(np.median(rad)), tol)
+        r = [float(np.median(rad))] * len(X)
+    else:
+        path = spline(C, [0 < j < len(C) - 1 for j in range(len(C))], tol)
+        X = np.array([p for p, _, _ in path])
+        r = [rad[j] + (rad[min(j + 1, len(rad) - 1)] - rad[j]) * s for _, j, s in path]
+    T = np.gradient(X, axis=0)
+    T /= np.linalg.norm(T, axis=1, keepdims=True)
+    k = max(m, arc_steps(max(rad), 2 * math.pi, tol)) if any_sides else m * arc_steps(max(rad), 2 * math.pi / m, tol)
+    u = pts[0][0] - C[0]
+    verts, norms, grid = [], [], []
+    for x, t, rr in zip(X, T, r):
+        u = u - (u @ t) * t  # carried along the path without twisting
+        u /= np.linalg.norm(u)
+        w = np.cross(t, u)
+        line = []
+        for i in range(k + 1):
+            a = 2 * math.pi * i / k
+            d = math.cos(a) * u + math.sin(a) * w
+            verts.append(x + rr * d)
+            norms.append(d)
+            line.append(len(verts) - 1)
+        grid.append(line)
+    quads = [[lo[i], lo[i + 1], hi[i + 1], hi[i]] for lo, hi in zip(grid, grid[1:]) for i in range(k)]
+    print(f"    tube of {len(C)} rings of {m} points: {len(X)} rings of {k} sides")
+    return np.array(verts), np.array(norms), quads
 
 
 def surface(prof, centre, n, a0, tol, any_sides=False):
@@ -420,6 +666,30 @@ def main():
             out_f.append((mat, fs))
             return len(faces)
 
+        def add(mat, sv, sn, quads, faces, vR, vnR, R):
+            """New faces made from the original's faces, in the frame R turned the model to."""
+            # normals the way the original's point (most of its vertices' nearest new one
+            # agreeing), and triangles wound as the game's: clockwise seen from the front
+            near = [int(np.argmin(((sv - vR[c[0]]) ** 2).sum(1))) for f in faces for c in f]
+            ref = np.array([vnR[c[2]] for f in faces for c in f])
+            if ((sn[near] * ref).sum(1) < 0).sum() > len(near) / 2:
+                sn = -sn
+            area = [np.linalg.norm(np.cross(sv[q[1]] - sv[q[0]], sv[q[2]] - sv[q[0]])) for q in quads]
+            q0 = quads[int(np.argmax(area))]
+            fn = np.cross(sv[q0[1]] - sv[q0[0]], sv[q0[2]] - sv[q0[0]])
+            if fn @ sn[q0[0]] > 0:
+                quads = [q[::-1] for q in quads]
+            uvs = transfer_uvs(sv, quads, vR, vt, faces)
+            sv, sn = sv @ R, sn @ R  # back from the axis's frame to the model's
+            base = len(out_v)
+            out_v.extend(sv)
+            out_n.extend(sn)
+            fs = []
+            for q, uv in zip(quads, uvs):
+                fs.append(([base + i for i in q], list(range(len(out_uv), len(out_uv) + len(q)))))
+                out_uv.extend(uv)
+            out_f.append((mat, fs))
+
         for mat, part in [(m, p) for m in order for p in parts(v, groups[m])]:
             pids = sorted({c[0] for f in part for c in f})
             found, err = None, None
@@ -434,10 +704,32 @@ def main():
             if not found:
                 if not loose:
                     raise err
+                if recipe.get("tubes"):
+                    try:  # a tube on its own (a hand rail)
+                        tv, tn, tq = tube(v, part, tol, recipe.get("any_sides", False))
+                        add(mat, tv, tn, tq, part, v, vn, np.eye(3))
+                        continue
+                    except Refused as e:
+                        if len(part) > 32:
+                            print(f"  {mat} part of {len(part)} faces kept: {e}")
                 kept += keep(mat, part)  # not round about any axis
                 continue
             R, vR, centre, n, a0, pts, faces, stray = found
             vnR = vn @ R.T
+            if stray and recipe.get("tubes"):
+                # faces reaching the round part's rings join the two and are kept; the rest
+                # may be a tube (a lamp's arm)
+                def on_round(i):
+                    rr = math.hypot(*(vR[i][:2] - centre))
+                    return any(abs(vR[i][2] - z) < 0.03 and abs(rr - pr) < 0.06 + 0.01 * pr for pr, z in pts)
+                joins = [f for f in stray if any(on_round(c[0]) for c in f)]
+                arm = [f for f in stray if not any(on_round(c[0]) for c in f)]
+                try:
+                    tv, tn, tq = tube(vR, arm, tol, recipe.get("any_sides", False))
+                    add(mat, tv, tn, tq, arm, vR, vnR, R)
+                    stray = joins
+                except Refused as e:
+                    print(f"    joined-on part kept: {e}")
             kept += keep(mat, stray)  # joined on but not round (a knob, a bracket)
             tilt = math.degrees(math.acos(min(1.0, abs(R[2][2]))))
             print(f"  {mat}, {n} sides around ({centre[0]:.3f}, {centre[1]:.3f})"
@@ -455,30 +747,16 @@ def main():
                     raise Refused(f"{mat} corner {rd['at']} is an end of its profile, not a corner")
                 rounds[j] = rd["radius"]
                 unused.remove(k)
-            prof = rounded(pts, rounds, tol)
+            # bends the original shades smoothly are shaded smoothly here too (and with
+            # "smooth_outline", rounded)
+            normals = ring_normals(vR, vnR, faces, centre, pts)
+            if recipe.get("smooth_outline"):
+                rounds = {**auto_rounds(pts, normals), **rounds}
+            normal_at = {tuple(p): nn for p, nn in zip(pts, normals)}
+            prof = smoothed(rounded(pts, rounds, tol), normal_at)
             sv, sn, quads, lo, hi = surface(prof, centre, n, a0, tol, recipe.get("any_sides", False))
             print(f"    {lo} sides" if lo == hi else f"    {lo} to {hi} sides")
-            # normals the way the original's point (most of its vertices' nearest new one
-            # agreeing), and triangles wound as the game's: clockwise seen from the front
-            near = [int(np.argmin(((sv - vR[c[0]]) ** 2).sum(1))) for f in faces for c in f]
-            ref = np.array([vnR[c[2]] for f in faces for c in f])
-            if ((sn[near] * ref).sum(1) < 0).sum() > len(near) / 2:
-                sn = -sn
-            area = [np.linalg.norm(np.cross(sv[q[1]] - sv[q[0]], sv[q[2]] - sv[q[0]])) for q in quads]
-            q0 = quads[int(np.argmax(area))]
-            fn = np.cross(sv[q0[1]] - sv[q0[0]], sv[q0[2]] - sv[q0[0]])
-            if fn @ sn[q0[0]] > 0:
-                quads = [q[::-1] for q in quads]
-            uvs = transfer_uvs(sv, quads, vR, vt, faces)
-            sv, sn = sv @ R, sn @ R  # back from the axis's frame to the model's
-            base = len(out_v)
-            out_v += list(sv)
-            out_n += list(sn)
-            fs = []
-            for q, uv in zip(quads, uvs):
-                fs.append(([base + i for i in q], list(range(len(out_uv), len(out_uv) + len(q)))))
-                out_uv += list(uv)
-            out_f.append((mat, fs))
+            add(mat, sv, sn, quads, faces, vR, vnR, R)
         for k in unused:
             rd = recipe["round"][k]
             raise Refused(f"{rd['material']} has no profile corner at {rd['at']}")

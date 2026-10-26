@@ -10,6 +10,7 @@ proc bl_vgui_GetCursorLine public
 endp
 
 funcv bl_vgui_VisualReset_c $
+funcv bl_vgui_AddPage_c $
 funcv bl_vgui_VisualDestroy_c $
 
 proc bl_vgui_VisualReset public
@@ -20,4 +21,9 @@ endp
 proc bl_vgui_VisualDestroy public
         call bl_vgui_VisualDestroy_c $
         Call_Asm_Return 0
+endp
+
+proc bl_vgui_AddPage public
+        call bl_vgui_AddPage_c $
+        Call_Asm_Return 2
 endp

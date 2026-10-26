@@ -16,7 +16,7 @@ python3 -I "$HERE/tools/gen_com.py" "$HERE/runtime/d3d9/com.def" com.llasm com_g
 
 # Relative include path: the project path contains spaces.
 # C23 because SR's llasm_cpu.h uses nullptr.
-CFLAGS="-std=c2x -O2 -arch arm64 -mmacosx-version-min=14.0 -Wall -DPTROFS_64BIT=1 -I. -I../../third_party/SR/SR/llasm-support"
+CFLAGS="-std=c2x -O2 -arch arm64 -mmacosx-version-min=26.0 -Wall -DPTROFS_64BIT=1 -I. -I../../third_party/SR/SR/llasm-support"
 for f in "$HERE"/runtime/*.c "$HERE"/runtime/d3d9/*.c com_gen.c; do
     clang $CFLAGS -I"$HERE/runtime" -I"$HERE/runtime/d3d9" -c "$f" -o "obj/$(basename "$f" .c).o"
 done
@@ -40,8 +40,8 @@ cp "$HERE"/runtime/llasm/*.llasm .  # com.llasm is generated above
 for f in *.llasm; do
     b="${f%.llasm}"
     "$HERE/build/tools/llasm" -m64 -ptrofs -O -I "$SUPPORT" -I "$HERE/runtime/llasm" "$f" -o "$b.ll"
-    "$LLVM/opt" -O2 -mtriple=arm64-apple-macos14 --data-layout="$ARM64_DL" "$b.ll" -o "$b.bc"
-    "$LLVM/llc" -O2 -mtriple=arm64-apple-macos14 -filetype=obj "$b.bc" -o "obj/llasm_$b.o"
+    "$LLVM/opt" -O2 -mtriple=arm64-apple-macos26 --data-layout="$ARM64_DL" "$b.ll" -o "$b.bc"
+    "$LLVM/llc" -O2 -mtriple=arm64-apple-macos26 -filetype=obj "$b.bc" -o "obj/llasm_$b.o"
 done
 
 ar rcs libbl_runtime.a obj/*.o

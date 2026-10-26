@@ -335,6 +335,8 @@ struct gen {
     char base_coord[96];  // what stage 0's 2D texture is read with (for the detail normal map)
     int alb_stage;        // the first plain 2D texture read, and its coordinate (variant albedo); -1 none yet
     char alb_coord[96];
+    char pom_coords[8][96];  // the coordinates plain 2D textures are read with (ps_pom), npom of them
+    int npom;
 };
 
 static const char comp[] = "xyzw";
@@ -530,6 +532,11 @@ static void sample(struct gen *g, uint32_t stage, const char *coord, const char 
     if (stage == 0 && k == D3D_TEX_2D && !g->base_coord[0]) snprintf(g->base_coord, sizeof g->base_coord, "%s", coord);
     if (k == D3D_TEX_2D && g->alb_stage < 0)
         g->alb_stage = (int)stage, snprintf(g->alb_coord, sizeof g->alb_coord, "%s", coord);
+    if (k == D3D_TEX_2D) {
+        int seen = 0;
+        for (int i = 0; i < g->npom && !seen; i++) seen = !strcmp(g->pom_coords[i], coord);
+        if (!seen && g->npom < 8) snprintf(g->pom_coords[g->npom++], sizeof g->pom_coords[0], "%s", coord);
+    }
     snprintf(buf, len, "tex%u.sample(smp%u, (%s).%s%s)", stage, stage, coord, k == D3D_TEX_2D ? "xy" : "xyz",
              extra ? extra : "");
 }
@@ -549,7 +556,7 @@ static const char *const header =
     "struct BLVSParams { int4 i[16]; uint b[16]; float2 inv_viewport; float clip_y; float pad; };\n"
     "struct BLPSParams { int4 i[16]; uint b[16]; float4 bumpenv[8]; float4 bumpenv_l[8]; float4 fog_color;\n"
     "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float gloss, pbr; float4 view;\n"
-    "    float bump, metal, spec, pad2; };\n"
+    "    float bump, metal, spec, pom; float pom_dist, pad3, pad4, pad5; };\n"
     "struct BLVSOut {\n"
     "    float4 pos [[position]]; float psize [[point_size]];\n"
     "    float4 d0 [[user(d0)]]; float4 d1 [[user(d1)]];\n"
@@ -948,8 +955,83 @@ static int gen_body(struct gen *g)
 // coordinates change across the pixel ("normal mapping without precomputed tangents"),
 // laid on the model's smooth normal. The light (oc0 and _l together, so the skin pass's colour
 // stays the texture's) is scaled by how far the bumps tilt towards the map's lights
-// (bl_dl[4 + 4k] to [7 + 4k]: metal_render.m's struct fog_light), and the shine added
+// (bl_dl[7 + 4k] to [10 + 4k]: metal_render.m's struct fog_light), and the shine added
 // (bl_dl[2].x its strength; the map's alpha is the roughness), and the light given a direction.
+// Skin detail on faces and bodies' skin, and a weave on bodies' cloth. bl_dl[4]: the
+// pores' strength (0 off), the texture's size in texels, 1 when bl_dsk (a body's skin
+// mask) says where its skin is; bl_dl[5]: the weave's strength (0 off), the largest pore
+// and thread spacing allowed in world units; bl_dl[6]: texels per pore and per thread.
+// Pores and threads are sized by the texture (a cell every so many texels), except where
+// that would make them bigger in the world than the largest allowed (characters with small
+// textures): there the grid is made finer, in steps of two, the two steps either side of
+// the wanted size mixed by how close each is so neighbouring triangles agree (the world
+// size of a texel, from how position and texture coordinates change across the pixel, is
+// constant over a triangle). Elsewhere it is one grid at the texture's size, as before.
+// Pores: small pits, one or none in each cell, placed and sized at random (an integer hash
+// of the cell), which tilt the normal (_n) and roughen the shine where they are; the shine
+// is also uneven in patches some fourteen pores wide (value noise). The weave: threads one
+// over and one under, each its own thickness. Each is faded out where its cells get smaller
+// than about a pixel, so it does not shimmer far off.
+static void ps_skin_detail(struct out *o)
+{
+    line(o, "#ifndef BL_HASH");
+    line(o, "#define BL_HMIX(x) ((((x) ^ ((x) >> 15u))) * 2246822519u)");
+    line(o, "#define BL_HASH(c) BL_HMIX(BL_HMIX((uint((c).x + 8192.0) * 1597334677u ^ uint((c).y + 8192.0) * 3812015801u) * 747796405u + 2891336453u))");
+    line(o, "#endif");
+    line(o, "float _skm = bl_dl[4].w > 0.5 ? bl_dsk.sample(bl_ds, _uv).r : 1.0;");
+    line(o, "float2 _ut = _uv * bl_dl[4].yz, _tx = _ux * bl_dl[4].yz, _ty = _uy * bl_dl[4].yz;");
+    line(o, "float _rt = sqrt(length(cross(_px, _py)) / max(abs(_tx.x * _ty.y - _tx.y * _ty.x), 1e-12));");
+    line(o, "if (bl_dl[4].x > 0.0 && _skm > 0.001) {");
+    o->indent++;
+    line(o, "float _n0 = 1.0 / bl_dl[6].x, _L = clamp(log2(max(_rt / bl_dl[5].y, _n0) / _n0), 0.0, 8.0), _L0 = floor(_L), _fr = _L - _L0;");
+    line(o, "float _ph = 0.0, _pw = 0.0; float2 _pg = float2(0.0), _pp0 = _ut * _n0 * exp2(_L0);");
+    line(o, "for (int _o = 0; _o < 2; _o++) {");
+    line(o, "    float2 _pp = _ut * _n0 * exp2(_L0 + float(_o)), _off = (_L0 + float(_o)) * float2(311.0, 173.0);");
+    line(o, "    float _fo = saturate(2.0 - 2.0 * length(fwidth(_pp))) * (_o == 0 ? 1.0 - _fr : _fr);");
+    line(o, "    _pw += _fo;");
+    line(o, "    if (_fo <= 0.0) continue;");
+    line(o, "    float2 _pc = floor(_pp);");
+    line(o, "    for (int _j = -1; _j <= 1; _j++) for (int _i = -1; _i <= 1; _i++) {");
+    line(o, "        float2 _c = _pc + float2(_i, _j); uint _hh = BL_HASH(_c + _off);");
+    line(o, "        float3 _r = float3(_hh & 1023u, (_hh >> 10) & 1023u, (_hh >> 20) & 1023u) / 1023.0;");
+    line(o, "        float _a = (_hh >> 30) == 0u ? 0.0 : 0.5 + 0.5 * _r.z, _rr = 0.2 + 0.14 * _r.z;");
+    line(o, "        float2 _d = _pp - (_c + 0.15 + 0.7 * _r.xy);");
+    line(o, "        float _e = _fo * _a * exp(-dot(_d, _d) / (_rr * _rr));");
+    line(o, "        _ph += _e, _pg += _e * 2.0 * _d / (_rr * _rr);");
+    line(o, "    }");
+    line(o, "}");
+    line(o, "float _pf = bl_dl[4].x * _skm;");
+    line(o, "_n = normalize(_n - (_T * _pg.x + _B * _pg.y) * 0.12 * _pf);");
+    line(o, "float2 _q = _pp0 / 14.0, _qi = floor(_q), _qf = _q - _qi; _qf = _qf * _qf * (3.0 - 2.0 * _qf);");
+    line(o, "float _v00 = float(BL_HASH(_qi) & 1023u), _v10 = float(BL_HASH(_qi + float2(1, 0)) & 1023u);");
+    line(o, "float _v01 = float(BL_HASH(_qi + float2(0, 1)) & 1023u), _v11 = float(BL_HASH(_qi + float2(1, 1)) & 1023u);");
+    line(o, "float _pv = mix(mix(_v00, _v10, _qf.x), mix(_v01, _v11, _qf.x), _qf.y) / 1023.0;");
+    line(o, "_rg = clamp(_rg * mix(1.0, (0.8 + 0.4 * _pv) * (1.0 + 0.6 * saturate(_ph)), saturate(_pf * _pw)), 0.22, 1.0);");
+    line(o, "_a2 = _rg * _rg * _rg * _rg;");
+    o->indent--;
+    line(o, "}");
+    line(o, "if (bl_dl[5].x > 0.0 && bl_dl[4].w > 0.5 && _skm < 0.999) {");
+    o->indent++;
+    line(o, "float _n0 = 1.0 / bl_dl[6].y, _L = clamp(log2(max(_rt / bl_dl[5].z, _n0) / _n0), 0.0, 8.0), _L0 = floor(_L), _fr = _L - _L0;");
+    line(o, "float2 _wg = float2(0.0);");
+    line(o, "for (int _o = 0; _o < 2; _o++) {");
+    line(o, "    float2 _wp = _ut * _n0 * exp2(_L0 + float(_o));");
+    line(o, "    float _fo = saturate(2.0 - 2.0 * length(fwidth(_wp))) * (_o == 0 ? 1.0 - _fr : _fr);");
+    line(o, "    if (_fo <= 0.0) continue;");
+    line(o, "    float2 _wc = floor(_wp), _wx = _wp - _wc;");
+    line(o, "    bool _warp = (int(_wc.x) + int(_wc.y) & 1) == 0;");
+    line(o, "    if (!_warp) _wx = _wx.yx;");
+    line(o, "    float _sa = sin(3.14159 * _wx.x), _sb = sin(3.14159 * _wx.y);");
+    line(o, "    float2 _tid = _warp ? float2(_wc.x, 1.0 + float(_o)) : float2(1.0 + float(_o), _wc.y);");
+    line(o, "    float _th = 0.8 + 0.4 * float(BL_HASH(_tid) & 1023u) / 1023.0;");
+    line(o, "    float2 _g = 3.14159 * _th * float2(cos(3.14159 * _wx.x) * (0.6 + 0.4 * _sb), _sa * 0.4 * cos(3.14159 * _wx.y));");
+    line(o, "    _wg += _fo * (_warp ? _g : _g.yx);");
+    line(o, "}");
+    line(o, "_n = normalize(_n - (_T * _wg.x + _B * _wg.y) * 0.05 * bl_dl[5].x * (1.0 - _skm));");
+    o->indent--;
+    line(o, "}");
+}
+
 static void ps_detail(struct out *o, const char *coord, int hair)
 {
     line(o, "{");
@@ -985,6 +1067,7 @@ static void ps_detail(struct out *o, const char *coord, int hair)
     line(o, "float4 _ms = bl_dn.sample(bl_ds, _uv);");
     line(o, "float _rg = clamp(_ms.w, 0.22, 1.0), _a2 = _rg * _rg * _rg * _rg;");
     line(o, "float _cloth = smoothstep(0.6, 0.85, _rg);");
+    if (!hair) ps_skin_detail(o);
     line(o, "float3 _V = -normalize(_P); float _nv = saturate(dot(_n, _V)) + 1e-4;");
     line(o, "float _f = 0.0, _E = 0.0, _S = 0.0, _Sh = 0.0, _Et = 0.0, _Dl = 0.0, _Tr = 0.0, _hs = 0.0;");
     if (hair) {
@@ -1000,7 +1083,7 @@ static void ps_detail(struct out *o, const char *coord, int hair)
         line(o, "_n = normalize(_n + (bl_dl[2].z > 0.5 ? _B : _T) * (_hr1 - _hr0) * 6.0 * _sx * (1.0 - _sx) * 0.3 * _sa);");
     }
     line(o, "for (int _k = 0; _k < int(bl_dl[1].w); _k++) {");
-    line(o, "    float4 _lp = bl_dl[4 + 4 * _k], _lc = bl_dl[5 + 4 * _k], _ld = bl_dl[6 + 4 * _k], _at = bl_dl[7 + 4 * _k];");
+    line(o, "    float4 _lp = bl_dl[7 + 4 * _k], _lc = bl_dl[8 + 4 * _k], _ld = bl_dl[9 + 4 * _k], _at = bl_dl[10 + 4 * _k];");
     line(o, "    float3 _v = _lp.xyz - _P;");
     line(o, "    float _d2 = max(dot(_v, _v), 64.0), _dd = sqrt(_d2);");
     line(o, "    float3 _L = _v / _dd;");
@@ -1076,6 +1159,65 @@ static void ps_detail(struct out *o, const char *coord, int hair)
         line(o, "oc0.xyz *= mix(1.0 - 0.45 * bl_dl[3].z, 1.0, saturate((_wb - _zw) / 3.0));");
         line(o, "oc0.w *= saturate((_wb - _zw) / bl_dl[2].w);");
     }
+    o->indent--;
+    line(o, "}");
+}
+
+// The input register a coordinate is (in.tN or tN, N 0 to 7), or -1 when it is anything
+// else (projected, computed).
+static int pom_reg(const char *c)
+{
+    if (!strncmp(c, "in.", 3)) c += 3;
+    return c[0] == 't' && c[1] >= '0' && c[1] <= '7' && !c[2] ? c[1] - '0' : -1;
+}
+
+// Variant surface's parallax occlusion, at the top of the shader before anything reads
+// the inputs: where the view ray into the surface meets the height map at [[texture(19)]]
+// (white high, p.pom deep as a share of the texture's shorter side, faded out towards
+// p.pom_dist and edge on), stepped 8 times head on to 24 edge on through the texture read
+// at in.t`alb` and refined between the last two steps. That register is moved there, and
+// the other coordinates plain 2D textures are read with (`regs`, a bit each) by as much
+// on the screen, so they keep to the colour (their own scale: bump and detail textures);
+// the lightmap's are not, as the game's own bump directions light the surface.
+static void ps_pom(struct out *o, int alb, unsigned regs)
+{
+    line(o, "if (p.pom > 0.0) {");
+    o->indent++;
+    line(o, "float3 _pmP = float3((in.pos.x * p.view.z - 1.0) * in.fogz / p.view.x,");
+    line(o, "                     (1.0 - in.pos.y * p.view.w) * in.fogz / p.view.y, in.fogz);");
+    line(o, "float3 _pmx = dfdx(_pmP), _pmy = dfdy(_pmP), _pmN = normalize(cross(_pmx, _pmy));");
+    line(o, "if (dot(_pmN, _pmP) > 0.0) _pmN = -_pmN;");
+    line(o, "float2 _pmuv = in.t%d.xy, _pmux = dfdx(_pmuv), _pmuy = dfdy(_pmuv);", alb);
+    for (int r = 0; r < 8; r++)
+        if (r != alb && (regs >> r & 1)) line(o, "float2 _pm%dx = dfdx(in.t%d.xy), _pm%dy = dfdy(in.t%d.xy);", r, r, r, r);
+    line(o, "float3 _pmr1 = cross(_pmy, _pmN), _pmr2 = cross(_pmN, _pmx);");
+    line(o, "float _pmdet = dot(_pmx, _pmr1);");
+    line(o, "float3 _pmgu = (_pmr1 * _pmux.x + _pmr2 * _pmuy.x) / _pmdet, _pmgv = (_pmr1 * _pmux.y + _pmr2 * _pmuy.y) / _pmdet;");
+    line(o, "float3 _pmV = -normalize(_pmP); float _pmvn = dot(_pmV, _pmN);");
+    line(o, "float _pmf = saturate((p.pom_dist - in.fogz) / (0.4 * p.pom_dist)) * saturate(_pmvn * 4.0);");
+    line(o, "float _pmd = p.pom * _pmf / max(max(length(_pmgu), length(_pmgv)), 1e-8);");
+    line(o, "float _pmj = _pmux.x * _pmuy.y - _pmuy.x * _pmux.y;");
+    line(o, "if (_pmd > 0.0 && abs(_pmdet) > 1e-12 && abs(_pmj) > 1e-14) {");
+    o->indent++;
+    line(o, "constexpr sampler _pms(filter::linear, mip_filter::linear, address::repeat);");
+    line(o, "float3 _pmD = -(_pmV - _pmN * _pmvn) / max(_pmvn, 0.25) * _pmd;");
+    line(o, "float2 _pmt = float2(dot(_pmgu, _pmD), dot(_pmgv, _pmD));");
+    line(o, "int _pmn = int(mix(24.0, 8.0, saturate(_pmvn)));");
+    line(o, "float _pmst = 1.0 / float(_pmn), _pml = 0.0, _pmpl = 0.0;");
+    line(o, "float _pmh = 1.0 - bl_ph.sample(_pms, _pmuv, gradient2d(_pmux, _pmuy)).r, _pmph = _pmh;");
+    line(o, "for (int _pmi = 0; _pmi < _pmn && _pml < _pmh; _pmi++) {");
+    line(o, "    _pmpl = _pml, _pmph = _pmh, _pml += _pmst;");
+    line(o, "    _pmh = 1.0 - bl_ph.sample(_pms, _pmuv + _pmt * _pml, gradient2d(_pmux, _pmuy)).r;");
+    line(o, "}");
+    line(o, "float _pma = _pmh - _pml, _pmb = _pmph - _pmpl;");
+    line(o, "float _pmw = _pma - _pmb < -1e-6 ? _pma / (_pma - _pmb) : 0.0;");
+    line(o, "float2 _pmo = _pmt * mix(_pml, _pmpl, _pmw);");
+    line(o, "in.t%d.xy += _pmo;", alb);
+    line(o, "float2 _pms2 = float2(_pmo.x * _pmuy.y - _pmuy.x * _pmo.y, _pmux.x * _pmo.y - _pmo.x * _pmux.y) / _pmj;");
+    for (int r = 0; r < 8; r++)
+        if (r != alb && (regs >> r & 1)) line(o, "in.t%d.xy += _pm%dx * _pms2.x + _pm%dy * _pms2.y;", r, r, r);
+    o->indent--;
+    line(o, "}");
     o->indent--;
     line(o, "}");
 }
@@ -1178,16 +1320,27 @@ static void ps_locals(struct gen *g)
     if (g->v && g->v->shadow_receiver) line(o, "float4 _sh = 0; bool _shd = false;");
 }
 
-// The tessellated vertex shader's main function (v->tess): the shader run on the three
-// corners, then Phong tessellation in view space (Boubekeur and Alexa 2008): the point is
-// projected onto each corner's tangent plane, the three weighted like the point itself,
-// and moved three quarters of the way there. Everything else is interpolated.
+// The tessellated vertex shader (v->tess). Metal 4 has no tessellator: bl_pre runs the
+// shader once on each vertex the draw uses, into a buffer (a draw with rasterization off),
+// then bl_main runs on the points of a grid over each triangle (one instance a triangle),
+// with the point's weights for the three corners. Phong tessellation in view space
+// (Boubekeur and Alexa 2008): the point is projected onto each corner's tangent plane,
+// the three weighted like the point itself, and moved part of the way there (tq.z,
+// BL_TESS_ROUND). Everything else is interpolated.
 static const char *const tess_main =
+    "vertex void bl_pre(BLVSIn in [[stage_in]], uint vid [[vertex_id]], constant float4 *c [[buffer(20)]],\n"
+    "        constant BLVSParams &p [[buffer(21)]], device BLVSRaw *raw [[buffer(23)]],\n"
+    "        constant uint4 &tq [[buffer(25)]]) {\n"
+    "    raw[vid - tq.y] = bl_vs(in, c, p);\n"
+    "}\n"
     "#define BL_I(f) (bc.x * r[0].f + bc.y * r[1].f + bc.z * r[2].f)\n"
-    "[[patch(triangle, 3)]] vertex BLVSOut bl_main(patch_control_point<BLVSIn> cp [[stage_in]],\n"
-    "        float3 bc [[position_in_patch]], constant float4 *c [[buffer(20)]],\n"
-    "        constant BLVSParams &p [[buffer(21)]], constant float4 &tp [[buffer(22)]]) {\n"
-    "    BLVSRaw r[3] = {bl_vs(cp[0], c, p), bl_vs(cp[1], c, p), bl_vs(cp[2], c, p)};\n"
+    "vertex BLVSOut bl_main(uint vid [[vertex_id]], uint tri [[instance_id]],\n"
+    "        constant BLVSParams &p [[buffer(21)]], constant float4 &tp [[buffer(22)]],\n"
+    "        device const BLVSRaw *raw [[buffer(23)]], device const uint *idx [[buffer(24)]],\n"
+    "        constant uint4 &tq [[buffer(25)]]) {\n"
+    "    uint gn = tq.x, gi = vid / (gn + 1), gj = vid % (gn + 1);\n"
+    "    float3 bc = float3(float(gn - gi - gj), float(gi), float(gj)) / float(gn);\n"
+    "    BLVSRaw r[3] = {raw[idx[3 * tri] - tq.y], raw[idx[3 * tri + 1] - tq.y], raw[idx[3 * tri + 2] - tq.y]};\n"
     "    float3 _P[3], _N[3];\n"
     "    for (int i = 0; i < 3; i++) {\n"
     "        _P[i] = float3(r[i].pos.x / tp.z, r[i].pos.y / tp.w, r[i].pos.w);\n"
@@ -1198,7 +1351,7 @@ static const char *const tess_main =
     "    }\n"
     "    float3 _X = bc.x * _P[0] + bc.y * _P[1] + bc.z * _P[2], _Q = 0.0;\n"
     "    for (int i = 0; i < 3; i++) _Q += bc[i] * (_X - dot(_X - _P[i], _N[i]) * _N[i]);\n"
-    "    float3 _D = 0.75 * (_Q - _X);\n"
+    "    float3 _D = as_type<float>(tq.z) * (_Q - _X);\n"
     "    float4 opos = BL_I(pos) + float4(_D.x * tp.z, _D.y * tp.w, _D.z * tp.x, _D.z);\n"
     "    BLVSOut out;\n"
     "    out.bln = BL_I(p2) - BL_I(pos); out.bln.y *= p.clip_y;\n"
@@ -1321,7 +1474,8 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
                     tex_type(tex_kind(&g, i)), i, i, i, i);
         int detail = info && v->skin == 1 && v->detail && (g.info.sampler_mask & 1);
         if (detail)
-            put(o, ",\n                         texture2d<float> bl_dn [[texture(15)]], constant float4 *bl_dl [[buffer(3)]]");
+            put(o, ",\n                         texture2d<float> bl_dn [[texture(15)]], texture2d<float> bl_dsk [[texture(18)]],"
+                   " constant float4 *bl_dl [[buffer(3)]]");
         if (detail && v->hair >= 2)
             put(o, ",\n                         depth2d<float> bl_hd [[texture(14)]]");
         if (v && v->shadow_receiver) put(o, ",\n                         constant BLShadowParams &sp [[buffer(2)]]");
@@ -1329,9 +1483,28 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (v && v->lightmap && v->rebake)
             put(o, ",\n                         texture2d<float> bl_lh [[texture(16)]], texture2d<float> bl_lo [[texture(17)]]");
         if (surface)
-            put(o, ",\n                         texture2d<float> bl_pm [[texture(12)]], constant float4 *bl_wl [[buffer(4)]]");
+            put(o, ",\n                         texture2d<float> bl_pm [[texture(12)]], constant float4 *bl_wl [[buffer(4)]],"
+                   " texture2d<float> bl_ph [[texture(19)]]");
         put(o, ") {\n");
         o->indent = 1;
+        if (surface) {
+            // The body once to see which coordinates its textures are read with, its text
+            // dropped, for the parallax ahead of every pass.
+            struct out kept = g.o;
+            memset(&g.o, 0, sizeof g.o);
+            g.alb_stage = -1, g.npom = 0;
+            ps_locals(&g);
+            int ok = !gen_body(&g);
+            free(g.o.s);
+            g.o = kept;
+            start(&g.ps, code, err, errlen);
+            int alb = ok && g.alb_stage >= 0 ? pom_reg(g.alb_coord) : -1;
+            unsigned regs = 0;
+            for (int i = 0; i < g.npom; i++)
+                if (pom_reg(g.pom_coords[i]) >= 0) regs |= 1u << pom_reg(g.pom_coords[i]);
+            if (alb >= 0) ps_pom(o, alb, regs);
+            g.base_coord[0] = 0, g.alb_stage = -1;
+        }
         if (g.env) {
             // The body again with the reflection cubemaps read as black, then as white:
             // the colour without them (_e0) and with white ones (_e1).

@@ -205,13 +205,13 @@ def main():
         for mat in dict.fromkeys(me["material"] for me in m["meshes"]):
             # as the game finds it: the first texture folder holding the material, whose
             # $basetexture names the texture
-            # (names in any case, a doubled slash read as one, as the game's file system does)
+            # (names in any case, a doubled or leading slash ignored, as the game's file system does)
             dirs = [re.sub("/+", "/", d.lower().replace("\\", "/")) for d in m["cd"]]
             vmt = next((d + mat.lower() for d in dirs
                         if tex_extract.exists(args.game, idx, "materials/" + d + mat.lower() + ".vmt")), None)
             base = vmt and re.search(r'"?\$basetexture"?\s+"?([^"\s]+)',
                                      tex_extract.read(args.game, idx, "materials/" + vmt + ".vmt").decode("latin1"), re.I)
-            tex = base and base.group(1).lower().replace("\\", "/")
+            tex = base and re.sub("/+", "/", base.group(1).lower().replace("\\", "/")).lstrip("/")
             if not tex or not tex_extract.exists(args.game, idx, "materials/" + tex + ".tth"):
                 print(f"{name}: no texture found for material {mat}", file=sys.stderr)
                 return 1

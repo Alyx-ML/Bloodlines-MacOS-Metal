@@ -22,6 +22,19 @@ void bl_detail_prefetch(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t form
 // the characters' are loaded: xyz the normal, mipmaps renormalised; nil without one.
 id<MTLTexture> bl_load_normal_map(id<MTLDevice> dev, const char *path);
 
+// A height map at `path` (a <name>_h.png, white high) for the surfaces' parallax: R8,
+// stretched so its 1st to 99th percentile span 0 to 1, with box-filtered mipmaps; nil
+// without one.
+id<MTLTexture> bl_load_height_map(id<MTLDevice> dev, const char *path);
+
+// Whether the texture `key` (w x h) is a face or a head by its file's name (with "face"
+// or "head" in it, not "hair"), for the skin detail; after bl_detail_normal saw it.
+int bl_detail_is_face(const void *key, uint32_t w, uint32_t h);
+
+// Where a body texture `key` (w x h) shows skin (R8, 1 skin), from its colours when its
+// map was loaded; nil for faces (all skin) and textures without a map.
+id<MTLTexture> bl_detail_skin_mask(const void *key, uint32_t w, uint32_t h);
+
 // A flat normal map (roughness 0.5) for character parts without one of their own (hair,
 // teeth, characters not in the list), so they get the same light as the rest.
 id<MTLTexture> bl_detail_flat(id<MTLDevice> dev);

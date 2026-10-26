@@ -27,14 +27,17 @@ Write hand-made fixes here; the pipeline generates the rest.
 - `0x10029250` vgui `RichText::GetCursorLine` (63 bytes), replaced by
   `bl_vgui_GetCursorLine`: a binary search over the line-break table instead of a
   linear scan, which made the `-dev` console O(n²).
+- `0x10024EB0` vgui `PropertyDialog::AddPage` (29 bytes), replaced by `bl_vgui_AddPage`:
+  does what the original did, and after the options dialog's Visual tab adds an
+  "Enhanced" tab (a plain `PropertyPage`).
 - `0x1001BD30` `COptionsSubVisual::OnResetData` (75 bytes), replaced by
-  `bl_vgui_VisualReset`: does the original's resets, then adds the "Ambient Occlusion",
-  "Reflections" and "Sharpening" check boxes to the Visual options tab the first time.
+  `bl_vgui_VisualReset`: does the original's resets, then the first time adds the
+  renderer's effects as check boxes on the Enhanced tab.
 - `0x1001BCD0` `COptionsSubVisual`'s destructor body (11 bytes), replaced by
   `bl_vgui_VisualDestroy`, which forgets those boxes.
 - `global_aliases.manual.sci` gives the routines those replacements call global names
   (`GameUI_<name>`): the check box constructor, Panel position and size, and the page
-  controls' reset methods.
+  controls' reset methods, and the PropertyPage constructor.
 
 ## shaderapidx9
 - `0x2A026250` the texture memory estimate (481 bytes), replaced by

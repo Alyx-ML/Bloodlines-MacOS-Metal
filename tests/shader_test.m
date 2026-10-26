@@ -70,8 +70,7 @@ int main(int argc, char **argv)
             @autoreleasepool {
                 NSError *error = nil;
                 MTLCompileOptions *opt = [MTLCompileOptions new];  // as the renderer compiles
-                if (@available(macOS 15.0, *)) opt.mathMode = MTLMathModeSafe;
-                else opt.fastMathEnabled = NO;
+                opt.mathMode = MTLMathModeSafe;
                 id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:msl] options:opt
                                                          error:&error];
                 if (!lib || ![lib newFunctionWithName:@"bl_main"]) {

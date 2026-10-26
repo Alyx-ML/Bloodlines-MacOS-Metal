@@ -2169,3 +2169,380 @@ Measured on the Santa Monica hub (sm_hub_1, M4 Pro), headless, one run at a time
   of a wrong alias assumption. The plugin's source is in build/analysis/guest_alias_pass.cpp.
 - What would help: the translated code's own speed (68%), not the x87 helpers. Even all
   of the helpers' time is under 1 ms a frame here.
+
+## 2026-10-26: Metal 4, stage 1 (the renderer's frame); macOS 26 required
+
+The renderer (runtime/d3d9/metal_render.m) now draws every frame through Metal 4, and the
+runtime, boot and modules are built for macOS 26 (`-mmacosx-version-min=26.0`; module
+objects built for 14 still link). The game stops with a message on a GPU without Metal 4.
+
+- runtime/d3d9/mtl4.{h,m}: render and compute encoders that take the Metal 3 calls the
+  renderer was written with, so most call sites only changed type. Bindings go into three
+  argument tables (vertex, fragment, compute) that are reused, since Metal takes a copy at
+  each draw; `set*Bytes` copies into the frame's upload space; blits are compute-encoder
+  copies, each waiting for the command before it.
+- Residency and lifetime: everything bound (and render targets, MetalFX's textures) is
+  added to one residency set on first use and held until unused for 300 frames; texture
+  views keep their parent with them. The drawable's texture is left to the layer's own set.
+- Order: every pass waits on one fence and updates it at its end, as Metal 3's tracking
+  ordered them; MetalFX (now MTL4FXTemporalScaler, built with an MTL4Compiler) takes the
+  same fence.
+- Frames: one MTL4CommandBuffer, an allocator per frame in flight (reset once the GPU is
+  done with that frame), commit feedback for the frame semaphore, GPU time and errors;
+  the drawable is waited for, signalled and presented on the queue. Reading a target back
+  waits on a shared event. BL_GPU_STATS=2 uses an MTL4CounterHeap.
+- Character tessellation (2026-10-25): Metal 4 has no tessellator. The shader now runs once
+  per vertex into a buffer (a draw with rasterization off), then each triangle is drawn as
+  an instance of an n x n grid that weights its corners (d3d9_shader.c, draw_patches).
+  Found while checking it: the Metal 3 version never split anything. Its factors were
+  stored as the integer 3 in half-float fields (a tiny number, so factor 1), and its
+  pictures matched the untessellated ones. Really split, Phong at 0.75 puffs faces up
+  enough to cover the eyes, so the strength is now BL_TESS_ROUND (0 to 1, default 0: not
+  split, as the game looked). BL_TESS still sets the props' split.
+- Verified, headless sm_hub_1 (M4 Pro): with Metal API validation, no errors (only the
+  "redundant call" hints Metal 3 also had). Frame 850 matches the Metal 3 build's (mean
+  difference 1.1 of 255 with the same path). GPU time 11.8 ms a frame, Metal 3 12.5.
+  Split with no rounding (a temporary switch), characters looked as unsplit (by eye; the
+  animation moment differed).
+- Not verified: anything in a window (presenting, pacing, HDR and deep-colour output to
+  the drawable never run headless), other levels, an M1.
+- Still Metal 3: the background queues of the lighting rebake (lm_bake.m) and the light
+  probes (gi_probes.m). Next stage.
+
+## 2026-10-26: Shadow Count looked into (no change made)
+
+Static reading of client.dll and GameUI.dll only; nothing run.
+
+- The Options > Visual "Shadow Count" slider (GameUI) runs from 1 to 2 and sets
+  cl_v_shadow_count (default.cfg: 2).
+- The character shadow setup in client.dll (the function at 0x1009e2d0, run per character
+  and again for all characters when shadow settings change) asks the engine for at most 8
+  lights near the character, sorts them by strength and keeps at most 7. Lights with zero
+  strength are dropped (the cutoff is 0.0).
+- cl_v_shadow_count is only tested as "more than 1": at 1 the lights are blended into one
+  shadow; at 2 (or anything higher) each kept light casts its own shadow. So values above 2
+  change nothing; the real limit is the 8 asked for and the 7 kept.
+- Going from 7 to 8 is one constant. More than 8 needs a larger light list than the
+  function's fixed 8-entry stack array, so the function would have to be replaced in the
+  runtime.
+- The shadow texture is 1024x1024 with each shadow in a 256x256 or 128x128 square, so it
+  holds 16 large or 64 small shadows.
+- Measured once, headless, sm_hub_1 frame 850 (the opening dialogue in the alley), with
+  cl_v_shadows 3 and cl_v_shadow_count 2: one character cast 2 shadows (the same body, hat
+  and attachment meshes drawn into two 256x256 squares); 4 of the 16 large squares were in
+  use. Nothing near the 7-light cap. One scene only: busier, brighter streets not measured.
+- BL_DRAW_STATS' [drawsrc] lines now also print "at": the model's place, or its first
+  bone's (c48..c50's w), which tells apart the characters drawn into the shadow texture.
+
+## 2026-10-26: "Smooth Characters" and "Sharpening" boxes
+
+- Smooth Characters (BL_ROUND, registry value SmoothCharacters, on until unticked):
+  characters' split triangles move BL_TESS_ROUND (now default 0.25, was 0 and off) of the
+  way onto Phong's curve, so chins and cheeks soften without the puffing seen at 0.75.
+  Unticked, characters are drawn as the game made them.
+- Sharpening (BL_SHARPEN, registry value SharpenAfterAA, on until unticked): the copy of
+  the TAA's picture back into the back buffer (taa_copy in taa_resolve) sharpens it,
+  contrast adaptive like AMD's CAS, BL_SHARPEN_STRENGTH (default 0.3). It runs after the
+  anti-aliasing and before the HUD; the old sharpening (removed 2026-10-26) ran before the
+  anti-aliasing. It has no hair exception like the old one had; to check: dark specks
+  beside bright hair strands.
+- Boxes: "Smooth Characters" above the Shadow Count slider, "Sharpening" a row above the
+  right-hand column (bl_vgui.c).
+- Verified: builds; the TAA shader compiles offline. Not verified: anything on screen (the
+  boxes' places, the look), left for the user's window run.
+
+## 2026-10-26: "Enhanced" options tab
+
+- The user asked to tidy the Visual tab: twelve check boxes had filled every gap between
+  its own controls. The options dialog now has an "Enhanced" tab after "Visual", and all
+  twelve boxes moved there, in two columns of six (lighting: Ambient Occlusion,
+  Reflections, Volumetric Light, Shadows, Bounced Light, Global Illumination; picture
+  and characters: HDR, Bloom, Eye Adaptation, Sharpening, Skin Scattering, Smooth
+  Characters). The Visual tab is the game's own again.
+- How: GameUI's `PropertyDialog::AddPage` (0x10024eb0) is replaced by
+  `bl_vgui_AddPage` (runtime/bl_vgui.c), which adds a plain `PropertyPage` after the
+  Visual tab; the Visual tab's OnResetData still makes the boxes (now on the new page),
+  with the font and scale of its "Combat effects" box. GameUI re-translated (17 s).
+- Settings are unchanged (the same registry values).
+- First window run: no tab. The Visual tab was matched by the address of its title, but
+  GameUI is not loaded at its own base; it is now matched by the title's text.
+- Second window run (the user's screenshot): the tab and both columns showed, working.
+- Tidied at the user's ask: three columns around the page's middle, each under a heading
+  (vgui::Label, 0x10023730, aliased GameUI_Label_ctor): "Lighting" (Global Illumination,
+  Bounced Light, Ambient Occlusion, Volumetric Light), "Camera" (HDR, Bloom, Eye
+  Adaptation, Sharpening), "Surfaces & Characters" (Shadows, Reflections, Skin Scattering,
+  Smooth Characters). Built; not yet seen.
+
+## 2026-10-26: Rebuilt head test (Jeanette, still renders only, nothing in the game)
+
+Tried rebuilding one character's head on MakeHuman's CC0 base head (`tools/heads/`):
+`export_head.py` takes the mesh and flex keys out of the Blender import,
+`fit_head.py` fits the base head to the game's face and binds every new vertex to a face
+triangle (barycentric place plus an offset in the triangle's own axes), and
+`render_head.py` renders old against new. The binding is exact at rest (error 0). It
+follows the face through bones and flexes in the same way the hair strips do.
+
+Fixes made along the way:
+- The mouth cut is now a flood fill from inside the mouth that stops at forward-facing
+  faces. The opening's edge lands where the lips meet: 52 vertices, where the old box cut
+  gave 156 and tore the area round the mouth.
+- The lips are mapped upper to upper and lower to lower, corner to corner. This removed
+  a notch under the nose.
+- Where the base head folds over the game's coarse face (the ears, the lid corners), it
+  keeps its own shape. The ears are now real ears.
+- UVs are worked out per corner, on one texture piece per triangle. This removed a
+  smeared band at the collar.
+
+Result: 2979 vertices and 5670 triangles, against the game face's 2136 triangles. Seen in
+renders (`build/heads/jeanette_tex.png`): from the front the new head looks almost the
+same as the old one, but its ears and side profile are better. Her ear texture looks
+smeared, because it was painted for the game's flat ear. There are faint facets on the
+cheek.
+
+Not verified: expressions in the game. In Blender, the flex keys imported from the SMD
+break the game's own teeth and lids at full weight, on the old head as much as the new
+one, so the Blender test can only show that the new head copies the old face's movement.
+It cannot show what the game's expressions really look like.
+
+## 2026-10-26: "Skin Detail" box (pores and uneven shine on faces)
+
+A new layer is drawn over the faces' original textures, which are left unchanged
+(`ps_skin_detail` in d3d9_shader.c, called from ps_detail for skin that is not hair).
+- It lays a grid on the face texture, with one cell every BL_SKIN_DETAIL_SIZE texels
+  (default 3). Each cell gets either no pore or a small pit at a random place, size and
+  depth, chosen by an integer hash.
+- The pits tilt the skin's normal, so the game's lights pick them out, and they make the
+  shine rougher where they are. The shine also varies in patches about fourteen pores
+  wide.
+- The layer fades out once a cell gets smaller than about a pixel, so it doesn't shimmer
+  at a distance. No texture files are involved.
+
+It applies only to textures whose file name has "face" or "head" in it and not "hair":
+252 of the 1219 character textures (tex_detail.m, `bl_detail_is_face`). Body textures
+mix skin and clothes, so they get none for now.
+
+The constants gained a fifth header row (strength and pores across and down the
+texture), so the lights start at bl_dl[5]. The setting is `SkinDetail` in the Native key,
+on by default, with a "Skin Detail" box under "Surfaces & Characters" on the Enhanced tab.
+BL_SKIN_DETAIL_STRENGTH (0 to 2, default 1) can be used for tuning.
+
+Verified: the runtime builds, and the new shader code compiles on its own with Metal.
+Not verified: how it looks in the game. That needs a window test, which the user will do.
+
+## 2026-10-26: Skin detail on bodies' skin too
+
+Skin Detail now covers body textures as well, limited to their skin by a mask made from
+each texture's colours when its map loads (tex_detail.m `make_skin_mask`, an R8 texture
+up to 512 across, bound at texture 18; bl_dl[4].w says a mask is in use).
+- Skin is found by colour: warm (red over green over blue, with green a fair way above
+  blue), slightly saturated, and not too dark.
+- White and grey cloth, jeans, black leather and strong reds are left out.
+- The mask is box-blurred and thresholded again so stray specks drop out.
+- Faces keep no mask (all skin).
+
+Checked on stills of five body textures. Jeanette's chest, arms and hands come out
+clean and her shirt is left out. The damsel's bare midriff is found. Pale streaks on a
+bum's brown jacket and bits of dark leather also pass, so they get faint pores.
+
+A stricter test that tried to leave out olive tones was dropped, because it broke up
+Jeanette's real skin.
+
+Verified: the runtime builds, and the shader piece compiles on its own. Not verified: the
+look in the game. The log prints "[detail] skin mask" with each body's skin share.
+
+Fix: the user's first test run printed no mask lines, and a standalone test of the mask
+code found 0% skin on Jeanette. Drawing her texture through Core Graphics had multiplied
+its colour by the alpha channel, which on bodies is often a shine mask set to 0 over skin.
+The raw bytes are now read (load_pixels), and the image is only drawn when its layout
+needs it. Standalone results on bodies: Jeanette 31% skin (matching the still), bum 6%,
+damsel 11%, the Brujah player body 10%. Goth girl 67%, mostly the skin-coloured padding
+between texture pieces, which never shows on the model, but also parts of her cream corset.
+
+## 2026-10-26: Gentler pores on bodies
+
+The user said the body pores looked a bit much. Bodies' skin detail now runs at 0.7 of
+the faces' strength (BL_SKIN_DETAIL_BODY, default 0.7). Faces are unchanged. Built; the
+user is checking the look.
+
+## 2026-10-26: "Cloth Detail" box (a fine weave on clothes)
+
+Body textures now get a plain weave wherever their skin mask says the surface isn't skin
+(`ps_skin_detail` in d3d9_shader.c, after the pores).
+- Threads go one over and one under, with a thread every BL_CLOTH_DETAIL_SIZE texels
+  (default 2).
+- Each thread has its own thickness, chosen by a hash.
+- The weave tilts the normal (0.05 at strength 1, BL_CLOTH_DETAIL_STRENGTH) and fades out
+  where a thread gets smaller than about a pixel.
+- It's generated in the shader, with no textures. Faces get none (no mask). Tongues,
+  teeth and eyes get no mask now, so they get neither pores nor weave.
+
+The constants gained a sixth header row (cloth strength and threads across and down the
+texture), so the lights start at bl_dl[6]. bl_dl[4].w (is there a mask) is now set
+whether or not Skin Detail is on.
+
+The setting is `ClothDetail`, on by default, with a "Cloth Detail" box under "Surfaces &
+Characters". The Enhanced tab's boxes are now 36 apart (they were 40) to fit a sixth row.
+
+Step 1 is one general weave. Leather, buckles and other non-fabric parts get it too,
+because colour can't tell fabrics apart.
+
+Verified: the runtime builds, and the shader piece compiles on its own. Not verified: the
+look in the game.
+
+## 2026-10-26: Pores and weave sized in the world; the weave always on
+
+In the user's screenshot, Danielle (a 256x256 head texture) had pores as big as scales,
+because pore size was set in texels and her texture is low resolution. Pores and threads
+are now set in world units instead.
+- Sizes are BL_SKIN_DETAIL_SIZE (default 0.06) and BL_CLOTH_DETAIL_SIZE (default 0.08).
+  Both were measured on Jeanette, whose look the user approved: 3 texels of her face
+  texture and 2 of her body texture. The measurement used the Blender import's triangle
+  areas against their UV areas, times the 52.49 that the hair tools found between the
+  import and the game.
+- The shader works out the world size of a texel from how position and texture
+  coordinates change across the pixel (constant over a triangle).
+- It takes the grids in steps of two either side of the wanted size and mixes the two by
+  how close each is, so the size changes smoothly between triangles. Each step fades out
+  on its own once its cells get smaller than a pixel.
+- Bodies keep 0.7 of the faces' pore strength.
+
+The user wanted Cloth Detail always on rather than as an option, so its box is gone and
+the Enhanced tab is back to 40-apart boxes. BL_CLOTH_DETAIL=0 turns the weave off for
+comparisons. The Skin Detail box stays.
+
+Verified: the runtime builds, and the shader piece compiles on its own. Not verified: the
+look in the game.
+
+## 2026-10-26: Texel sizing back, with a limit only for coarse textures
+
+The world sizing above weakened Jeanette's pores. Her wanted size fell between two grid
+steps, so she got a mix of two half-strength patterns. The user had only asked for care
+with some characters, so the change was too broad.
+
+Sizes are back to texels (3 per pore, 2 per thread), so Jeanette and characters with
+similar textures look exactly as before. The same hashes are used and one grid is drawn.
+A limit only applies where a pore or thread would come out bigger in the world than:
+- 0.10 world units on faces (BL_SKIN_DETAIL_MAX);
+- 0.20 on bodies (_MAX_BODY);
+- 0.13 for threads (BL_CLOTH_DETAIL_MAX).
+
+These sit just above what 98% of Jeanette's face, body and shirt have, measured per
+triangle from her model. There, and only there, the grid gets finer in steps of two,
+mixed between steps. The constants gained a seventh row (texels per pore and per thread),
+so the lights start at bl_dl[7].
+
+Verified: the runtime builds, and the shader piece compiles on its own. Not verified: the
+look in the game (Jeanette should be unchanged from the version the user approved, and
+Danielle should have finer pores).
+
+## 2026-10-26: Jeanette's body from a new picture
+
+The user supplied a 2048x2048 picture of Jeanette's body texture in the original layout
+(build/textures/characters/.../jeanette/jeanette_body_opaque2.png; the layout matches the
+original, correlation 0.97). It replaces the upscaled copy the renderer draws:
+- jeanette_body_u.png is the picture at 4096, keeping the old alpha (the original's shine mask);
+- jeanette_body_n.png is remade from it with PBRify's normal model, at 1024 as before,
+  because the pore and thread sizes count in that map's texels;
+- jeanette_body_r.png is remade with PBRify's roughness model, at 2048.
+The skin mask still comes from the game's own texture. The old three files are kept in
+build/textures/characters_backup/jeanette_body_before_opaque2/.
+
+Not verified: the look in the game.
+
+## 2026-10-26: Jeanette's face and skirt from new pictures
+
+The user supplied new pictures of Jeanette's face (2912x1440) and skirt (2048x2048), in
+.../jeanette/Newtex/. The face matches the original's layout when stretched to 2:1
+(correlation 0.99). The skirt covers all but 0.1% of the original's opaque part. Made as
+for the body:
+- jeanette_face_u.png at 4096x2048 and a new jeanette_skirt_u.png at 2048 (the skirt had
+  no upscaled copy, so the renderer drew the game's own), each keeping the game texture's
+  alpha (the skirt's alpha is its UV wireframe, as the game ships it);
+- _n remade at the old sizes, 1024x512 and 1024, so pore and thread sizes stay;
+- _r remade at the pictures' size.
+The old files are in build/textures/characters_backup/jeanette_face_skirt_before_newtex/
+(the skirt had no _u, so deleting jeanette_skirt_u.png goes back to the game's skirt).
+
+Not verified: the look in the game.
+
+## 2026-10-26: no Gigapixel upscales
+
+The user wants no Gigapixel upscales in use. Comparing each file the renderer reads
+(_u, _n, _r, _hair under build/textures/characters) with every Gigapixel picture
+(the same size and the same pixels, mean difference 0.00) found 61 made from one:
+- all 56 eye textures (_u);
+- Jeanette's two hair textures (jeanette_hair_1_u, _2_u);
+- the other Jeanette model's jeanettebody_u and jeanettebody_n;
+- the tongue (_u).
+
+These 61 and the 254 Gigapixel pictures themselves (in characters/, export/ and
+unused/) were moved to build/textures/removed_gigapixel/, keeping their paths. The eyes,
+the tongue and Jeanette's hair now draw the game's own textures (the eye highlights are
+shader work and stay).
+
+The hair under Jeanette's strips was lifted from the hair's upscaled copy (_u). It is now
+lifted from the game's texture as exported (<name>.png beside the map), in
+tex_detail.m's bl_detail_hair. The map textures (build/hires) come from PBRify and
+-replace pictures, none from Gigapixel.
+
+Verified: the runtime builds. Not verified: the look in the game.
+
+## 2026-10-26: Danielle from new pictures
+
+The user supplied new pictures of Danielle's body (2912x1440), head (1029x1028) and hair
+(2912x1440), in .../danielle/NewTex/. Each matches the game texture's layout (correlation
+0.98). Made as for Jeanette:
+- danielle_body_u.png at 4096x2048 and danielle_head_u.png at 1024, keeping the game
+  textures' alpha;
+- their _n remade at the old sizes (1024x512, 256), so pore and thread sizes stay;
+- their _r remade at the pictures' size.
+
+Danielle's hair texture has exactly the same pixels as Angela's (angelahair). The game's
+texture matches Angela's line in normals.txt first, so the new hair went in as
+downtown/angela/angelahair_u.png (4096x2048, no maps, as hair has none) and shows on
+both. The old Danielle files are in
+build/textures/characters_backup/danielle_before_newtex/ (angelahair had no _u).
+
+Not verified: the look in the game.
+
+## 2026-10-26: the masked male dancer from a new picture
+
+The user supplied a 2048x2048 picture for the asylum bar's shirtless masked dancer
+(dancer/male_2/male2targa, in .../male_2/NewTx/; the layout matches, correlation 0.985).
+male2targa_u.png is the picture at 2048 with the game texture's alpha. _n is remade at
+512, so pore and thread sizes stay. _r is remade at 2048. The old files are in
+build/textures/characters_backup/male_dancer_2_before_newtx/.
+
+Not verified: the look in the game.
+
+## 2026-10-26: parallax occlusion on floors and walls
+
+Surfaces with a height map now get parallax occlusion: bricks, tiles, planks and
+carvings look set into the surface, not painted on.
+- New `tools/tex_height.py` makes `<name>_h.png` (white high) beside a map texture's
+  export with PBRify's height model, from the picture the renderer draws (-replace, else
+  -pbrify, else the export), read as a tile so it repeats without a seam. It ran on 19
+  asylum materials with real relief: brick/doora, concrete/wllb, ground/sidewalka,
+  plaster/asceilinga, aswllc, pillara, wlla, wllb, stone/asfloora, bar, doorb, rocka,
+  wlla, tile/tilea, wood/ceilingb, floora, floorb, woodbeamsa, woodpanela (and the same
+  names in the other exported maps). The flat painted walls, smooth concrete and metal
+  were left out.
+- metal_render.m loads the height maps with the PBRify maps (same tables, key "<name>#h",
+  loaded ahead the same way). tex_detail.m's `bl_load_height_map` makes them R8,
+  stretched 1st to 99th percentile to 0..1, with mipmaps. `struct obj` gained `pom`.
+- d3d9_shader.c: in the surface variant, a dry pass of the body finds the coordinates
+  plain 2D textures are read with. `ps_pom`, at the top of the shader, steps the view ray
+  through the height map (8 steps head on to 24 edge on, refined between the last two)
+  along the albedo coordinate. It moves that input register, and the other plain 2D
+  registers by as much on the screen, before any pass reads them. The lightmap's
+  coordinates stay. The depth is `BL_POM_DEPTH` (default 0.015 of the texture's shorter
+  side, 0 off); it fades out towards `BL_POM_DIST` (1500) and edge on. The height map is
+  at [[texture(19)]]; d3d_ps_params gained pom and pom_dist (pad2 gone).
+- Like the PBRify bumps, it is part of the surface variant, so it needs Reflections on.
+
+Verified: the runtime builds, and shader_test compiles all 7184 variants (0 failed).
+Not verified: the look in the game.
+
+## 2026-10-26: new pictures for the asylum's ram frieze and stone door
+
+The user supplied 2048×2048 pictures for `materials/stone/bar` (the ram-head frieze above the bar; the file was named `bar_h.png` but is a colour picture) and `materials/stone/doorb` (the stone doorway with wooden doors). Their layouts match the originals (luminance correlation 0.96 and 0.999). They went in as `<name>-replace.png`, replacing the PBRify upscales (removed, since tex_pack refuses two upscales of one texture). The bump and roughness maps were remade from each picture at the game texture's size (128 and 512, read as a tile), and the height maps from the pictures with tools/tex_height.py (27 s). tex_pack wrote both at 2048×2048 BC7. Not yet checked in the game.

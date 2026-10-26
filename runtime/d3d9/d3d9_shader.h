@@ -152,7 +152,10 @@ struct d3d_ps_params {
     float bump;               // variant surface: how much the map's bumps shade the light (0 none)
     float metal;              // variant surface: how metallic the map's material is (0 to 1)
     float spec;               // variant surface: strength of the lights' shine on it (0 none)
-    float pad2;
+    float pom;                // variant surface: parallax depth from the height map at [[texture(19)]],
+                              // a share of the texture's size (0 none)
+    float pom_dist;           // variant surface: view distance the parallax has faded out by
+    float pad3[3];
 };
 
 // Fixed-function pixel stages (draws with no pixel shader): the texture stage states
