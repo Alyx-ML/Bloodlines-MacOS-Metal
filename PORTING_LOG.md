@@ -1726,3 +1726,23 @@ player's machine from their own game files (`BL_HAIR_MESH`, default on; 0 off).
   (7 MB), the bar stools' seats and bases rounder, with no gaps or other faults seen.
   Then the user's own window run: the round bar tables up close, smooth with no gaps.
   Not verified: other maps, the time it adds at map load, and frame rate.
+
+## 2026-10-26: ambient occlusion with XeGTAO's depth copies and visibility bitmasks
+
+- The AO was plain GTAO (2 slices of 4 steps a side, one horizon each way), which left
+  grainy dark fuzz around thin parts (Jeanette's collar and neck) and dark halos behind
+  them. Two changes in `metal_render.m`, both from published methods:
+  1. XeGTAO's depth pyramid: 4 smaller copies of the half-resolution view depth
+     (`ao_mip`, `ao_occlusion`), each pixel a weighted average of 4 that leans to the
+     farthest. Steps longer than 2^3.3 pixels read the smaller copies, so they land on
+     steady values. Now 3 slices of 6 steps a side.
+  2. Visibility bitmasks (Therrien, Levesque and Gilet 2023) in place of the two
+     horizons: each slice's half circle is 32 sectors, cosine weighted, and each sample
+     is taken to be `BL_AO_THICKNESS` world units deep (default 16), so light gets in
+     behind thin things.
+- Fixed on the way: the result is divided by the slices' total weight, so surfaces
+  facing away from the camera come out fully unshaded (before, low-poly faces showed).
+- Verified: headless runs of the Jeanette dialogue (sm_asylum_1, frame 1500), AO alone
+  and in game, against the old AO: no grain at the collar, no halos, no facets. Then the
+  user's own window run: approved. Not verified: other maps, and the cost (timing runs
+  were shared with other GPU work).

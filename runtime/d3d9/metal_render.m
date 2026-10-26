@@ -33,7 +33,7 @@
 //   BL_WIDESCREEN=stretch    keep the game's 4:3 projection on wider modes (default: corrected)
 //   BL_ANISO=n               anisotropic filtering for filtered mipmapped textures (default 16, 1 = off)
 //   BL_AO=0|1|show           ambient occlusion (see post_run), over the options' check box;
-//                            BL_AO_RADIUS, BL_AO_STRENGTH tune it
+//                            BL_AO_RADIUS, BL_AO_THICKNESS, BL_AO_STRENGTH tune it
 //   BL_SSR=0|1|show|hits     screen-space reflections (see post_run), over the options' check box;
 //                            "hits": red the reflection weight, green where rays met the picture,
 //                            blue what the cubemaps added; BL_SSR_STRENGTH (default 1) scales them,
@@ -134,7 +134,7 @@ static int deep_color;  // 16-bit back buffer, 10-bit window (BL_DEEP_COLOR, def
 // view_state: 0 no world view yet this frame, 1 world drawn (view_proj holds its
 // projection), 2 done for this frame.
 static int env_ao, env_ao_show, env_ssr, env_ssr_show, env_sharpen, env_tonemap, env_hdr, env_fog, env_sss, env_sss_show;
-static float env_ao_radius, env_ao_strength, env_ssr_strength, env_ssr_fresnel, env_ssr_blur, env_sharpen_strength,
+static float env_ao_radius, env_ao_strength, env_ao_thickness, env_ssr_strength, env_ssr_fresnel, env_ssr_blur, env_sharpen_strength,
     env_tonemap_expand, env_hdr_peak, env_hdr_knee, env_hdr_headroom, env_fog_density, env_fog_dist, env_sss_width,
     env_sss_strength, env_sss_sheen;
 static int view_state;
@@ -1069,6 +1069,7 @@ static void ensure_device(void)
     effect_settings();
     env_ao_radius = getenv("BL_AO_RADIUS") ? (float)atof(getenv("BL_AO_RADIUS")) : 32;
     env_ao_strength = getenv("BL_AO_STRENGTH") ? (float)atof(getenv("BL_AO_STRENGTH")) : 0.6f;
+    env_ao_thickness = getenv("BL_AO_THICKNESS") ? (float)atof(getenv("BL_AO_THICKNESS")) : 16;
     env_ssr_strength = getenv("BL_SSR_STRENGTH") ? (float)atof(getenv("BL_SSR_STRENGTH")) : 1;
     env_ssr_fresnel = getenv("BL_SSR_FRESNEL") ? (float)atof(getenv("BL_SSR_FRESNEL")) : 3;
     env_ssr_blur = getenv("BL_SSR_BLUR") ? (float)atof(getenv("BL_SSR_BLUR")) : 0.02f;
@@ -1763,13 +1764,21 @@ static int draw_reads_atlas(const struct d3d_state *s)
 // Ground-truth ambient occlusion (Jimenez et al. 2016, as in Intel's XeGTAO) from the
 // back buffer's depth, once the world is drawn and before the view model and HUD
 // (post_before_draw). The depth is turned back into view-space positions with the world
-// view's projection, taken from its draws (note_projection). Four passes, the first
-// three at half resolution: view depth from the depth buffer; the occlusion, 3 slices of
-// 8 steps a side whose angles and offsets follow a 4x4 pattern; a depth-aware 4x4 filter
+// view's projection, taken from its draws (note_projection). The passes, all but the last
+// at half resolution: view depth from the depth buffer, and 4 smaller copies of it, each
+// pixel a weighted average of 4 that leans to the farthest (XeGTAO's depth filter), which
+// the longer steps read so that they land on stable values; the occlusion, 3 slices of 6
+// steps a side whose angles and offsets follow a 4x4 pattern; a depth-aware 4x4 filter
 // that averages the pattern out; and, at full resolution, a depth-aware upsample that
-// multiplies the image by the result. BL_AO=1 turns it on, BL_AO=show shows the
-// occlusion alone; BL_AO_RADIUS (world units, default 32) and BL_AO_STRENGTH (default 0.6)
-// tune it.
+// multiplies the image by the result. The occlusion uses visibility bitmasks (Therrien,
+// Levesque and Gilet 2023) in place of GTAO's two horizons: each slice's half circle
+// around the normal is 32 sectors, spaced so that each carries the same share of
+// cosine-weighted light, and every sample, taken to be BL_AO_THICKNESS deep, blocks only
+// the sectors between its front and its back. Light then gets in behind thin things
+// (railings, an arm) instead of the wall behind them darkening as if they were solid all
+// the way back. BL_AO=1 turns it on, BL_AO=show shows the occlusion alone; BL_AO_RADIUS
+// (world units, default 32), BL_AO_THICKNESS (world units, default 16) and BL_AO_STRENGTH
+// (default 0.6) tune it.
 
 struct ao_params {
     float full[2], half[2];  // back buffer and half-resolution sizes
@@ -1777,12 +1786,14 @@ struct ao_params {
     float p00, p11;          // projection scales in x and y
     float radius, inv_radius2;
     float max_px, strength;  // max_px: largest radius in half-resolution pixels
+    float thickness;         // how deep each sample is taken to be (world units)
+    float mip_offset;        // steps longer than 2^this half-resolution pixels read the smaller depth copies
 };
 
 static NSString *const ao_source =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
-     "struct AOP { float2 full, hsize; float alpha, beta, p00, p11, radius, inv_radius2, max_px, strength; };\n"
+     "struct AOP { float2 full, hsize; float alpha, beta, p00, p11, radius, inv_radius2, max_px, strength, thickness, mip_offset; };\n"
      "struct V { float4 pos [[position]]; };\n"
      "vertex V ao_vs(uint id [[vertex_id]]) {\n"
      "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
@@ -1796,9 +1807,31 @@ static NSString *const ao_source =
      "    if (w <= 0.0) w = 1e6;\n"
      "    float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.hsize.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.hsize.y);\n"
      "    return float3(ndc.x * w / a.p00, ndc.y * w / a.p11, w); }\n"
+          // A smaller copy of the view depth: of each 2x2, an average weighted to the
+     // farthest, leaving out what is much nearer (the edge of something in front). The
+     // sky (0 at the top level) counts as very far.
+     "fragment float ao_mip(V in [[stage_in]], texture2d<float> src [[texture(0)]], constant AOP &a [[buffer(0)]]) {\n"
+     "    int2 p = int2(in.pos.xy) * 2, m = int2(src.get_width(), src.get_height()) - 1;\n"
+     "    float4 d = float4(src.read(uint2(min(p, m))).x, src.read(uint2(min(p + int2(1, 0), m))).x,\n"
+     "                      src.read(uint2(min(p + int2(0, 1), m))).x, src.read(uint2(min(p + int2(1, 1), m))).x);\n"
+     "    d = select(d, float4(1e6), d <= 0.0);\n"
+     "    float mx = max(max(d.x, d.y), max(d.z, d.w));\n"
+     "    float range = 0.615 * 0.75 * a.radius, from = (1.0 - 0.615) * 0.75 * a.radius;\n"
+     "    float4 w = saturate((d - mx) / range + from / range + 1.0);\n"
+     "    return dot(w, d) / max(dot(w, float4(1.0)), 1e-6); }\n"
      "constant float bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};\n"
-     "fragment float ao_main(V in [[stage_in]], texture2d<float> zt [[texture(0)]], constant AOP &a [[buffer(0)]]) {\n"
-     "    int2 p = int2(in.pos.xy);\n"
+     // The view depth at half-resolution pixel q from copy m (0 the full half-resolution
+     // one); c: the centre of the pixel read, in half-resolution pixels.
+     "static float zmip(texture2d<float> z0, texture2d<float> z1, texture2d<float> z2, texture2d<float> z3,\n"
+     "                  texture2d<float> z4, int m, int2 q, thread float2 &c) {\n"
+     "    uint2 r = uint2(q >> m);\n"
+     "    c = (float2(r) + 0.5) * float(1 << m);\n"
+     "    float w = m == 0 ? z0.read(r).x : m == 1 ? z1.read(r).x : m == 2 ? z2.read(r).x : m == 3 ? z3.read(r).x : z4.read(r).x;\n"
+     "    return w <= 0.0 ? 1e6 : w; }\n"
+     "fragment float ao_main(V in [[stage_in]], texture2d<float> zt [[texture(0)]], texture2d<float> z1 [[texture(1)]],\n"
+     "                       texture2d<float> z2 [[texture(2)]], texture2d<float> z3 [[texture(3)]],\n"
+     "                       texture2d<float> z4 [[texture(4)]], constant AOP &a [[buffer(0)]]) {\n"
+     "    int2 p = int2(in.pos.xy), hs = int2(a.hsize) - 1;\n"
      "    if (zt.read(uint2(p)).x <= 0.0) return 1.0;\n"
      "    float3 P = vpos(a, zt, p);\n"
      "    float3 l = vpos(a, zt, p - int2(1, 0)), r = vpos(a, zt, p + int2(1, 0));\n"
@@ -1812,8 +1845,8 @@ static NSString *const ao_source =
      "    if (rpx < 1.0) return 1.0;\n"
      "    float n0 = (bayer[(p.x & 3) + (p.y & 3) * 4] + 0.5) / 16.0;\n"
      "    float n1 = (bayer[((p.x + 2) & 3) + ((p.y + 1) & 3) * 4] + 0.5) / 16.0;\n"
-     "    const int SLICES = 2, STEPS = 4;\n"
-     "    float vis = 0.0;\n"
+     "    const int SLICES = 3, STEPS = 6;\n"
+     "    float vis = 0.0, wsum = 0.0;\n"
      "    for (int s = 0; s < SLICES; s++) {\n"
      "        float phi = (float(s) + n0) * (M_PI_F / float(SLICES));\n"
      "        float2 omega = float2(cos(phi), -sin(phi));\n"
@@ -1823,26 +1856,40 @@ static NSString *const ao_source =
      "        float3 pn = N - axis * dot(N, axis);\n"
      "        float plen = length(pn);\n"
      "        float cosn = saturate(dot(pn, V) / max(plen, 1e-4));\n"
+     // Angles in the slice from the view direction, positive towards `dir` (the +omega
+     // side on screen); the normal's half circle is n - pi/2 .. n + pi/2.
      "        float n = sign(dot(ortho, pn)) * acos(cosn);\n"
-     "        float low0 = cos(n + M_PI_2_F), low1 = cos(n - M_PI_2_F);\n"
-     "        float h0c = low0, h1c = low1;\n"
-     "        for (int k = 0; k < STEPS; k++) {\n"
-     "            float t = (float(k) + n1) / float(STEPS);\n"
-     "            float2 off = omega * max(t * t * rpx, float(k) * 0.5 + 1.0);\n"
-     "            int2 q0 = int2(float2(p) + 0.5 + off), q1 = int2(float2(p) + 0.5 - off);\n"
-     "            float3 S0 = vpos(a, zt, q0) - P, S1 = vpos(a, zt, q1) - P;\n"
-     "            float l0 = dot(S0, S0), l1 = dot(S1, S1);\n"
-     "            float c0 = dot(S0, V) * rsqrt(max(l0, 1e-6)), c1 = dot(S1, V) * rsqrt(max(l1, 1e-6));\n"
-     "            float w0 = saturate((1.0 - l0 * a.inv_radius2) * 2.5), w1 = saturate((1.0 - l1 * a.inv_radius2) * 2.5);\n"
-     "            h0c = max(h0c, mix(low0, c0, w0));\n"
-     "            h1c = max(h1c, mix(low1, c1, w1));\n"
+     "        uint bits = 0u;\n"
+     "        for (int side = 0; side < 2; side++) {\n"
+     "            float sd = side ? -1.0 : 1.0;\n"
+     "            for (int k = 0; k < STEPS; k++) {\n"
+     "                float t = (float(k) + n1) / float(STEPS);\n"
+     "                float len = max(t * t * rpx, float(k) * 0.5 + 1.0);\n"
+     "                int2 q = clamp(int2(float2(p) + 0.5 + sd * omega * len), int2(0), hs);\n"
+     // Longer steps read the smaller copies (XeGTAO's mip offset, 3.3).
+     "                int m = clamp(int(log2(len) - a.mip_offset), 0, 4);\n"
+     "                float2 c;\n"
+     "                float w = zmip(zt, z1, z2, z3, z4, m, q, c);\n"
+     "                float2 ndc = float2(c.x * 2.0 / a.hsize.x - 1.0, 1.0 - c.y * 2.0 / a.hsize.y);\n"
+     "                float3 d = float3(ndc.x * w / a.p00, ndc.y * w / a.p11, w) - P;\n"
+     "                float l2 = dot(d, d);\n"
+     // Past the radius a sample fades out: kept for a share of the pixels, which the
+     // filter averages.
+     "                float keep = saturate((1.0 - l2 * a.inv_radius2) * 2.5);\n"
+     "                if (l2 < 1e-6 || keep < fract(n1 + float(k) * 0.618034 + float(side) * 0.5)) continue;\n"
+     "                float3 L = d * rsqrt(l2), Lb = normalize(d - V * a.thickness);\n"
+     "                float2 h = sd * acos(clamp(float2(dot(L, V), dot(Lb, V)), -1.0, 1.0)) - n;\n"
+     // Sectors equal in cosine-weighted light: sin of the angle from the normal.
+     "                h = 0.5 + 0.5 * sin(clamp(h, -M_PI_2_F, M_PI_2_F));\n"
+     "                uint b0 = uint(round(min(h.x, h.y) * 32.0)), b1 = uint(round(max(h.x, h.y) * 32.0));\n"
+     "                if (b1 > b0) bits |= (b1 - b0 >= 32u ? 0xFFFFFFFFu : (1u << (b1 - b0)) - 1u) << b0;\n"
+     "            }\n"
      "        }\n"
-     "        float h1 = n + clamp(acos(h0c) - n, -M_PI_2_F, M_PI_2_F);\n"
-     "        float h0 = n + clamp(-acos(h1c) - n, -M_PI_2_F, M_PI_2_F);\n"
-     "        float sn = sin(n);\n"
-     "        vis += plen * 0.25 * ((cosn + 2.0 * h0 * sn - cos(2.0 * h0 - n)) + (cosn + 2.0 * h1 * sn - cos(2.0 * h1 - n)));\n"
+     "        vis += plen * (1.0 - float(popcount(bits)) / 32.0), wsum += plen;\n"
      "    }\n"
-     "    return saturate(vis / float(SLICES)); }\n"
+     // Weighted by how much of the normal each slice holds; an open half circle is 1
+     // whichever way the surface faces.
+     "    return saturate(vis / max(wsum, 1e-4)); }\n"
      // Depth-aware 4x4 average: covers one tile of the pattern. Output: occlusion, depth.
      "fragment float2 ao_blur(V in [[stage_in]], texture2d<float> ao [[texture(0)]], texture2d<float> zt [[texture(1)]],\n"
      "                        constant AOP &a [[buffer(0)]]) {\n"
@@ -1864,8 +1911,8 @@ static NSString *const ao_source =
      "    float o = mix(1.0, ao.sample(s, in.pos.xy / a.full).x, a.strength);\n"
      "    return float4(o, o, o, 1.0); }\n";
 
-// kind 0: view depth (from the depth buffer); 1: occlusion;
-// 2: filter; 3: multiply into the image; 4: show the occlusion alone. Kinds 3 and 4 draw
+// kind 0: view depth (from the depth buffer); 1: occlusion (ao_occlusion);
+// 2: filter; 3: multiply into the image; 4: show the occlusion alone; 5: a smaller copy of the view depth. Kinds 3 and 4 draw
 // in the game's pass, with its depth attachment (`depth`).
 static id<MTLRenderPipelineState> ao_pipeline(int kind, MTLPixelFormat color, MTLPixelFormat depth)
 {
@@ -1880,7 +1927,7 @@ static id<MTLRenderPipelineState> ao_pipeline(int kind, MTLPixelFormat color, MT
     NSString *key = [NSString stringWithFormat:@"%d/%lu/%lu", kind, (unsigned long)color, (unsigned long)depth];
     id<MTLRenderPipelineState> p = cache[key];
     if (p) return p;
-    static NSString *const names[] = {@"ao_depth", @"ao_main", @"ao_blur", @"ao_apply", @"ao_apply"};
+    static NSString *const names[] = {@"ao_depth", @"ao_main", @"ao_blur", @"ao_apply", @"ao_apply", @"ao_mip"};
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [lib newFunctionWithName:@"ao_vs"];
     d.fragmentFunction = [lib newFunctionWithName:names[kind]];
@@ -1953,6 +2000,38 @@ static void ao_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTe
     [e setRenderPipelineState:ao_pipeline(kind, target.pixelFormat, MTLPixelFormatInvalid)];
     [e setFragmentTexture:t0 atIndex:0];
     [e setFragmentTexture:t1 atIndex:1];
+    [e setFragmentBytes:a length:sizeof *a atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+}
+
+// The occlusion into `raw` from the half-resolution view depth z: z's 4 smaller copies
+// (kept between frames), then ao_main over them.
+static void ao_occlusion(id<MTLTexture> raw, id<MTLTexture> z, const struct ao_params *a)
+{
+    static id<MTLTexture> mips[4];
+    NSUInteger w = z.width, h = z.height;
+    id<MTLTexture> prev = z;
+    for (int i = 0; i < 4; i++) {
+        w = (w + 1) / 2, h = (h + 1) / 2;
+        if (!mips[i] || mips[i].width != w || mips[i].height != h) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                                                         width:w height:h mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            mips[i] = [mtl newTextureWithDescriptor:td];
+        }
+        ao_pass(5, mips[i], prev, nil, a);
+        prev = mips[i];
+    }
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = raw;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    [e setRenderPipelineState:ao_pipeline(1, raw.pixelFormat, MTLPixelFormatInvalid)];
+    [e setFragmentTexture:z atIndex:0];
+    for (int i = 0; i < 4; i++) [e setFragmentTexture:mips[i] atIndex:(NSUInteger)i + 1];
     [e setFragmentBytes:a length:sizeof *a atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
@@ -3196,12 +3275,12 @@ static void post_run(struct d3d_state *s)
     id<MTLTexture> z = ao_texture(0, MTLPixelFormatR32Float, hw, hh);
     struct ao_params a = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, view_proj.alpha,
                           view_proj.beta, view_proj.p00, view_proj.p11, env_ao_radius,
-                          1 / (env_ao_radius * env_ao_radius), 0.2f * (float)hh, env_ao_strength};
+                          1 / (env_ao_radius * env_ao_radius), 0.2f * (float)hh, env_ao_strength, env_ao_thickness, 3.3f};
     if (env_ao || reflect || env_fog || skin || contact) ao_pass(0, z, depth, nil, &a);
     if (env_ao) {
         id<MTLTexture> raw = ao_texture(1, MTLPixelFormatR16Float, hw, hh);
         id<MTLTexture> soft = ao_texture(2, MTLPixelFormatRG32Float, hw, hh);
-        ao_pass(1, raw, z, nil, &a);
+        ao_occlusion(raw, z, &a);
         ao_pass(2, soft, raw, z, &a);
         ao_result = soft, ao_result_params = a;
     }
