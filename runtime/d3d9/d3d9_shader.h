@@ -25,6 +25,7 @@ struct d3d_shader_info {
     uint8_t sampler_type[D3D_SHADER_MAX_SAMPLERS];
     int writes_depth;
     uint32_t color_outputs;  // pixel: oC<n> written (ps_1_x: bit 0)
+    uint32_t const_read[8];  // float constants c<n> (n < 256) read, bit n; relative reads mark their base
     // Constants the shader defines. D3D applies them over the constants the game sets,
     // for relative addressing too, so the renderer writes them into the uploaded copy.
     int ndefs, ndefis, ndefbs;
@@ -74,11 +75,24 @@ struct d3d_shader_variant {
     // reads become bl_lightmap, a smooth (Catmull-Rom) read kept inside the
     // surface's rectangle of the page, which [[texture(13)]] holds for each of its texels.
     uint8_t lightmap;
+    // Pixel, with lightmap: the lighting rebake's page at [[texture(16)]], 4 times the
+    // size of the game's, and the old light it replaces at [[texture(17)]], the game's size.
+    // Where texture(13) marks a texel's rectangle as rebaked (0x8000 added to x0), the
+    // game's page is read changed by the difference (in the rectangle 4 times as large).
+    uint8_t rebake;
     // Pixel: also write [[color(2)]] for the bounced light (metal_render.m ssil_run): the
     // surface's own colour, the first 2D texture it reads that is not a lightmap or
     // shadow (stage 0's with the fixed-function stages), alpha 1; mid grey for one that
     // reads none.
     uint8_t albedo;
+    // Pixel: also write [[color(3)]] for the reflections (metal_render.m surface_texture):
+    // the view-space normal, from the surface's slope (the view depth, in.fogz, across the
+    // pixels) and, when d3d_ps_params pbr says so, bent by the PBRify normal map at
+    // [[texture(12)]] (xyz the normal, a the roughness) read where the first plain 2D
+    // texture is; a the roughness, -1 without a map. With a map the bumps also shade the
+    // light: the map's lights at [[buffer(4)]] ([0].x their count, then four float4 each,
+    // struct fog_light in metal_render.m).
+    uint8_t surface;
 };
 
 // Soft shadows from the atlas (variant shadow_receiver): the atlas is seen as 8x8 cells
@@ -133,7 +147,12 @@ struct d3d_ps_params {
     float alpha_ref;
     uint32_t alpha_func;      // D3DCMPFUNC; 8 (ALWAYS) when alpha test is off
     float gloss;              // with reflection info and no cubemap: its a (metal_render.m material_gloss)
-    float pad;
+    float pbr;                // variant surface: 1 when [[texture(12)]] is the draw's PBRify map
+    float view[4];            // variant surface: p00, p11, 2 / width and 2 / height of the target
+    float bump;               // variant surface: how much the map's bumps shade the light (0 none)
+    float metal;              // variant surface: how metallic the map's material is (0 to 1)
+    float spec;               // variant surface: strength of the lights' shine on it (0 none)
+    float pad2;
 };
 
 // Fixed-function pixel stages (draws with no pixel shader): the texture stage states

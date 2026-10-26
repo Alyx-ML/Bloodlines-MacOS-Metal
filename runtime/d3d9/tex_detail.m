@@ -8,6 +8,7 @@
 #import <ImageIO/ImageIO.h>
 #include <mach-o/dyld.h>
 #include <math.h>
+#include <os/lock.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -177,10 +178,18 @@ static void load_rough(const char *path, uint8_t *px, size_t w, size_t h)
     free(g);
 }
 
+static id<MTLTexture> load_map_at(id<MTLDevice> dev, const char *path);
 static id<MTLTexture> load_map(id<MTLDevice> dev, const char *rel)
 {
     char path[1600];
     snprintf(path, sizeof path, "%s/%s", dir, rel);
+    return load_map_at(dev, path);
+}
+
+id<MTLTexture> bl_load_normal_map(id<MTLDevice> dev, const char *path) { return load_map_at(dev, path); }
+
+static id<MTLTexture> load_map_at(id<MTLDevice> dev, const char *path)
+{
     NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
     CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
     if (!src) return nil;
@@ -358,6 +367,92 @@ static id<MTLTexture> hair_base_color(id<MTLDevice> dev, const char *path, const
     return t;
 }
 
+// The closest entry to a texture's signature, or -1.
+static int best_match(uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch, float *err_out)
+{
+    float sig[192];
+    if (!signature(w, h, format, data, pitch, sig)) return -1;
+    int best = -1;
+    float best_err = 0.01f;  // mean difference per channel, 0..1 (a texture matches itself within 0.003)
+    for (int i = 0; i < nentries; i++) {
+        struct entry *e = &entries[i];
+        if ((uint64_t)e->w * h != (uint64_t)e->h * w || e->w < w) continue;
+        float err = 0;
+        for (int j = 0; j < 192; j++) err += fabsf(e->sig[j] - sig[j]);
+        err /= 192;
+        if (err < best_err) best_err = err, best = i;
+    }
+    *err_out = best_err;
+    return best;
+}
+
+// Loaded ahead (bl_detail_prefetch), by path, until first asked for: map, colour (or
+// NSNull) and when; and the paths being loaded.
+static NSMutableDictionary<NSString *, NSArray *> *ready;
+static NSMutableSet<NSString *> *loading;
+static os_unfair_lock ready_lock = OS_UNFAIR_LOCK_INIT;
+
+void bl_detail_prefetch(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch)
+{
+    if (!loaded) load_list();
+    if (!nentries || !data) return;
+    if (!ready) ready = [NSMutableDictionary new], loading = [NSMutableSet new];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        float err;
+        int best = best_match(w, h, format, data, pitch, &err);
+        if (best < 0) return;
+        NSString *path = @(entries[best].path);
+        double now = CFAbsoluteTimeGetCurrent();
+        os_unfair_lock_lock(&ready_lock);
+        for (NSString *n in ready.allKeys)
+            if (now - [ready[n][2] doubleValue] > 120) [ready removeObjectForKey:n];
+        int skip = ready[path] || [loading containsObject:path];
+        if (!skip) [loading addObject:path];
+        os_unfair_lock_unlock(&ready_lock);
+        if (skip) return;
+        id<MTLTexture> map = load_map(dev, entries[best].path), col = load_color(dev, entries[best].path);
+        os_unfair_lock_lock(&ready_lock);
+        [loading removeObject:path];
+        ready[path] = @[map ? (id)map : [NSNull null], col ? (id)col : [NSNull null], @(now)];
+        os_unfair_lock_unlock(&ready_lock);
+    });
+}
+
+// What was loaded ahead for `path`, waiting for it if it is being loaded; nil if nothing.
+static NSArray *take_ready(const char *path)
+{
+    if (!ready) return nil;
+    NSString *p = @(path);
+    for (;;) {
+        os_unfair_lock_lock(&ready_lock);
+        NSArray *r = ready[p];
+        int busy = !r && [loading containsObject:p];
+        if (r) [ready removeObjectForKey:p];
+        os_unfair_lock_unlock(&ready_lock);
+        if (!busy) return r;
+        usleep(200);
+    }
+}
+
+// The cache's entries by texture, size and stamp, with a small table in front of it: draws ask
+// for the same few hundred textures every frame, and making the key string each time showed
+// in profiles.
+static struct { const void *key; uint32_t stamp, w, h; } memo_key[512];
+static NSArray *memo_hit[512];
+static NSString *cache_key(const void *key, uint32_t stamp, uint32_t w, uint32_t h)
+{
+    return [NSString stringWithFormat:@"%p/%u/%ux%u", key, stamp, w, h];
+}
+static NSArray *cache_find(const void *key, uint32_t stamp, uint32_t w, uint32_t h)
+{
+    unsigned i = (unsigned)(((uintptr_t)key >> 4) ^ ((uintptr_t)key >> 13) ^ stamp * 31u) % 512u;
+    if (memo_hit[i] && memo_key[i].key == key && memo_key[i].stamp == stamp && memo_key[i].w == w && memo_key[i].h == h)
+        return memo_hit[i];
+    NSArray *hit = cache[cache_key(key, stamp, w, h)];
+    if (hit) memo_key[i].key = key, memo_key[i].stamp = stamp, memo_key[i].w = w, memo_key[i].h = h, memo_hit[i] = hit;
+    return hit;
+}
+
 id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t stamp, uint32_t w, uint32_t h,
                                 uint32_t format, const uint8_t *data, uint32_t pitch, id<MTLTexture> *color)
 {
@@ -365,37 +460,27 @@ id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t sta
     if (!loaded) load_list();
     if (!nentries || !data) return nil;
     if (!cache) cache = [NSMutableDictionary new];
-    NSString *k = [NSString stringWithFormat:@"%p/%u/%ux%u", key, stamp, w, h];
-    NSArray *hit = cache[k];
+    NSArray *hit = cache_find(key, stamp, w, h);
     if (hit) {
         if (hit.count > 1 && hit[1] != [NSNull null]) *color = hit[1];
         return hit[0] == [NSNull null] ? nil : hit[0];
     }
-    float sig[192];
     id<MTLTexture> result = nil;
     const char *name = NULL;
-    if (signature(w, h, format, data, pitch, sig)) {
-        int best = -1;
-        float best_err = 0.01f;  // mean difference per channel, 0..1 (a texture matches itself within 0.003)
-        for (int i = 0; i < nentries; i++) {
-            struct entry *e = &entries[i];
-            if ((uint64_t)e->w * h != (uint64_t)e->h * w || e->w < w) continue;
-            float err = 0;
-            for (int j = 0; j < 192; j++) err += fabsf(e->sig[j] - sig[j]);
-            err /= 192;
-            if (err < best_err) best_err = err, best = i;
-        }
-        if (best >= 0) {
-            result = load_map(dev, entries[best].path);
-            name = entries[best].path;
-            *color = load_color(dev, entries[best].path);
-            fprintf(stderr, "[detail] %ux%u texture: %s (difference %.4f)%s\n", w, h, entries[best].path, best_err,
-                    *color ? [[NSString stringWithFormat:@", upscaled %lux%lu", (unsigned long)(*color).width,
-                                                         (unsigned long)(*color).height] UTF8String]
-                           : "");
-        }
+    float best_err;
+    int best = best_match(w, h, format, data, pitch, &best_err);
+    if (best >= 0) {
+        NSArray *r = take_ready(entries[best].path);
+        result = r ? (r[0] == [NSNull null] ? nil : r[0]) : load_map(dev, entries[best].path);
+        name = entries[best].path;
+        *color = r ? (r[1] == [NSNull null] ? nil : r[1]) : load_color(dev, entries[best].path);
+        fprintf(stderr, "[detail] %ux%u texture: %s (difference %.4f)%s%s\n", w, h, entries[best].path, best_err,
+                *color ? [[NSString stringWithFormat:@", upscaled %lux%lu", (unsigned long)(*color).width,
+                                                     (unsigned long)(*color).height] UTF8String]
+                       : "",
+                r ? ", loaded ahead" : "");
     }
-    cache[k] = @[result ? (id)result : [NSNull null], *color ? (id)*color : [NSNull null],
+    cache[cache_key(key, stamp, w, h)] = @[result ? (id)result : [NSNull null], *color ? (id)*color : [NSNull null],
                  name ? (id)[NSString stringWithUTF8String:name] : [NSNull null]];
     return result;
 }
@@ -423,7 +508,7 @@ const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, const void *key, ui
 {
     static NSMutableDictionary<NSString *, NSValue *> *meshes;
     if (!cache) return NULL;
-    NSArray *hit = cache[[NSString stringWithFormat:@"%p/%u/%ux%u", key, 0u, w, h]];
+    NSArray *hit = cache_find(key, 0, w, h);
     if (!hit || hit.count < 3 || hit[2] == [NSNull null]) return NULL;
     NSString *name = hit[2];
     if (!meshes) meshes = [NSMutableDictionary new];

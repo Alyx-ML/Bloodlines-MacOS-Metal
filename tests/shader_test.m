@@ -1,7 +1,8 @@
 // Translates D3D9 shader bytecode files (vs_*.bin / ps_*.bin, as BL_DUMP_SHADERS
 // writes them) to MSL and compiles each with Metal, in the default variant and the
 // variants the renderer can ask for: every sampler cube or volume, ps_1_x texcoords
-// projected, vertex inputs integer. Needs GPU access.
+// projected, vertex inputs integer, sampler 0 reading a lightmap page (smooth, and from the
+// lighting rebake's page). Needs GPU access.
 //   shader_test <dir> [-v]     -v prints the MSL of failures
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -48,17 +49,18 @@ int main(int argc, char **argv)
         char path[2048], err[256] = "";
         snprintf(path, sizeof path, "%s/%s", argv[1], e->d_name);
         uint32_t *code = load(path);
-        struct d3d_shader_variant vars[6];
+        struct d3d_shader_variant vars[8];
         memset(vars, 0, sizeof vars);
         for (int i = 0; i < D3D_SHADER_MAX_SAMPLERS; i++) {
             vars[1].tex_kind[i] = D3D_TEX_CUBE, vars[2].tex_kind[i] = D3D_TEX_3D;
             vars[3].projected[i] = 3, vars[4].projected[i] = 4;
         }
         for (int i = 0; i < D3D_SHADER_MAX_INPUTS; i++) vars[1].input_kind[i] = D3D_IN_UINT, vars[2].input_kind[i] = D3D_IN_SINT;
-        vars[5].reflection_info = vars[5].albedo = 1;
+        vars[5].reflection_info = vars[5].albedo = vars[5].surface = 1;
+        vars[6].lightmap = vars[7].lightmap = 1, vars[7].rebake = 1;
         static const char *const names[] = {"default", "cube/uint", "volume/sint", "projected3", "projected4",
-                                            "info/albedo"};
-        for (int k = 0; k < 6; k++) {
+                                            "info/albedo/surface", "lightmap", "lightmap/rebake"};
+        for (int k = 0; k < 8; k++) {
             char *msl = d3d_shader_msl(code, k ? &vars[k] : NULL, err, sizeof err);
             if (!msl) {
                 printf("FAIL translate %s (%s): %s\n", e->d_name, names[k], err);

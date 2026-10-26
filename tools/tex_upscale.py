@@ -26,18 +26,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TILE, PAD = 256, 16
 
 
-def upscale(net, scale, rgb, dev):
-    """rgb: h x w x 3 float32. Tiles of TILE with PAD of overlap, so the edges match."""
+def upscale(net, scale, rgb, dev, tile=TILE, dtype=torch.float32):
+    """rgb: h x w x 3 float32. Tiles of `tile` with PAD of overlap, so the edges match;
+    the network run in `dtype` (float16 on CUDA, tools/colab_pbrify.py)."""
     h, w = rgb.shape[:2]
     out = np.zeros((h * scale, w * scale, 3), np.float32)
     src = np.pad(rgb, ((PAD, PAD), (PAD, PAD), (0, 0)), mode="reflect")
-    for y in range(0, h, TILE):
-        for x in range(0, w, TILE):
-            th, tw = min(TILE, h - y), min(TILE, w - x)
-            tile = src[y:y + th + 2 * PAD, x:x + tw + 2 * PAD]
-            t = torch.from_numpy(np.ascontiguousarray(tile)).permute(2, 0, 1)[None].to(dev)
+    for y in range(0, h, tile):
+        for x in range(0, w, tile):
+            th, tw = min(tile, h - y), min(tile, w - x)
+            part = src[y:y + th + 2 * PAD, x:x + tw + 2 * PAD]
+            t = torch.from_numpy(np.ascontiguousarray(part)).permute(2, 0, 1)[None].to(dev, dtype)
             with torch.no_grad():
-                r = net(t).clamp(0, 1)[0].permute(1, 2, 0).cpu().numpy()
+                r = net(t).clamp(0, 1)[0].permute(1, 2, 0).float().cpu().numpy()
             p = PAD * scale
             out[y * scale:(y + th) * scale, x * scale:(x + tw) * scale] = r[p:p + th * scale, p:p + tw * scale]
     return out
@@ -50,6 +51,8 @@ def main():
     ap.add_argument("--match", nargs="*", default=["face", "head"])
     ap.add_argument("--skip", nargs="*", default=["spec", "env", "mask", "hair", "trans"])
     ap.add_argument("--first", nargs="*", default=[])
+    ap.add_argument("--only", nargs="*", default=[],
+                    help="only textures whose path has one of these (a level's characters)")
     ap.add_argument("--max", type=int, default=2048, help="longest side of the result")
     args = ap.parse_args()
     dev = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -62,7 +65,8 @@ def main():
         index = json.load(f)
     todo = [t for t in index if any(p in t["name"] for p in ("character/npc/", "character/pc/"))
             and any(k in os.path.basename(t["name"]).lower() for k in args.match)
-            and not any(k in os.path.basename(t["name"]).lower() for k in args.skip)]
+            and not any(k in os.path.basename(t["name"]).lower() for k in args.skip)
+            and (not args.only or any(k in t["name"] for k in args.only))]
     todo.sort(key=lambda t: (not any(f in t["name"] for f in args.first), t["w"] * t["h"]))
     done = 0
     for t in todo:

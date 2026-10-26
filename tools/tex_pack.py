@@ -222,13 +222,15 @@ def find_jobs(src, game, idx):
         while root != src and not os.path.exists(os.path.join(root, "index.json")):
             root = os.path.dirname(root)
         for f in sorted(files):
-            if not f.lower().endswith(".png") or f == "contact_sheet.png":
+            if not f.lower().endswith((".png", ".webp")) or f == "contact_sheet.png":
                 continue
-            rel = os.path.relpath(os.path.join(d, f[:-4]), root).replace(os.sep, "/").lower()
+            rel = os.path.relpath(os.path.join(d, os.path.splitext(f)[0]), root).replace(os.sep, "/").lower()
             folder, stem = rel.rpartition("/")[0], rel.rpartition("/")[2]
             names = [stem] + [stem[:i] for i in range(len(stem)) if stem[i] == "-" and i]
             found = [n for n in dict.fromkeys(names)
                      if tex_extract.exists(game, idx, "materials/" + (folder + "/" if folder else "") + n + ".tth")]
+            if not found and rel.endswith(("_n", "_r")):
+                continue  # PBRify's normal and roughness maps (tools/tex_normals.py, colab_pbrify.py)
             if len(found) != 1:
                 refused.append(f"{os.path.join(d, f)}: " + ("no texture of that name in the game" if not found
                                else "matches several textures: " + ", ".join(found)))

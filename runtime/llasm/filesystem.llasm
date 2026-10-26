@@ -1,0 +1,10 @@
+;; Entry points for native replacements of FileSystem_Stdio routines (runtime/bl_filesystem.c).
+include llasm.llinc
+include asm-calls.llinc
+
+funcv bl_fs_FindMatch_c $
+
+proc bl_fs_FindMatch public
+        call bl_fs_FindMatch_c $
+        Call_Asm_Return 3
+endp

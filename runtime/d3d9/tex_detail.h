@@ -14,6 +14,14 @@
 id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t stamp, uint32_t w, uint32_t h,
                                 uint32_t format, const uint8_t *data, uint32_t pitch, id<MTLTexture> *color);
 
+// Starts loading the normal map and upscaled colour for a top level the game just filled,
+// on another thread, for bl_detail_normal to find ready (the data must stay as it is).
+void bl_detail_prefetch(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch);
+
+// A normal map at `path` (a <name>_n.png, with <name>_r.png's roughness in alpha), as
+// the characters' are loaded: xyz the normal, mipmaps renormalised; nil without one.
+id<MTLTexture> bl_load_normal_map(id<MTLDevice> dev, const char *path);
+
 // A flat normal map (roughness 0.5) for character parts without one of their own (hair,
 // teeth, characters not in the list), so they get the same light as the rest.
 id<MTLTexture> bl_detail_flat(id<MTLDevice> dev);

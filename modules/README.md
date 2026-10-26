@@ -15,6 +15,14 @@ Write hand-made fixes here; the pipeline generates the rest.
 - `0x100048D0` `_CIsqrt`, `0x100048E4` `sqrt` and their shared worker up to
   `0x10004989` (186 bytes).
 
+## FileSystem_Stdio
+- `0x10007C40` the wildcard search's matcher (584 bytes), replaced by `bl_fs_FindMatch`
+  (`runtime/bl_filesystem.c`, `runtime/llasm/filesystem.llasm`): it walks the file tree
+  from the start entry in order and compares prefix and extension directly, without the
+  original's per-entry string work; most of the start-up and map-load time went there.
+- `global_aliases.manual.sci` names the symbol table getter at `0x1000CB20`
+  (`FileSystem_SymbolTable`), which the replacement calls for the entries' names.
+
 ## GameUI
 - `0x10029250` vgui `RichText::GetCursorLine` (63 bytes), replaced by
   `bl_vgui_GetCursorLine`: a binary search over the line-break table instead of a

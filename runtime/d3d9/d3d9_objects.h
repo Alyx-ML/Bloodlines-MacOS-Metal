@@ -37,10 +37,13 @@ struct obj {
     int gpu_scale;             // gpu is this many times the size (the shadow atlas; 0 = 1)
     void *hires;               // upscaled texture drawn in place of gpu (tex_hires.h), or NULL
     float gloss;               // textures: how much its material reflects (metal_render.m material_gloss)
+    void *pbr;                 // textures: its PBRify normal and roughness map (metal_render.m pbr_map), or NULL
+    float metal;               // textures: how metallic its material is (metal_render.m material_metal)
     void *sound;               // DirectSound buffer state (dsound.c)
     int dirty;                 // guest memory changed since the last upload
     int rewrites;              // static vertex buffers: times rewritten after first use
     int used;                  // textures: bound for a draw since the last upload
+    int prefetched;            // textures: their upscale and maps asked for ahead (d3d_image_changed)
 };
 
 struct obj *obj_new(enum obj_type type, uint32_t vtbl);

@@ -1,0 +1,11 @@
+{
+  "model": "models/scenery/furniture/bartable/bartable.mdl",
+  "tolerance": 0.03,
+  "round": [
+    {"material": "bartable", "at": [15.901, 16.897], "radius": 0.3},
+    {"material": "bartable", "at": [15.901, 18.018], "radius": 0.2},
+    {"material": "bartable", "at": [15.29, 18.387], "radius": 0.2},
+    {"material": "bartable", "at": [9.722, -17.622], "radius": 0.25},
+    {"material": "bartable", "at": [2.176, -15.716], "radius": 0.8}
+  ]
+}

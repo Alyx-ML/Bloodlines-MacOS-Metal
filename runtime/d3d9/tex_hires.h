@@ -12,6 +12,13 @@
 // bytes apart, or nil.
 id<MTLTexture> bl_hires_texture(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data,
                                 uint32_t pitch);
+// Starts loading the upscaled texture for a top level the game just filled, on another
+// thread, for bl_hires_texture to find ready when the texture is first drawn (the data
+// must stay as it is). Textures loaded ahead and not asked for go after two minutes.
+void bl_hires_prefetch(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch);
 // The game's name for the same top level ("materials/wood/floorb"), from names.txt, or
 // NULL. Cheap straight after bl_hires_texture for the same level.
 const char *bl_tex_name(uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch);
+// The same from any thread (no reuse of the last hash), after the first bl_tex_name or
+// bl_hires_prefetch.
+const char *bl_tex_name_any_thread(uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch);

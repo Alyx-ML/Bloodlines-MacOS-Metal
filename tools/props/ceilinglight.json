@@ -1,0 +1,8 @@
+{
+  "model": "models/scenery/structural/ceilinglight/ceilinglight.mdl",
+  "tolerance": 0.03,
+  "round": [
+    {"material": "ceilinglight", "at": [2.555, 1.004], "radius": 1.0},
+    {"material": "ceilinglight", "at": [2.064, 0.651], "radius": 1.0}
+  ]
+}

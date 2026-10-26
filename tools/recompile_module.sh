@@ -74,8 +74,10 @@ python3 -I "$HERE/tools/table_init_pointers.py" "$NAME.ll"
 sed -i '' 's/^define private fastcc void @loc_/define internal fastcc void @loc_/' "$NAME.ll"
 "$LLVM/llvm-split" -j "$JOBS" -o "$NAME.part" "$NAME.ll"
 # SR_INLINE=1 links in the x87 helpers (build_runtime.sh) as internal copies for opt to
-# inline. Off by default: measured on sp_theatre it was about 6% slower than calls,
-# since the cost is in the helpers' memory-based x87 stack, not the call.
+# inline. Off by default, and in fact opt never inlines them: the helpers are compiled for
+# apple-m1 and the translated procs carry no target, so the inliner refuses ("conflicting
+# target features"). Matching the targets did inline them (2026-10-26), with no measurable
+# gain on the Santa Monica hub: see PORTING_LOG.
 INLINE="$HERE/build/runtime/sr_inline.bc"
 [ -z "$SR_INLINE" ] || test -s "$INLINE"
 export LLVM ARM64_DL INLINE SR_INLINE

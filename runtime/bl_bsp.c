@@ -29,6 +29,8 @@ static struct map {
     int nlights;
 } *map;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+// The open map's surfaces go to the renderer's light probes (gi_probes.h), which keep them.
+void bl_map_note(struct bl_bsp_world *w, const char *host_path);
 
 static int rd32(const uint8_t *p) { int v; memcpy(&v, p, 4); return v; }
 static float rdf(const uint8_t *p) { float v; memcpy(&v, p, 4); return v; }
@@ -126,6 +128,24 @@ void bl_bsp_note_open(const char *host_path)
     map = m;
     pthread_mutex_unlock(&lock);
     free_map(old);
+    // Its surfaces too, for the lighting rebake (read and checked).
+    char err[256], summary[1024];
+    struct bl_bsp_world *w = bl_bsp_world_load(host_path, err, sizeof err);
+    if (!w) {
+        fprintf(stderr, "[bsp] surfaces not read: %s\n", err);
+        return;
+    }
+    int bad = bl_bsp_world_check(w, summary, sizeof summary);
+    fprintf(stderr, "[bsp] %s%s\n", summary, bad ? " -- LAYOUT NOT AS EXPECTED" : "");
+    if (bad) bl_bsp_world_free(w);
+    else bl_map_note(w, host_path);
+}
+
+// For tools built without the renderer (tests/bsp_check): the surfaces are not kept.
+__attribute__((weak)) void bl_map_note(struct bl_bsp_world *w, const char *host_path)
+{
+    (void)host_path;
+    bl_bsp_world_free(w);
 }
 
 static int leaf_at(const struct map *m, const float p[3])
@@ -226,4 +246,258 @@ int bl_bsp_lights(const float cam[3], struct bl_light *out, int max)
     }
     pthread_mutex_unlock(&lock);
     return n;
+}
+
+// --- the map's surfaces, for the lighting rebake ----------------------------------------
+//
+// VBSP 17 as Bloodlines has it differs from Half-Life 2's in the faces: 104 bytes, with
+// eight light styles and eight day and night bytes (and a per-style mean colour) where
+// Half-Life 2 has four styles in 56 bytes. Maps compiled again for the Unofficial Patch
+// hold each face's mean colour per style just before its samples (lightofs), as Half-Life
+// 2's do; the original maps do not (world->means says which, from the lump's size).
+
+struct bl_bsp_world *bl_bsp_world_load(const char *path, char *err, int errlen)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        snprintf(err, (size_t)errlen, "cannot open %s", path);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *d = size > 1036 ? malloc((size_t)size) : NULL;
+    int ok = d && fread(d, 1, (size_t)size, f) == (size_t)size;
+    fclose(f);
+    if (!ok || memcmp(d, "VBSP", 4) || rd32(d + 4) != 17) {
+        snprintf(err, (size_t)errlen, "%s: not a version 17 VBSP", path);
+        free(d);
+        return NULL;
+    }
+    const uint8_t *lump[64];
+    int len[64];
+    for (int i = 0; i < 64; i++) {
+        int ofs = rd32(d + 8 + 16 * i), n = rd32(d + 12 + 16 * i);
+        if (ofs < 0 || n < 0 || (long)ofs + n > size) ofs = 0, n = 0;
+        lump[i] = d + ofs, len[i] = n;
+    }
+    struct bl_bsp_world *w = calloc(1, sizeof *w);
+    const char *slash = strrchr(path, '/');
+    snprintf(w->name, sizeof w->name, "%s", slash ? slash + 1 : path);
+    int nplanes = len[1] / 20, nedges = len[12] / 4, nsurf = len[13] / 4;
+    w->nverts = len[3] / 12;
+    w->verts = calloc((size_t)w->nverts + 1, sizeof *w->verts);
+    for (int i = 0; i < w->nverts; i++)
+        for (int k = 0; k < 3; k++) w->verts[i][k] = rdf(lump[3] + 12 * i + 4 * k);
+    w->ntexinfo = len[6] / 72;
+    w->texinfo = calloc((size_t)w->ntexinfo + 1, sizeof *w->texinfo);
+    for (int i = 0; i < w->ntexinfo; i++) {
+        const uint8_t *p = lump[6] + 72 * i;
+        for (int k = 0; k < 8; k++) (&w->texinfo[i].tex[0][0])[k] = rdf(p + 4 * k), (&w->texinfo[i].lm[0][0])[k] = rdf(p + 32 + 4 * k);
+        w->texinfo[i].flags = rd32(p + 64), w->texinfo[i].texdata = rd32(p + 68);
+    }
+    // Texture data: reflectivity, the name's place in the string table (lumps 44 and 43),
+    // size, view size.
+    w->ntexdata = len[2] / 32;
+    w->texdata = calloc((size_t)w->ntexdata + 1, sizeof *w->texdata);
+    for (int i = 0; i < w->ntexdata; i++) {
+        const uint8_t *p = lump[2] + 32 * i;
+        struct bl_bsp_texdata *t = &w->texdata[i];
+        for (int k = 0; k < 3; k++) t->reflectivity[k] = rdf(p + 4 * k);
+        t->width = rd32(p + 16), t->height = rd32(p + 20);
+        int s = rd32(p + 12);
+        if (s >= 0 && 4 * s + 4 <= len[44]) {
+            int ofs = rd32(lump[44] + 4 * s);
+            if (ofs >= 0 && ofs < len[43])
+                snprintf(t->name, sizeof t->name, "%.*s", (int)strnlen((const char *)lump[43] + ofs, (size_t)(len[43] - ofs)),
+                         (const char *)lump[43] + ofs);
+        }
+    }
+    // Models: mins, maxs, origin, head node, first face, face count.
+    w->nmodels = len[14] / 48;
+    w->nfaces = len[7] / 104;
+    w->faces = calloc((size_t)w->nfaces + 1, sizeof *w->faces);
+    w->index = calloc((size_t)nsurf + 1, sizeof *w->index);
+    for (int m = 0; m < w->nmodels; m++) {
+        int first = rd32(lump[14] + 48 * m + 40), n = rd32(lump[14] + 48 * m + 44);
+        for (int i = first; i >= 0 && i < first + n && i < w->nfaces; i++) w->faces[i].model = m;
+    }
+    // Brush entities stand where their entity's origin says ("model" "*N"); their faces
+    // are in the model's own space.
+    float (*mo)[3] = calloc((size_t)w->nmodels + 1, sizeof *mo);
+    for (const char *e = (const char *)lump[0], *end = e + len[0]; e < end;) {
+        const char *open = memchr(e, '{', (size_t)(end - e)), *close = open ? memchr(open, '}', (size_t)(end - open)) : NULL;
+        if (!close) break;
+        int model = -1;
+        float o[3] = {0};
+        for (const char *k = open + 1; k < close;) {
+            const char *q[4];
+            int n = 0;
+            for (const char *c = k; c < close && n < 4; c++)
+                if (*c == '"') q[n++] = c;
+            if (n < 4) break;
+            int kl = (int)(q[1] - q[0] - 1);
+            if (kl == 5 && !memcmp(q[0] + 1, "model", 5) && q[2][1] == '*') model = atoi(q[2] + 2);
+            if (kl == 6 && !memcmp(q[0] + 1, "origin", 6)) sscanf(q[2] + 1, "%f %f %f", &o[0], &o[1], &o[2]);
+            k = q[3] + 1;
+        }
+        if (model > 0 && model < w->nmodels) memcpy(mo[model], o, sizeof o);
+        e = close + 1;
+    }
+    for (int i = 0; i < w->nfaces; i++) {
+        const uint8_t *p = lump[7] + 104 * i;
+        struct bl_bsp_face *fc = &w->faces[i];
+        // The face's own plane, facing the way it does (planes come in pairs); the side
+        // byte is its node's, not its own.
+        int plane = (uint16_t)rd16(p + 32);
+        if (plane < nplanes) {
+            for (int k = 0; k < 3; k++) fc->normal[k] = rdf(lump[1] + 20 * plane + 4 * k);
+            fc->dist = rdf(lump[1] + 20 * plane + 12);
+        }
+        int firstedge = rd32(p + 36), numedges = rd16(p + 40);
+        fc->first = w->nindex;
+        for (int e = 0; e < numedges && firstedge >= 0 && firstedge + e < nsurf; e++) {
+            int se = rd32(lump[13] + 4 * (firstedge + e)), ed = se < 0 ? -se : se;
+            if (ed >= nedges) continue;
+            int v = (uint16_t)rd16(lump[12] + 4 * ed + (se < 0 ? 2 : 0));
+            if (v < w->nverts) w->index[w->nindex++] = v;
+        }
+        fc->count = w->nindex - fc->first;
+        fc->texinfo = rd16(p + 42);
+        if (fc->texinfo >= w->ntexinfo) fc->texinfo = -1;
+        fc->disp = rd16(p + 44);
+        memcpy(fc->styles, p + 48, 8);
+        for (int k = 0; k < 8; k++) fc->nstyles += fc->styles[k] != 255;
+        fc->lightofs = rd32(p + 72);
+        if (fc->lightofs >= 0) fc->lightofs /= 4;
+        fc->area = rdf(p + 76);
+        fc->mins[0] = rd32(p + 80), fc->mins[1] = rd32(p + 84);
+        fc->size[0] = rd32(p + 88), fc->size[1] = rd32(p + 92);
+        fc->bumped = fc->texinfo >= 0 && (w->texinfo[fc->texinfo].flags & 0x800);
+        memcpy(fc->origin, mo[fc->model], sizeof fc->origin);
+    }
+    free(mo);
+    w->nlights = len[15] / 88;
+    w->lights = calloc((size_t)w->nlights + 1, sizeof *w->lights);
+    for (int i = 0; i < w->nlights; i++) {
+        const uint8_t *p = lump[15] + 88 * i;
+        struct bl_bsp_worldlight *l = &w->lights[i];
+        for (int k = 0; k < 3; k++)
+            l->origin[k] = rdf(p + 4 * k), l->intensity[k] = rdf(p + 12 + 4 * k), l->normal[k] = rdf(p + 24 + 4 * k);
+        l->cluster = rd32(p + 36), l->type = rd32(p + 40), l->style = rd32(p + 44);
+        l->stopdot = rdf(p + 48), l->stopdot2 = rdf(p + 52), l->exponent = rdf(p + 56), l->radius = rdf(p + 60);
+        for (int k = 0; k < 3; k++) l->att[k] = rdf(p + 64 + 4 * k);
+        l->flags = rd32(p + 76), l->texinfo = rd32(p + 80), l->owner = rd32(p + 84);
+    }
+    // Mean colours before each face's samples, or not: whichever fills the lump exactly.
+    long plain = 0, styles = 0;
+    for (int i = 0; i < w->nfaces; i++)
+        if (w->faces[i].lightofs >= 0 && w->faces[i].texinfo >= 0) {
+            const struct bl_bsp_face *fc = &w->faces[i];
+            plain += (long)(fc->size[0] + 1) * (fc->size[1] + 1) * fc->nstyles * (fc->bumped ? 4 : 1);
+            styles += fc->nstyles;
+        }
+    w->means = plain + styles == len[8] / 4;
+    w->nsamples = len[8] / 4;
+    w->lighting = malloc((size_t)len[8] + 4);
+    memcpy(w->lighting, lump[8], (size_t)len[8]);
+    w->props = bl_props_load(path, d, size, w->props_err, sizeof w->props_err);
+    w->nplanes = nplanes, w->nnodes = len[5] / 32, w->nleaves = len[10] / 32;
+    w->planes = calloc((size_t)w->nplanes + 1, sizeof *w->planes);
+    w->nodes = calloc((size_t)w->nnodes + 1, sizeof *w->nodes);
+    w->leaves = calloc((size_t)w->nleaves + 1, sizeof *w->leaves);
+    for (int i = 0; i < w->nplanes; i++)
+        for (int k = 0; k < 4; k++) w->planes[i][k] = rdf(lump[1] + 20 * i + 4 * k);
+    for (int i = 0; i < w->nnodes; i++) {
+        const uint8_t *p = lump[5] + 32 * i;
+        w->nodes[i][0] = rd32(p), w->nodes[i][1] = rd32(p + 4), w->nodes[i][2] = rd32(p + 8);
+        if (w->nodes[i][0] < 0 || w->nodes[i][0] >= w->nplanes) w->nodes[i][0] = 0;
+    }
+    for (int i = 0; i < w->nleaves; i++) w->leaves[i][0] = rd32(lump[10] + 32 * i), w->leaves[i][1] = rd16(lump[10] + 32 * i + 4);
+    free(d);
+    return w;
+}
+
+void bl_bsp_world_free(struct bl_bsp_world *w)
+{
+    if (!w) return;
+    free(w->verts), free(w->index), free(w->faces), free(w->texinfo), free(w->texdata), free(w->lights), free(w->lighting);
+    bl_props_free(w->props);
+    free(w->planes), free(w->nodes), free(w->leaves);
+    free(w);
+}
+
+int bl_bsp_world_open(const struct bl_bsp_world *w, const float p[3])
+{
+    int i = 0;
+    for (int guard = 0; i >= 0 && guard < 4096; guard++) {
+        if (i >= w->nnodes) return 0;
+        const float *pl = w->planes[w->nodes[i][0]];
+        i = w->nodes[i][1 + (pl[0] * p[0] + pl[1] * p[1] + pl[2] * p[2] - pl[3] < 0)];
+    }
+    i = -1 - i;
+    return i >= 0 && i < w->nleaves && !(w->leaves[i][0] & 1) && w->leaves[i][1] >= 0;
+}
+
+static int by_lightofs(const void *a, const void *b)
+{
+    const int *x = a, *y = b;
+    return x[0] < y[0] ? -1 : x[0] > y[0];
+}
+
+int bl_bsp_world_check(const struct bl_bsp_world *w, char *buf, int len)
+{
+    int lit = 0, bumped = 0, bad_range = 0, bad_luxel = 0, overlap = 0, disp = 0, ntype[6] = {0};
+    long samples = 0;
+    float worst = 0;  // the farthest a corner falls outside its lightmap, in luxels
+    int *spans = malloc(sizeof(int) * 2 * ((size_t)w->nfaces + 1));
+    for (int i = 0; i < w->nfaces; i++) {
+        const struct bl_bsp_face *f = &w->faces[i];
+        disp += f->disp >= 0;
+        if (f->lightofs < 0 || f->texinfo < 0) continue;
+        int n = (f->size[0] + 1) * (f->size[1] + 1) * f->nstyles * (f->bumped ? 4 : 1);
+        // The mean colours (one per style) come just before the samples, in some maps.
+        int before = w->means ? f->nstyles : 0;
+        if (f->lightofs < before || f->lightofs + n > w->nsamples) {
+            bad_range++;
+            continue;
+        }
+        spans[2 * lit] = f->lightofs - before, spans[2 * lit + 1] = f->lightofs + n;
+        lit++, bumped += f->bumped, samples += n;
+        if (f->disp >= 0) continue;  // a displacement's lightmap follows its grid, not the texinfo
+        const struct bl_bsp_texinfo *t = &w->texinfo[f->texinfo];
+        float out = 0;
+        for (int c = 0; c < f->count; c++) {
+            const float *v = w->verts[w->index[f->first + c]];
+            for (int k = 0; k < 2; k++) {
+                float s = v[0] * t->lm[k][0] + v[1] * t->lm[k][1] + v[2] * t->lm[k][2] + t->lm[k][3] - (float)f->mins[k];
+                out = fmaxf(out, fmaxf(-s, s - (float)f->size[k]));
+            }
+        }
+        worst = fmaxf(worst, out);
+        bad_luxel += out > 0.5f;  // half a luxel: vrad's rounding of the mins
+    }
+    qsort(spans, (size_t)lit, 2 * sizeof(int), by_lightofs);
+    for (int i = 1; i < lit; i++) overlap += spans[2 * i] < spans[2 * i - 1];
+    long used = 0;
+    for (int i = 0; i < lit; i++) used += spans[2 * i + 1] - spans[2 * i];
+    free(spans);
+    for (int i = 0; i < w->nlights; i++)
+        if (w->lights[i].type >= 0 && w->lights[i].type < 6) ntype[w->lights[i].type]++;
+    int ntris = 0;
+    for (int i = 0; i < w->nfaces; i++) ntris += w->faces[i].count > 2 ? w->faces[i].count - 2 : 0;
+    snprintf(buf, (size_t)len,
+             "%s: %d faces (%d lit, %d bumped, %d displacements), %d triangles, %d vertices, %d textures, %d models; "
+             "%d lights (%d point, %d spot, %d surface, %d sun, %d sky); lightmaps %ld of %d samples used, "
+             "%d out of range, %d overlapping, %d with a corner outside (worst %.2f luxels)%s; ",
+             w->name, w->nfaces, lit, bumped, disp, ntris, w->nverts, w->ntexdata, w->nmodels, w->nlights, ntype[1],
+             ntype[2], ntype[0], ntype[3], ntype[5], used, w->nsamples, bad_range, overlap, bad_luxel, worst,
+             w->means ? ", mean colours before each face's" : "");
+    size_t at = strlen(buf);
+    if (w->props)
+        snprintf(buf + at, (size_t)len - at, "%d static props, %d casting shadows, %d of those read (%d as boxes, %d by their visible mesh), %d triangles",
+                 w->props->nprops, w->props->nshadow, w->props->nfound, w->props->nbox, w->props->nmesh, w->props->ntris);
+    else
+        snprintf(buf + at, (size_t)len - at, "static props: %s", w->props_err);
+    return bad_range + overlap + bad_luxel + !w->props;
 }

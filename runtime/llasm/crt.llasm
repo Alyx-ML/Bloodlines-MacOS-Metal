@@ -7,6 +7,8 @@ funcv bl_crt_CIsqrt_c $
 funcv bl_crt_log_c $
 funcv bl_crt_CIlog_c $
 funcv bl_crt_memcpy_c $
+funcv bl_crt_strnicmp_c $
+funcv bl_crt_stricmp_c $
 
 proc bl_crt_sqrt public
         call bl_crt_sqrt_c $
@@ -30,6 +32,16 @@ endp
 
 proc bl_crt_memcpy public
         call bl_crt_memcpy_c $
+        Call_Asm_Return 0
+endp
+
+proc bl_crt_strnicmp public
+        call bl_crt_strnicmp_c $
+        Call_Asm_Return 0
+endp
+
+proc bl_crt_stricmp public
+        call bl_crt_stricmp_c $
         Call_Asm_Return 0
 endp
 

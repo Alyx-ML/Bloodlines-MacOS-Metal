@@ -9,6 +9,7 @@
 #import "tex_hires.h"
 
 #include <CommonCrypto/CommonDigest.h>
+#include <os/lock.h>
 #include <mach-o/dyld.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -161,6 +162,53 @@ static id<MTLTexture> load_texture(id<MTLDevice> dev, const char *name)
     return t;
 }
 
+// Loaded ahead (bl_hires_prefetch), by name, until first asked for: the texture and when
+// it was loaded; and the names being loaded.
+static NSMutableDictionary<NSString *, NSArray *> *ready;
+static NSMutableSet<NSString *> *loading;
+static os_unfair_lock ready_lock = OS_UNFAIR_LOCK_INIT;
+
+void bl_hires_prefetch(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch)
+{
+    if (!loaded) load_list();
+    if (!nentries || w < 8 || h < 8 || !data) return;
+    if (!ready) ready = [NSMutableDictionary new], loading = [NSMutableSet new];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        struct entry k = {.key = level_key(w, h, format, data, pitch)};
+        struct entry *e = k.key ? bsearch(&k, entries, nentries, sizeof *entries, by_key) : NULL;
+        if (!e || e->w != w || e->h != h) return;
+        NSString *name = @(e->name);
+        double now = CFAbsoluteTimeGetCurrent();
+        os_unfair_lock_lock(&ready_lock);
+        for (NSString *n in ready.allKeys)
+            if (now - [ready[n][1] doubleValue] > 120) [ready removeObjectForKey:n];
+        int skip = ready[name] || [loading containsObject:name] || [cache objectForKey:name];
+        if (!skip) [loading addObject:name];
+        os_unfair_lock_unlock(&ready_lock);
+        if (skip) return;
+        id<MTLTexture> t = load_texture(dev, e->name);
+        os_unfair_lock_lock(&ready_lock);
+        [loading removeObject:name];
+        if (t) ready[name] = @[t, @(now)];
+        os_unfair_lock_unlock(&ready_lock);
+    });
+}
+
+// One loaded ahead for `name`, waiting for it if it is being loaded; nil if none.
+static id<MTLTexture> take_ready(NSString *name)
+{
+    if (!ready) return nil;
+    for (;;) {
+        os_unfair_lock_lock(&ready_lock);
+        id<MTLTexture> t = ready[name][0];
+        int busy = !t && [loading containsObject:name];
+        if (t) [ready removeObjectForKey:name];
+        os_unfair_lock_unlock(&ready_lock);
+        if (!busy) return t;
+        usleep(200);
+    }
+}
+
 // The last level hashed (bl_tex_name reuses it).
 static const uint8_t *last_data;
 static uint32_t last_w, last_h;
@@ -174,6 +222,14 @@ const char *bl_tex_name(uint32_t w, uint32_t h, uint32_t format, const uint8_t *
                                                                              : level_key(w, h, format, data, pitch)};
     if (!k.key) return NULL;
     struct entry *e = bsearch(&k, names, nnames, sizeof *names, by_key);
+    return e && e->w == w && e->h == h ? e->name : NULL;
+}
+
+const char *bl_tex_name_any_thread(uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch)
+{
+    if (!loaded || !nnames || w < 8 || h < 8) return NULL;
+    struct entry k = {.key = level_key(w, h, format, data, pitch)};
+    struct entry *e = k.key ? bsearch(&k, names, nnames, sizeof *names, by_key) : NULL;
     return e && e->w == w && e->h == h ? e->name : NULL;
 }
 
@@ -191,9 +247,13 @@ id<MTLTexture> bl_hires_texture(id<MTLDevice> dev, uint32_t w, uint32_t h, uint3
         return nil;
     }
     NSString *name = @(e->name);
+    os_unfair_lock_lock(&ready_lock);
     id<MTLTexture> t = [cache objectForKey:name];
-    if (!t && (t = load_texture(dev, e->name))) {
+    os_unfair_lock_unlock(&ready_lock);
+    if (!t && ((t = take_ready(name)) || (t = load_texture(dev, e->name)))) {
+        os_unfair_lock_lock(&ready_lock);
         [cache setObject:t forKey:name];
+        os_unfair_lock_unlock(&ready_lock);
         fprintf(stderr, "[hires] %ux%u %s: upscaled %lux%lu\n", w, h, e->name, (unsigned long)t.width,
                 (unsigned long)t.height);
     }

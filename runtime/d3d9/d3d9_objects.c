@@ -214,8 +214,9 @@ void bl_com_trace_c(uint32_t id, uint32_t sp)
     }
     // BL_COM_BT=<Interface::Method>: guest backtrace at its first call.
     static const char *bt_at;
-    static int bt_done;
-    if (!bt_done && (bt_at || (bt_at = getenv("BL_COM_BT"))) && !strcmp(bl_com_method_names[id], bt_at)) {
+    static int bt_done = -1;
+    if (bt_done < 0) bt_at = getenv("BL_COM_BT"), bt_done = !bt_at;
+    if (!bt_done && !strcmp(bl_com_method_names[id], bt_at)) {
         void bl_guest_backtrace(uint32_t sp);
         bt_done = 1;
         bl_guest_backtrace(sp);

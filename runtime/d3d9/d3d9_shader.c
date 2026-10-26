@@ -191,6 +191,8 @@ int d3d_shader_parse(const uint32_t *code, struct d3d_shader_info *info, char *e
             continue;
         }
         if (in.nparams == 0) continue;
+        for (int i = 1; i < in.nparams; i++)
+            if (reg_type(p[i]) == REG_CONST && reg_num(p[i]) < 256) info->const_read[reg_num(p[i]) >> 5] |= 1u << (reg_num(p[i]) & 31);
         int dtype = reg_type(p[0]);
         if (ps.pixel && dtype == REG_DEPTHOUT) info->writes_depth = 1;
         if (ps.pixel && dtype == REG_COLOROUT) info->color_outputs |= 1u << reg_num(p[0]);
@@ -517,7 +519,8 @@ static void sample(struct gen *g, uint32_t stage, const char *coord, const char 
         return;
     }
     if (g->v && stage < 8 && (g->v->lightmap & (1u << stage)) && k == D3D_TEX_2D) {
-        snprintf(buf, len, "bl_lightmap(tex%u, smp%u, bl_lr, (%s).xy)", stage, stage, coord);
+        if (g->v->rebake) snprintf(buf, len, "bl_lightmap_rebaked(tex%u, smp%u, bl_lr, (%s).xy, bl_lh, bl_lo)", stage, stage, coord);
+        else snprintf(buf, len, "bl_lightmap(tex%u, smp%u, bl_lr, (%s).xy)", stage, stage, coord);
         return;
     }
     if (g->white_base && stage == 0 && k == D3D_TEX_2D) {
@@ -545,7 +548,8 @@ static const char *const header =
     "using namespace metal;\n"
     "struct BLVSParams { int4 i[16]; uint b[16]; float2 inv_viewport; float clip_y; float pad; };\n"
     "struct BLPSParams { int4 i[16]; uint b[16]; float4 bumpenv[8]; float4 bumpenv_l[8]; float4 fog_color;\n"
-    "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float gloss, pad1; };\n"
+    "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float gloss, pbr; float4 view;\n"
+    "    float bump, metal, spec, pad2; };\n"
     "struct BLVSOut {\n"
     "    float4 pos [[position]]; float psize [[point_size]];\n"
     "    float4 d0 [[user(d0)]]; float4 d1 [[user(d1)]];\n"
@@ -583,10 +587,7 @@ static const char *const header =
 // (the rectangle of the texel the coordinate falls in; none known: bilinear), so no light
 // comes in from the surfaces packed next to it.
 static const char *const lightmap_msl =
-    "static float4 bl_lightmap(texture2d<float> t, sampler s, texture2d<ushort> lr, float2 uv) {\n"
-    "    float2 sz = float2(t.get_width(), t.get_height()), p = uv * sz;\n"
-    "    int4 r = int4(lr.read(uint2(clamp(p, float2(0.0), sz - 1.0))));\n"
-    "    if (r.z <= r.x) return t.sample(s, uv);\n"
+    "static float4 bl_lightmap_cubic(texture2d<float> t, float2 p, int4 r) {\n"
     "    float2 q = p - 0.5, f = q - floor(q);\n"
     "    float2 w[4] = {f * (-0.5 + f * (1.0 - 0.5 * f)), 1.0 + f * f * (-2.5 + 1.5 * f),\n"
     "                   f * (0.5 + f * (2.0 - 1.5 * f)), f * f * (-0.5 + 0.5 * f)};\n"
@@ -599,6 +600,25 @@ static const char *const lightmap_msl =
     "            if ((x == 1 || x == 2) && (y == 1 || y == 2)) mn = min(mn, c), mx = max(mx, c);\n"
     "        }\n"
     "    return clamp(sum, mn, mx);\n"
+    "}\n"
+    "static float4 bl_lightmap(texture2d<float> t, sampler s, texture2d<ushort> lr, float2 uv) {\n"
+    "    float2 sz = float2(t.get_width(), t.get_height()), p = uv * sz;\n"
+    "    int4 r = int4(lr.read(uint2(clamp(p, float2(0.0), sz - 1.0))));\n"
+    "    if (r.z <= r.x) return t.sample(s, uv);\n"
+    "    return bl_lightmap_cubic(t, p, r);\n"
+    "}\n"
+    // Where the rectangle says so (x0 + 0x8000), the game's page changed by the rebake: the
+    // new light (h, 4 times the size) less the old (o, the map's own samples encoded), so
+    // what the game adds to its page as it runs (dynamic lights) stays.
+    "static float4 bl_lightmap_rebaked(texture2d<float> t, sampler s, texture2d<ushort> lr, float2 uv, texture2d<float> h,\n"
+    "                                  texture2d<float> o) {\n"
+    "    float2 sz = float2(t.get_width(), t.get_height()), p = uv * sz;\n"
+    "    int4 r = int4(lr.read(uint2(clamp(p, float2(0.0), sz - 1.0))));\n"
+    "    if (r.x < 32768) return r.z <= r.x ? t.sample(s, uv) : bl_lightmap_cubic(t, p, r);\n"
+    "    r.x -= 32768;\n"
+    "    float4 g = bl_lightmap_cubic(t, p, r);\n"
+    "    float3 n = bl_lightmap_cubic(h, uv * float2(h.get_width(), h.get_height()), r * 4).rgb;\n"
+    "    return float4(max(g.rgb + n - bl_lightmap_cubic(o, p, r).rgb, 0.0), g.a);\n"
     "}\n";
 
 // Soft shadows (variant shadow_receiver; metal_render.m, shadows): percentage-closer
@@ -1060,6 +1080,72 @@ static void ps_detail(struct out *o, const char *coord, int hair)
     line(o, "}");
 }
 
+// Variant surface's [[color(3)]] (_pbo, written out with the rest): the view-space
+// position from the pixel and its view depth, the normal from its slope (towards the
+// camera), bent by the PBRify map read at `coord` (NULL: none) in the frame its texture
+// coordinates make there (green towards -v, as the characters' maps). The bumps shade
+// the colour as the characters' do (ps_detail): half-Lambert light from the map's lights
+// on the bumps over the same on the flat surface, so the game's own lighting is kept
+// and only the bumps are added (p.bump their strength). Then the lights' shine: GGX
+// specular on the bumps with the map's roughness, each light's share of the game's light
+// here (its colour over the texture's, `stage` the texture), so it follows the game's
+// lighting and shadows; 4% head on, or for metal (p.metal) the texture's colour, with
+// less of the game's diffuse colour. p.spec its strength.
+static void ps_surface(struct out *o, const char *coord, int stage)
+{
+    line(o, "float3 _pbp = float3((in.pos.x * p.view.z - 1.0) * in.fogz / p.view.x,");
+    line(o, "                    (1.0 - in.pos.y * p.view.w) * in.fogz / p.view.y, in.fogz);");
+    line(o, "float3 _pbx = dfdx(_pbp), _pby = dfdy(_pbp), _pbn = normalize(cross(_pbx, _pby));");
+    line(o, "if (dot(_pbn, _pbp) > 0.0) _pbn = -_pbn;");
+    line(o, "float4 _pbo = float4(_pbn, -1.0);");
+    if (!coord) return;
+    line(o, "if (p.pbr > 0.5) {");
+    o->indent++;
+    line(o, "constexpr sampler _pbs(filter::linear, mip_filter::linear, address::repeat);");
+    line(o, "float2 _pbuv = (%s).xy, _pbux = dfdx(_pbuv), _pbuy = dfdy(_pbuv);", coord);
+    line(o, "float4 _pbm = bl_pm.sample(_pbs, _pbuv);");
+    line(o, "float3 _pbq1 = cross(_pby, _pbn), _pbq2 = cross(_pbn, _pbx);");
+    line(o, "float3 _pbt = _pbq1 * _pbux.x + _pbq2 * _pbuy.x, _pbb = _pbq1 * _pbux.y + _pbq2 * _pbuy.y;");
+    line(o, "_pbt = normalize(_pbt - _pbn * dot(_pbt, _pbn) + 1e-12); _pbb = normalize(_pbb - _pbn * dot(_pbb, _pbn) + 1e-12);");
+    line(o, "float3 _pbmn = _pbm.xyz * 2.0 - 1.0;");
+    line(o, "float3 _pbnb = normalize(_pbt * _pbmn.x - _pbb * _pbmn.y + _pbn * max(_pbmn.z, 0.05));");
+    line(o, "_pbo = float4(_pbnb, _pbm.a);");
+    line(o, "float _pbE = 0.0, _pbf = 0.0; float3 _pbS = float3(0.0), _pbSw = float3(0.0);");
+    line(o, "float _pbr = clamp(_pbm.a, 0.08, 1.0), _pba = _pbr * _pbr * _pbr * _pbr;");
+    line(o, "float3 _pbV = -normalize(_pbp); float _pbnv = saturate(dot(_pbnb, _pbV)) + 1e-4;");
+    line(o, "for (int _pbi = 0; _pbi < int(bl_wl[0].x); _pbi++) {");
+    line(o, "    float4 _lp = bl_wl[1 + 4 * _pbi], _lc = bl_wl[2 + 4 * _pbi], _ld = bl_wl[3 + 4 * _pbi], _at = bl_wl[4 + 4 * _pbi];");
+    line(o, "    float3 _v = _lp.xyz - _pbp;");
+    line(o, "    float _d2 = max(dot(_v, _v), 64.0), _dd = sqrt(_d2);");
+    line(o, "    float3 _L = _v / _dd;");
+    line(o, "    float _e = dot(_lc.xyz, float3(0.2126, 0.7152, 0.0722)) / (_at.x + _at.y * _dd + _at.z * _d2);");
+    line(o, "    if (_lp.w > 0.0) { float _x = _dd / _lp.w; _e *= saturate(1.0 - _x * _x * _x * _x); }");
+    line(o, "    if (dot(_ld.xyz, _ld.xyz) > 0.25) {");
+    line(o, "        float _cs = dot(-_L, _ld.xyz);");
+    line(o, "        _e *= _cs <= _ld.w ? 0.0 : saturate((_cs - _ld.w) / max(_lc.w - _ld.w, 1e-4));");
+    line(o, "    }");
+    line(o, "    _pbE += _e * (dot(_pbn, _L) * 0.5 + 0.5), _pbf += _e * (dot(_pbnb, _L) * 0.5 + 0.5);");
+    line(o, "    float _nl = saturate(dot(_pbnb, _L));");
+    line(o, "    if (_nl <= 0.0 || _e <= 0.0) continue;");
+    line(o, "    float3 _H = normalize(_L + _pbV);");
+    line(o, "    float _nh = saturate(dot(_pbnb, _H)), _vh = saturate(dot(_pbV, _H));");
+    line(o, "    float _dn = _nh * _nh * (_pba - 1.0) + 1.0, _D = _pba / (3.14159 * _dn * _dn);");
+    line(o, "    float _vis = 0.5 / (_nl * sqrt(_pbnv * _pbnv * (1.0 - _pba) + _pba) + _pbnv * sqrt(_nl * _nl * (1.0 - _pba) + _pba));");
+    line(o, "    float3 _c = _lc.xyz / max(dot(_lc.xyz, float3(0.2126, 0.7152, 0.0722)), 1e-6) * (_e * _D * _vis * _nl);");
+    line(o, "    _pbS += _c, _pbSw += _c * pow(1.0 - _vh, 5.0);");
+    line(o, "}");
+    line(o, "if (_pbE > 1e-6) {");
+    line(o, "    float3 _pbal = tex%d.sample(smp%d, _pbuv).rgb;", stage, stage);
+    line(o, "    float _pbl = min(dot(oc0.xyz, float3(0.2126, 0.7152, 0.0722)) / max(dot(_pbal, float3(0.2126, 0.7152, 0.0722)), 0.04), 4.0);");
+    line(o, "    oc0.xyz *= clamp(1.0 + 2.0 * p.bump * (_pbf / _pbE - 1.0), 0.5, 1.6);");
+    line(o, "    float3 _pbF0 = mix(float3(0.04), _pbal, p.metal);");
+    line(o, "    float3 _pbsp = (_pbF0 * _pbS + (1.0 - _pbF0) * _pbSw) * (3.14159 * p.spec * _pbl / _pbE);");
+    line(o, "    oc0.xyz = oc0.xyz * (1.0 - 0.7 * p.metal) + min(_pbsp, float3(1.5));");
+    line(o, "}");
+    o->indent--;
+    line(o, "}");
+}
+
 // Alpha test and fog on oc0, as the fixed-function back end does after any pixel shader.
 // _fog: the share of the colour the fog leaves.
 static void ps_alpha_and_fog(struct out *o)
@@ -1223,6 +1309,8 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (info) put(o, "    float4 c1 [[color(1)]];\n");
         int albedo = v && v->albedo && !(g.info.color_outputs & 4);
         if (albedo) put(o, "    float4 c2 [[color(2)]];\n");
+        int surface = v && v->surface && !(g.info.color_outputs & 8);
+        if (surface) put(o, "    float4 c3 [[color(3)]];\n");
         if (g.info.writes_depth) put(o, "    float depth [[depth(any)]];\n");
         put(o, "};\n");
         put(o, "fragment BLPSOut bl_main(BLPSIn in [[stage_in]], constant float4 *c [[buffer(0)]],\n"
@@ -1238,6 +1326,10 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
             put(o, ",\n                         depth2d<float> bl_hd [[texture(14)]]");
         if (v && v->shadow_receiver) put(o, ",\n                         constant BLShadowParams &sp [[buffer(2)]]");
         if (v && v->lightmap) put(o, ",\n                         texture2d<ushort> bl_lr [[texture(13)]]");
+        if (v && v->lightmap && v->rebake)
+            put(o, ",\n                         texture2d<float> bl_lh [[texture(16)]], texture2d<float> bl_lo [[texture(17)]]");
+        if (surface)
+            put(o, ",\n                         texture2d<float> bl_pm [[texture(12)]], constant float4 *bl_wl [[buffer(4)]]");
         put(o, ") {\n");
         o->indent = 1;
         if (g.env) {
@@ -1282,6 +1374,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (g.ps.major == 1) line(o, "oc0 = r0;");
         if (g.env) line(o, "float3 _d = oc0.xyz - _e0, _w = _e1 - _e0;");
         if (detail && skin && g.base_coord[0]) ps_detail(o, g.base_coord, v->hair);
+        if (surface) ps_surface(o, g.alb_stage >= 0 ? g.alb_coord : NULL, g.alb_stage);
         ps_alpha_and_fog(o);
         if (v && v->shadow_caster) line(o, v->shadow_caster == 2 ? "oc0.w = in.pos.z;" : "oc0.w = 1.0 - in.pos.z;");
         line(o, "BLPSOut out;");
@@ -1298,6 +1391,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (albedo && g.alb_stage >= 0)
             line(o, "out.c2 = float4(tex%d.sample(smp%d, (%s).xy).rgb, 1.0);", g.alb_stage, g.alb_stage, g.alb_coord);
         else if (albedo) line(o, "out.c2 = float4(0.5, 0.5, 0.5, 1.0);");
+        if (surface) line(o, "out.c3 = _pbo;");
         if (g.info.writes_depth) line(o, "out.depth = odepth;");
         line(o, "return out;");
         put(o, "}\n");

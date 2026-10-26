@@ -39,7 +39,10 @@
 //                            "hits": red the reflection weight, green where rays met the picture,
 //                            blue what the cubemaps added; BL_SSR_STRENGTH (default 1) scales them,
 //                            BL_SSR_FRESNEL (3) and BL_SSR_BLUR (0.02) tune them; BL_GLOSS scales
-//                            the reflections given to materials the game left without (0 none)
+//                            the reflections given to materials the game left without (0 none);
+//                            BL_PBR=0 leaves out the surfaces' facing and PBRify maps (pbr_map),
+//                            BL_PBR_BUMP (default 1) how much their bumps shade the light,
+//                            BL_PBR_SPEC (default 1.5) how much the lights shine on them
 //   BL_HDR=0|1               HDR output on screens that have it (see hdr_present), over the
 //                            options' check box; BL_HDR_PEAK, BL_HDR_KNEE, BL_HDR_HEADROOM tune it
 //   BL_FOG=0|1               volumetric light: the map's lights in a thin haze (see fog_run), over
@@ -60,9 +63,10 @@
 //                            BL_SHADOWS_AB=n turns the setting over every n frames (comparisons)
 //   BL_TAA_JITTER=n          the temporal anti-aliasing's offset (pixels, default 0.5; see the TAA
 //                            section), negative flips it for MetalFX
-//   BL_GPU_STATS=1          log the mean GPU time per frame every 100 frames
+//   BL_GPU_STATS=1          log the mean GPU time per frame every 100 frames (2: also per pass)
 //   BL_PROP_TESS=0|1         props split and rounded like characters (BL_TESS per edge; default off)
 //   BL_LIGHTMAP_SMOOTH=0|1   the map's baked light read smoothly (see the lightmaps section; default on)
+//   BL_REBAKE=1              the lightmaps baked again on the GPU (shelved: see "the lighting rebake in the game")
 //   BL_BLOOM=0|1|show        bright lights glow (see the bloom section), over the options' check box
 //                            (on until unticked); BL_BLOOM_STRENGTH (default 0.35), BL_BLOOM_THRESHOLD (0.6)
 //   BL_EXPOSURE=0|1|show     eye adaptation: the view brightens in the dark and dims in bright places
@@ -72,8 +76,13 @@
 //   BL_SSIL=0|1|show|albedo  bounced light (see the bounced light section), over the options' check
 //                            box (on until unticked); albedo shows the surfaces' colour; BL_SSIL_RADIUS (world units, default 128),
 //                            BL_SSIL_STRENGTH (default 1), BL_SSIL_BLUR (passes, default 2)
+//   BL_GI=0|1                global illumination: characters' and props' light from around them
+//                            (see the light probes section), over the options' check box (on
+//                            until unticked); BL_GI_MIX (0..1, default 1) how much of the game's
+//                            own; BL_GI_LOG=n logs the first n changed draws
 //   BL_LIGHTMAP_SMOOTH_AT=n  debugging: only from frame n (before and after in one run)
 //   BL_UPSCALE=0            the game's own colour textures: no upscales (characters, build/hires)
+//   BL_REMODEL=0            the game's own prop models: no remodels (build/remodels)
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
@@ -88,8 +97,12 @@
 #include <string.h>
 
 #include "bl_bsp.h"
+#import "gi_probes.h"
+#import "lm_bake.h"
 #import "tex_detail.h"
 #import "tex_hires.h"
+#include <mach-o/dyld.h>
+#include "prop_remodel.h"
 #include "prop_smooth.h"
 #include "bl_cocoa.h"
 #include "bl_win32.h"
@@ -113,16 +126,22 @@ static int env_hair_mesh = 1;         // BL_HAIR_MESH=0: the game's own hair, no
 static int env_tess = 3;            // BL_TESS: characters' triangles split this many times per edge, rounded (0 off)
 static int env_prop_tess = 0;       // BL_PROP_TESS: props' too (prop_swap_for)
 static int env_lightmap_smooth = 1;  // BL_LIGHTMAP_SMOOTH (lightmap_for)
+static int env_rebake;               // BL_REBAKE=1: the lightmaps baked again (lightmap_rebake; shelved, off)
 static long env_lightmap_at;         // BL_LIGHTMAP_SMOOTH_AT
 static int env_bloom, env_bloom_show, env_exposure, env_exposure_show;  // BL_BLOOM, BL_EXPOSURE (the effects table)
 static long env_bloom_at;  // BL_BLOOM_AT
 static int env_ssil, env_ssil_show, env_ssil_blur = 2;  // BL_SSIL (the effects table), BL_SSIL_BLUR
+static int env_gi, env_gi_log;  // BL_GI (the effects table), BL_GI_LOG
+static float env_gi_mix = 1;    // BL_GI_MIX
 static float env_ssil_radius = 128, env_ssil_strength = 1;
 static float env_bloom_strength = 0.35f, env_bloom_threshold = 0.6f, env_exposure_lo = 0.8f, env_exposure_hi = 1.3f;
 static int env_upscale_off;  // BL_UPSCALE=0: the game's own colour textures (characters, tex_hires.h)
+static int env_remodel_off;  // BL_REMODEL=0: the game's own prop models (prop_remodel.h)
 static int env_sss_eyes = 1;  // BL_SSS_EYES=0: no eye highlights
 static int enc_info;                       // and whether it draws reflection info (info_texture)
 static int enc_albedo;                     // and the surfaces' own colour (albedo_texture)
+static int enc_surface;                    // and the surfaces' facing and roughness (surface_texture)
+#define SURFACE_FORMAT MTLPixelFormatRGBA16Float
 #define INFO_FORMAT MTLPixelFormatRGBA16Float
 #define ALBEDO_FORMAT MTLPixelFormatRGBA8Unorm
 static CAMetalLayer *layer;
@@ -144,6 +163,22 @@ static const char *env_draw_dump, *env_dump_dir;
 static int env_tex_stats, env_shadow_show;
 static double fps_max;  // frame cap with a window (BL_FPS_MAX, default 60; 0 = none)
 static int env_pacing, env_pacing_stats;  // BL_PACING (default on), BL_PACING_STATS
+// BL_HITCH=ms: log frames that take longer, with the time spent this frame loading
+// upscaled and PBR textures and character normal maps (the rest: shaders, see frame_build_ns).
+static double env_hitch;
+static int env_prefetch_off;  // BL_PREFETCH=0: load upscales and normal maps when first drawn
+static uint64_t hitch_tex_ns, hitch_pbr_ns;
+static uint64_t hitch_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+static uint64_t hitch_detail_ns;
+static uint64_t hitch_wait_ns, hitch_present_start;  // waiting for the GPU's frames in flight; present's start
+static id<MTLTexture> detail_normal_timed(id<MTLDevice> dev, const void *key, uint32_t stamp, uint32_t w, uint32_t h,
+                                          uint32_t format, const uint8_t *data, uint32_t pitch, id<MTLTexture> *color)
+{
+    uint64_t t0 = hitch_now();
+    id<MTLTexture> r = bl_detail_normal(dev, key, stamp, w, h, format, data, pitch, color);
+    hitch_detail_ns += hitch_now() - t0;
+    return r;
+}
 static int env_aniso;   // forced anisotropy (BL_ANISO, default 16)
 static int env_widescreen;  // correct the 4:3 projection on wider modes (BL_WIDESCREEN, default on)
 static int frame_has_3d, menu_frame;  // a perspective draw to the back buffer: this frame, the last
@@ -184,7 +219,7 @@ static void taa_frame_end(void);
 // set the effects and save them in the registry; the environment, when set, wins over both.
 #define EFFECT_KEY "HKCU\\Software\\Troika\\Vampire\\Native"
 enum { BL_EFFECT_AO, BL_EFFECT_SSR, BL_EFFECT_HDR, BL_EFFECT_FOG, BL_EFFECT_SSS, BL_EFFECT_SHADOWS,
-       BL_EFFECT_BLOOM, BL_EFFECT_EXPOSURE, BL_EFFECT_SSIL, BL_EFFECTS };
+       BL_EFFECT_BLOOM, BL_EFFECT_EXPOSURE, BL_EFFECT_SSIL, BL_EFFECT_GI, BL_EFFECTS };
 static int env_shadows;  // the shadows section's switch
 // The shadows section (below the stretch copies): the atlas's scale, its receivers, contact shadows.
 static struct obj *shadow_atlas;
@@ -210,6 +245,7 @@ static const struct { const char *env, *value; int *on, *show, def; } effects[BL
     {"BL_BLOOM", "Bloom", &env_bloom, &env_bloom_show, 1},
     {"BL_EXPOSURE", "EyeAdaptation", &env_exposure, &env_exposure_show, 1},
     {"BL_SSIL", "BouncedLight", &env_ssil, &env_ssil_show, 1},
+    {"BL_GI", "GlobalIllumination", &env_gi, NULL, 1},
 };
 static int effects_loaded, effect_forced[BL_EFFECTS];
 void bl_vgui_poll(void);
@@ -410,6 +446,7 @@ static float material_gloss(const char *name)
     static const struct { const char *folder; float gloss; } table[] = {
         {"materials/tile/", 0.10f},
         {"materials/wood/", 0.06f},
+        {"materials/metal/", 0.15f},
     };
     static float scale = -1;
     if (scale < 0) scale = getenv("BL_GLOSS") ? (float)atof(getenv("BL_GLOSS")) : 1;
@@ -417,6 +454,101 @@ static float material_gloss(const char *name)
     for (size_t i = 0; i < sizeof table / sizeof *table; i++)
         if (!strncmp(name, table[i].folder, strlen(table[i].folder))) return table[i].gloss * scale;
     return 0;
+}
+
+// The PBRify normal and roughness map for the texture the game calls `name`
+// ("materials/wood/floorb"): build/textures/maps/<map>/wood/floorb_n.png and _r.png,
+// made on the player's machine (tools/tex_normals.py), loaded as the characters' are
+// (bl_load_normal_map); nil without one. The reflections use them for the surfaces'
+// facing and roughness (variant surface). BL_PBR=0: none.
+static int env_pbr = 1;
+static float env_pbr_bump = 1;  // BL_PBR_BUMP: how much the maps' bumps shade the light (0 none)
+static float env_pbr_spec = 1.5f;  // BL_PBR_SPEC: how much the lights shine on them (0 none)
+
+// How metallic a material is, by its name: the metal folder, and chrome or steel
+// anywhere (models' parts).
+static float material_metal(const char *name)
+{
+    if (!name) return 0;
+    if (strstr(name, "chrome") || strstr(name, "steel")) return 1;
+    return strncmp(name, "materials/metal/", 16) ? 0 : 0.8f;
+}
+// PBRify maps by surface (materials/ left off): where each is, those loaded (while in use),
+// and those loaded ahead (pbr_prefetch) until first asked for, with the ones being loaded.
+static NSMutableDictionary<NSString *, NSString *> *pbr_paths;
+static NSMapTable<NSString *, id<MTLTexture>> *pbr_loaded;
+static NSMutableDictionary<NSString *, id<MTLTexture>> *pbr_ready;
+static NSMutableSet<NSString *> *pbr_loading;
+static os_unfair_lock pbr_lock = OS_UNFAIR_LOCK_INIT;
+
+static void pbr_paths_load(void)
+{
+    if (pbr_paths) return;
+    pbr_paths = [NSMutableDictionary dictionary];
+    pbr_loaded = [NSMapTable strongToWeakObjectsMapTable];
+    pbr_ready = [NSMutableDictionary dictionary], pbr_loading = [NSMutableSet set];
+    char exe[1024];
+    uint32_t n = sizeof exe;
+    if (!_NSGetExecutablePath(exe, &n) && strrchr(exe, '/')) {
+        *strrchr(exe, '/') = 0;  // build/tests
+        NSString *root = [[@(exe) stringByAppendingPathComponent:@"../textures/maps"] stringByStandardizingPath];
+        for (NSString *map in [NSFileManager.defaultManager contentsOfDirectoryAtPath:root error:nil]) {
+            NSString *dir = [root stringByAppendingPathComponent:map];
+            for (NSString *rel in [NSFileManager.defaultManager enumeratorAtPath:dir])
+                if ([rel hasSuffix:@"_n.png"])
+                    pbr_paths[[rel substringToIndex:rel.length - 6]] = [dir stringByAppendingPathComponent:rel];
+        }
+        fprintf(stderr, "[metal] PBRify maps: %lu surfaces in %s\n", (unsigned long)pbr_paths.count, root.UTF8String);
+    }
+}
+
+static id<MTLTexture> pbr_map(const char *name)
+{
+    if (!env_pbr || !name || strncmp(name, "materials/", 10)) return nil;
+    pbr_paths_load();
+    NSString *key = @(name + 10);
+    NSString *path = pbr_paths[key];
+    if (!path) return nil;
+    for (;;) {
+        os_unfair_lock_lock(&pbr_lock);
+        id<MTLTexture> t = [pbr_loaded objectForKey:key];
+        if (!t && (t = pbr_ready[key])) [pbr_loaded setObject:t forKey:key], [pbr_ready removeObjectForKey:key];
+        int busy = !t && [pbr_loading containsObject:key];
+        os_unfair_lock_unlock(&pbr_lock);
+        if (t) return t;
+        if (!busy) break;
+        usleep(200);
+    }
+    id<MTLTexture> t = bl_load_normal_map(mtl, path.UTF8String);
+    os_unfair_lock_lock(&pbr_lock);
+    if (t) [pbr_loaded setObject:t forKey:key];
+    os_unfair_lock_unlock(&pbr_lock);
+    return t;
+}
+
+// Starts loading the PBRify map of a texture the game just filled, on another thread.
+static void pbr_prefetch(uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch)
+{
+    if (!env_pbr) return;
+    pbr_paths_load();
+    if (!pbr_paths.count) return;
+    id<MTLDevice> dev = mtl;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        const char *name = bl_tex_name_any_thread(w, h, format, data, pitch);
+        if (!name || strncmp(name, "materials/", 10)) return;
+        NSString *key = @(name + 10), *path = pbr_paths[key];
+        if (!path) return;
+        os_unfair_lock_lock(&pbr_lock);
+        int skip = [pbr_loaded objectForKey:key] || pbr_ready[key] || [pbr_loading containsObject:key];
+        if (!skip) [pbr_loading addObject:key];
+        os_unfair_lock_unlock(&pbr_lock);
+        if (skip) return;
+        id<MTLTexture> t = bl_load_normal_map(dev, path.UTF8String);
+        os_unfair_lock_lock(&pbr_lock);
+        [pbr_loading removeObject:key];
+        if (t) pbr_ready[key] = t;
+        os_unfair_lock_unlock(&pbr_lock);
+    });
 }
 
 // The Metal texture of a D3D texture object, created and refreshed from guest memory.
@@ -479,15 +611,25 @@ static id<MTLTexture> texture_of(struct obj *tex)
         tex->dirty = 0;
         // An upscaled texture for what the game put in the top level (not for textures it
         // rewrites as it goes, D3DUSAGE_DYNAMIC).
+        uint64_t t0 = hitch_now();
         if (top && tex->type == OBJ_TEXTURE && !(tex->usage & 0x200) && !env_upscale_off) {
             if (tex->hires) CFRelease(tex->hires);
             id<MTLTexture> h = bl_hires_texture(mtl, tex->width, tex->height, tex->format, bl_g2h(tex->subs[0]->mem),
                                                 tex->subs[0]->pitch);
             tex->hires = h ? (__bridge_retained void *)h : NULL;
         }
-        if (top && tex->type == OBJ_TEXTURE && !(tex->usage & 0x200))
-            tex->gloss = material_gloss(bl_tex_name(tex->width, tex->height, tex->format, bl_g2h(tex->subs[0]->mem),
-                                                    tex->subs[0]->pitch));
+        if (top && tex->type == OBJ_TEXTURE && !(tex->usage & 0x200)) {
+            const char *name = bl_tex_name(tex->width, tex->height, tex->format, bl_g2h(tex->subs[0]->mem),
+                                           tex->subs[0]->pitch);
+            tex->gloss = material_gloss(name);
+            tex->metal = material_metal(name);
+            if (tex->pbr) CFRelease(tex->pbr);
+            uint64_t t1 = hitch_now();
+            id<MTLTexture> m = pbr_map(name);
+            hitch_pbr_ns += hitch_now() - t1;
+            tex->pbr = m ? (__bridge_retained void *)m : NULL;
+        }
+        hitch_tex_ns += hitch_now() - t0;
     }
     tex->used = 1;
     return tex->hires ? (__bridge id<MTLTexture>)tex->hires : t;
@@ -842,6 +984,7 @@ struct pipe_key {
     uint8_t point;
     uint8_t info;    // reflection info attachment: 0 none, 1 kept, 2 written
     uint8_t albedo;  // the surfaces' colour attachment (albedo_texture), the same
+    uint8_t surface; // the surfaces' facing and roughness attachment (surface_texture), the same
 };
 
 static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *pipelines;
@@ -961,6 +1104,10 @@ static id<MTLRenderPipelineState> pipeline(struct pipe_key *k, id<MTLFunction> v
     if (k->albedo) {
         d.colorAttachments[2].pixelFormat = ALBEDO_FORMAT;
         d.colorAttachments[2].writeMask = k->albedo == 2 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+    }
+    if (k->surface) {
+        d.colorAttachments[3].pixelFormat = SURFACE_FORMAT;
+        d.colorAttachments[3].writeMask = k->surface == 2 ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
     }
     d.depthAttachmentPixelFormat = (MTLPixelFormat)k->depth_format;
     d.stencilAttachmentPixelFormat = (MTLPixelFormat)k->depth_format;
@@ -1125,6 +1272,8 @@ static void ensure_device(void)
     fps_max = getenv("BL_FPS_MAX") ? atof(getenv("BL_FPS_MAX")) : 60;
     env_pacing = !(getenv("BL_PACING") && !strcmp(getenv("BL_PACING"), "0"));
     env_pacing_stats = getenv("BL_PACING_STATS") != NULL;
+    if (getenv("BL_HITCH")) env_hitch = atof(getenv("BL_HITCH"));
+    env_prefetch_off = getenv("BL_PREFETCH") && !atoi(getenv("BL_PREFETCH"));
     env_shader_stats = getenv("BL_SHADER_STATS") != NULL;
     env_shader_early = !(getenv("BL_SHADER_EARLY") && !strcmp(getenv("BL_SHADER_EARLY"), "0"));
     env_aniso = getenv("BL_ANISO") ? atoi(getenv("BL_ANISO")) : 16;
@@ -1135,6 +1284,9 @@ static void ensure_device(void)
     env_ao_radius = getenv("BL_AO_RADIUS") ? (float)atof(getenv("BL_AO_RADIUS")) : 32;
     env_ao_strength = getenv("BL_AO_STRENGTH") ? (float)atof(getenv("BL_AO_STRENGTH")) : 0.6f;
     env_ao_thickness = getenv("BL_AO_THICKNESS") ? (float)atof(getenv("BL_AO_THICKNESS")) : 16;
+    env_pbr = getenv("BL_PBR") ? atoi(getenv("BL_PBR")) != 0 : 1;
+    env_pbr_spec = getenv("BL_PBR_SPEC") ? (float)atof(getenv("BL_PBR_SPEC")) : 1.5f;
+    env_pbr_bump = getenv("BL_PBR_BUMP") ? (float)atof(getenv("BL_PBR_BUMP")) : 1;
     env_ssr_strength = getenv("BL_SSR_STRENGTH") ? (float)atof(getenv("BL_SSR_STRENGTH")) : 1;
     env_ssr_fresnel = getenv("BL_SSR_FRESNEL") ? (float)atof(getenv("BL_SSR_FRESNEL")) : 3;
     env_ssr_blur = getenv("BL_SSR_BLUR") ? (float)atof(getenv("BL_SSR_BLUR")) : 0.02f;
@@ -1149,6 +1301,8 @@ static void ensure_device(void)
     if (getenv("BL_DETAIL_STRENGTH")) env_detail_strength = (float)atof(getenv("BL_DETAIL_STRENGTH"));
     if (getenv("BL_SHINE")) env_shine = (float)atof(getenv("BL_SHINE"));
     if (getenv("BL_CHARLIGHT")) env_charlight = (float)atof(getenv("BL_CHARLIGHT"));
+    if (getenv("BL_GI_MIX")) env_gi_mix = (float)atof(getenv("BL_GI_MIX"));
+    if (getenv("BL_GI_LOG")) env_gi_log = atoi(getenv("BL_GI_LOG"));
     if (getenv("BL_CHARLIGHT_MIN")) env_charlight_min = (float)atof(getenv("BL_CHARLIGHT_MIN"));
     env_hair_u = getenv("BL_HAIR_U") && atoi(getenv("BL_HAIR_U"));
     if (getenv("BL_HAIR_FADE")) env_hair_fade = (float)atof(getenv("BL_HAIR_FADE"));
@@ -1156,6 +1310,7 @@ static void ensure_device(void)
     if (getenv("BL_PROP_TESS")) env_prop_tess = atoi(getenv("BL_PROP_TESS"));
     if (getenv("BL_LIGHTMAP_SMOOTH")) env_lightmap_smooth = atoi(getenv("BL_LIGHTMAP_SMOOTH"));
     if (getenv("BL_LIGHTMAP_SMOOTH_AT")) env_lightmap_at = atol(getenv("BL_LIGHTMAP_SMOOTH_AT"));
+    if (getenv("BL_REBAKE")) env_rebake = atoi(getenv("BL_REBAKE"));
     if (getenv("BL_BLOOM_AT")) env_bloom_at = atol(getenv("BL_BLOOM_AT"));
     if (getenv("BL_SSIL_RADIUS")) env_ssil_radius = (float)atof(getenv("BL_SSIL_RADIUS"));
     if (getenv("BL_SSIL_STRENGTH")) env_ssil_strength = (float)atof(getenv("BL_SSIL_STRENGTH"));
@@ -1170,6 +1325,7 @@ static void ensure_device(void)
     if (getenv("BL_HAIR_MESH")) env_hair_mesh = atoi(getenv("BL_HAIR_MESH"));
     if (env_tess > 16) env_tess = 16;
     env_upscale_off = getenv("BL_UPSCALE") && !strcmp(getenv("BL_UPSCALE"), "0");
+    env_remodel_off = getenv("BL_REMODEL") && !strcmp(getenv("BL_REMODEL"), "0");
     env_sss_eyes = !(getenv("BL_SSS_EYES") && !strcmp(getenv("BL_SSS_EYES"), "0"));
     env_tonemap_expand = getenv("BL_TONEMAP_EXPAND") ? (float)atof(getenv("BL_TONEMAP_EXPAND")) : 0.8f;
     env_hdr_peak = getenv("BL_HDR_PEAK") ? (float)atof(getenv("BL_HDR_PEAK")) : 4;
@@ -1187,6 +1343,96 @@ static id<MTLCommandBuffer> command_buffer(void)
 {
     if (!cmd) cmd = [queue commandBuffer];
     return cmd;
+}
+
+// BL_GPU_STATS=2: GPU time per pass, summed by the function that began it, logged every
+// 100 frames (GPU timestamps at the start and end of each pass; passes can overlap, so
+// the parts may add up to more than the frame).
+static int gpu_pass_stats = -1;
+static id<MTLCounterSampleBuffer> pass_samples[FRAMES_IN_FLIGHT];
+static const char *pass_names[FRAMES_IN_FLIGHT][512];
+static uint8_t pass_compute[FRAMES_IN_FLIGHT][512];
+static int pass_count[FRAMES_IN_FLIGHT];
+static double gpu_tick_ns = 1;  // ns per GPU timestamp tick
+
+static int pass_stats_on(void)
+{
+    if (gpu_pass_stats < 0) {
+        const char *e = getenv("BL_GPU_STATS");
+        gpu_pass_stats = e && atoi(e) == 2 && [mtl supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary];
+        id<MTLCounterSet> ts = nil;
+        for (id<MTLCounterSet> c in mtl.counterSets)
+            if ([c.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = c;
+        if (gpu_pass_stats && !ts) gpu_pass_stats = 0;
+        if (gpu_pass_stats) {
+            MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
+            d.counterSet = ts, d.sampleCount = 4 * 512, d.storageMode = MTLStorageModeShared;
+            for (int i = 0; i < FRAMES_IN_FLIGHT; i++) pass_samples[i] = [mtl newCounterSampleBufferWithDescriptor:d error:nil];
+            MTLTimestamp c0, g0, c1, g1;
+            [mtl sampleTimestamps:&c0 gpuTimestamp:&g0];
+            usleep(100000);
+            [mtl sampleTimestamps:&c1 gpuTimestamp:&g1];
+            gpu_tick_ns = g1 > g0 ? (double)(c1 - c0) / (double)(g1 - g0) : 1;
+            fprintf(stderr, "[gpu] %.4f ns a timestamp tick\n", gpu_tick_ns);
+        }
+    }
+    return gpu_pass_stats;
+}
+
+static id<MTLRenderCommandEncoder> stat_render(MTLRenderPassDescriptor *d, const char *name)
+{
+    int n = pass_stats_on() ? pass_count[frame_slot] : 512;
+    if (n < 512) {
+        MTLRenderPassSampleBufferAttachmentDescriptor *a = d.sampleBufferAttachments[0];
+        a.sampleBuffer = pass_samples[frame_slot];
+        a.startOfVertexSampleIndex = 4 * n, a.endOfVertexSampleIndex = 4 * n + 1;
+        a.startOfFragmentSampleIndex = 4 * n + 2, a.endOfFragmentSampleIndex = 4 * n + 3;
+        pass_names[frame_slot][n] = name, pass_compute[frame_slot][n] = 0, pass_count[frame_slot]++;
+    } else if (gpu_pass_stats > 0)
+        d.sampleBufferAttachments[0].sampleBuffer = nil;
+    return [command_buffer() renderCommandEncoderWithDescriptor:d];
+}
+
+static id<MTLComputeCommandEncoder> stat_compute(const char *name)
+{
+    if (!pass_stats_on() || pass_count[frame_slot] >= 512) return [command_buffer() computeCommandEncoder];
+    int n = pass_count[frame_slot]++;
+    MTLComputePassDescriptor *d = [MTLComputePassDescriptor computePassDescriptor];
+    d.sampleBufferAttachments[0].sampleBuffer = pass_samples[frame_slot];
+    d.sampleBufferAttachments[0].startOfEncoderSampleIndex = 4 * n;
+    d.sampleBufferAttachments[0].endOfEncoderSampleIndex = 4 * n + 1;
+    pass_names[frame_slot][n] = name, pass_compute[frame_slot][n] = 1;
+    return [command_buffer() computeCommandEncoderWithDescriptor:d];
+}
+
+// At the end of a frame's GPU work: its passes' times, added up by name.
+static void pass_stats_done(int slot, unsigned long frame)
+{
+    static NSMutableDictionary<NSString *, NSNumber *> *sum;
+    static int nframes;
+    if (!sum) sum = [NSMutableDictionary dictionary];
+    int n = pass_count[slot];
+    NSData *r = n ? [pass_samples[slot] resolveCounterRange:NSMakeRange(0, 4 * (NSUInteger)n)] : nil;
+    const MTLCounterResultTimestamp *t = r.bytes;
+    // Passes overlap (one's vertex stage starts while the last one's fragments run), so
+    // each is charged from the end of the one before it (or its own start, after a gap)
+    // to its end: the parts add up to the frame.
+    uint64_t prev_end = 0;
+    for (int i = 0; t && i < n; i++) {
+        uint64_t lo = t[4 * i].timestamp, hi = t[4 * i + (pass_compute[slot][i] ? 1 : 3)].timestamp;
+        if (lo == MTLCounterErrorValue || hi == MTLCounterErrorValue || !lo || hi <= lo) continue;
+        if (prev_end > lo) lo = prev_end < hi ? prev_end : hi;
+        prev_end = hi > prev_end ? hi : prev_end;
+        NSString *k = @(pass_names[slot][i]);
+        sum[k] = @(sum[k].doubleValue + (double)(hi - lo) * gpu_tick_ns / 1e6);
+    }
+    if (++nframes == 100) {
+        NSArray *keys = [sum keysSortedByValueUsingComparator:^(NSNumber *a, NSNumber *b) { return [b compare:a]; }];
+        fprintf(stderr, "[gpu] passes, ms a frame (to frame %lu):", frame);
+        for (NSString *k in keys) fprintf(stderr, " %s %.2f", k.UTF8String, sum[k].doubleValue / 100);
+        fprintf(stderr, "\n");
+        [sum removeAllObjects], nframes = 0;
+    }
 }
 
 static void end_pass(void)
@@ -1236,6 +1482,26 @@ static id<MTLTexture> albedo_texture(id<MTLTexture> color)
         td.storageMode = MTLStorageModePrivate;
         t = [mtl newTextureWithDescriptor:td];
         t.label = @"surface colour";
+    }
+    return t;
+}
+
+// The surfaces' facing (view space) and roughness (-1 unknown) drawn by the world view's
+// shaders (d3d_shader_variant surface) for the reflections, the back buffer's size; 0
+// where nothing was drawn.
+static unsigned long surface_frame = ~0ul;  // the frame it was last drawn in
+static id<MTLTexture> surface_texture(id<MTLTexture> color)
+{
+    static id<MTLTexture> t;
+    if (!t || t.width != color.width || t.height != color.height) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:SURFACE_FORMAT
+                                                                                     width:color.width
+                                                                                    height:color.height
+                                                                                 mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        t = [mtl newTextureWithDescriptor:td];
+        t.label = @"surface facing";
     }
     return t;
 }
@@ -1304,8 +1570,19 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
         a.clearColor = MTLClearColorMake(0, 0, 0, 0);
         albedo_frame = frames;
     }
-    enc = [command_buffer() renderCommandEncoderWithDescriptor:d];
-    enc_color = color, enc_depth = depth, enc_info = info, enc_albedo = albedo;
+    // And the surfaces' facing and roughness, for the reflections, cleared the same way.
+    int surface = info && env_ssr && env_pbr;
+    if (surface) {
+        MTLRenderPassColorAttachmentDescriptor *a = d.colorAttachments[3];
+        a.texture = surface_texture(target_texture(color));
+        a.storeAction = MTLStoreActionStore;
+        int fresh = surface_frame != frames || d.colorAttachments[0].loadAction == MTLLoadActionClear;
+        a.loadAction = fresh ? MTLLoadActionClear : MTLLoadActionLoad;
+        a.clearColor = MTLClearColorMake(0, 0, 0, 0);
+        surface_frame = frames;
+    }
+    enc = stat_render(d, __func__);
+    enc_color = color, enc_depth = depth, enc_info = info, enc_albedo = albedo, enc_surface = surface;
     int world_end = (post_result || ao_result || contact_result) && color && color == s->back_buffer;
     if (post_result && color && color == s->back_buffer) post_apply(enc, target_texture(color), depth != NULL);
     if (ao_result && color && color == s->back_buffer) ao_apply(enc, target_texture(color), depth != NULL);
@@ -1320,7 +1597,7 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
         d.colorAttachments[0].loadAction = MTLLoadActionLoad;
         d.depthAttachment.loadAction = d.stencilAttachment.loadAction = MTLLoadActionLoad;
         if (info) d.colorAttachments[1].loadAction = MTLLoadActionLoad;
-        enc = [command_buffer() renderCommandEncoderWithDescriptor:d];
+        enc = stat_render(d, __func__);
     }
     if (world_end && env_hdr) {
         // A copy of the finished world view, before the view model and HUD: what
@@ -1335,7 +1612,7 @@ static id<MTLRenderCommandEncoder> pass(struct d3d_state *s)
         d.colorAttachments[0].loadAction = MTLLoadActionLoad;
         d.depthAttachment.loadAction = d.stencilAttachment.loadAction = MTLLoadActionLoad;
         if (info) d.colorAttachments[1].loadAction = MTLLoadActionLoad;
-        enc = [command_buffer() renderCommandEncoderWithDescriptor:d];
+        enc = stat_render(d, __func__);
     }
     return enc;
 }
@@ -1353,6 +1630,7 @@ static void lightmap_forget(struct obj *o);
 void d3d_render_free(struct obj *o)
 {
     if (o->hires) CFRelease(o->hires), o->hires = NULL;
+    if (o->pbr) CFRelease(o->pbr), o->pbr = NULL;
     if (!o->gpu) return;
     id t = (__bridge_transfer id)o->gpu;  // released when t goes out of scope
     (void)t;
@@ -1501,7 +1779,7 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
     MTLPixelFormat dfmt = ds ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
     uint32_t mask = (flags & 1 ? 1u : 0u) | (flags & 2 && ds ? 2u : 0u) | (flags & 4 && ds ? 4u : 0u);
     if (!mask) return;
-    [e setRenderPipelineState:clear_pipeline(t.pixelFormat, dfmt, mask, enc_info | enc_albedo << 1)];
+    [e setRenderPipelineState:clear_pipeline(t.pixelFormat, dfmt, mask, enc_info | enc_albedo << 1 | enc_surface << 2)];
     static NSMutableDictionary *clear_depth_states;
     if (!clear_depth_states) clear_depth_states = [NSMutableDictionary new];
     NSNumber *dk = @(mask);
@@ -1587,6 +1865,7 @@ static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelF
     // info: bit 0 the reflection info attachment, bit 1 the surfaces' colour.
     if (info & 1) d.colorAttachments[1].pixelFormat = INFO_FORMAT, d.colorAttachments[1].writeMask = MTLColorWriteMaskNone;
     if (info & 2) d.colorAttachments[2].pixelFormat = ALBEDO_FORMAT, d.colorAttachments[2].writeMask = MTLColorWriteMaskNone;
+    if (info & 4) d.colorAttachments[3].pixelFormat = SURFACE_FORMAT, d.colorAttachments[3].writeMask = MTLColorWriteMaskNone;
     d.depthAttachmentPixelFormat = depth;
     d.stencilAttachmentPixelFormat = depth;
     NSError *error = nil;
@@ -1649,7 +1928,7 @@ static void stretch_draw(id<MTLTexture> a, const uint32_t sr[4], id<MTLTexture> 
     rp.colorAttachments[0].texture = b;
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    id<MTLRenderCommandEncoder> e = stat_render(rp, __func__);
     [e setRenderPipelineState:stretch_pipeline(b.pixelFormat)];
     [e setViewport:(MTLViewport){dr[0], dr[1], dr[2] - dr[0], dr[3] - dr[1], 0, 1}];
     float p[4] = {(float)sr[0] / a.width, (float)sr[1] / a.height, (float)sr[2] / a.width, (float)sr[3] / a.height};
@@ -2104,7 +2383,7 @@ static void ao_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTe
     rp.colorAttachments[0].texture = target;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    id<MTLRenderCommandEncoder> e = stat_render(rp, __func__);
     [e setRenderPipelineState:ao_pipeline(kind, target.pixelFormat, MTLPixelFormatInvalid)];
     [e setFragmentTexture:t0 atIndex:0];
     [e setFragmentTexture:t1 atIndex:1];
@@ -2145,7 +2424,7 @@ static void ao_occlusion(id<MTLTexture> raw, id<MTLTexture> z, const struct ao_p
     rp.colorAttachments[0].texture = raw;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    id<MTLRenderCommandEncoder> e = stat_render(rp, __func__);
     [e setRenderPipelineState:ao_pipeline(1, raw.pixelFormat, MTLPixelFormatInvalid)];
     [e setFragmentTexture:z atIndex:0];
     for (int i = 0; i < 4; i++) [e setFragmentTexture:ao_mips[i] atIndex:(NSUInteger)i + 1];
@@ -2217,13 +2496,17 @@ static NSString *const ssr_source =
      // (-1: not reflective). aux: how far the ray went (half-resolution pixels; 1e4 no hit),
      // and the Fresnel factor.
      "struct TOut { float4 c [[color(0)]]; float4 aux [[color(1)]]; };\n"
+     // surf: the surfaces' facing and roughness (surface_texture), all 0 where unknown.
      "fragment TOut ssr_trace(V in [[stage_in]], texture2d<float> zt [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
-     "                        texture2d<float> color [[texture(2)]], constant SP &a [[buffer(0)]]) {\n"
+     "                        texture2d<float> color [[texture(2)]], texture2d<float> surf [[texture(3)]],\n"
+     "                        constant SP &a [[buffer(0)]]) {\n"
      "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
-     "    TOut o; o.c = float4(0.0, 0.0, 0.0, -1.0); o.aux = float4(1e4, 1.0, 0.0, 0.0);\n"
+     "    TOut o; o.c = float4(0.0, 0.0, 0.0, -1.0); o.aux = float4(1e4, 1.0, 0.0, -1.0);\n"
      "    int2 p = int2(in.pos.xy);\n"
      "    if (zt.read(uint2(p)).x <= 0.0 || info.sample(s, in.pos.xy / a.hsize).w < 0.004) return o;\n"
      "    float3 P = vpos(a, zt, p), N = vnormal(a, zt, p, P), D = normalize(P);\n"
+     "    float4 sf = surf.read(uint2(in.pos.xy * float2(surf.get_width(), surf.get_height()) / a.hsize));\n"
+     "    if (dot(sf.xyz, sf.xyz) > 0.5) N = sf.xyz, o.aux.w = sf.w;\n"
      "    o.c.w = 0.0, o.aux.y = 1.0 + a.fresnel * pow(1.0 - saturate(dot(-D, N)), 5.0);\n"
      "    float3 R = reflect(D, N);\n"
      "    float len = a.max_dist;\n"
@@ -2274,7 +2557,10 @@ static NSString *const ssr_source =
      "    float z = zt.read(uint2(p)).x;\n"
      "    if (z <= 0.0 || ssr.read(uint2(p)).w < 0.0) return float4(0.0, 0.0, 0.0, -1.0);\n"
      // 5 by 5 taps, spaced out for the wider blurs.
-     "    float sigma = clamp(aux.read(uint2(p)).x * a.blur, 0.4, 2.0);\n"
+     "    float4 ax = aux.read(uint2(p));\n"
+     "    float sigma = clamp(ax.x * a.blur, 0.4, 2.0);\n"
+     // Rougher surfaces blur more (their roughness from the PBRify map, when known).
+     "    if (ax.w >= 0.0) sigma = clamp(sigma * (0.25 + 2.5 * ax.w), 0.4, 3.0);\n"
      "    int step = sigma > 1.3 ? 2 : 1;\n"
      "    float k = -0.5 / (sigma * sigma);\n"
      "    float4 sum = 0.0;\n"
@@ -2523,6 +2809,9 @@ static id<MTLRenderPipelineState> ssr_pipeline(int kind, MTLPixelFormat color, M
     return p;
 }
 
+// The trace's surface facing (surface_texture this frame, or an empty one).
+static id<MTLTexture> ssr_surface;
+
 // ssr_history's SSRH: the TAA's reprojection (set by taa_motion) and the depth's alpha and beta.
 static struct { float reproj[4][4]; float offset[2]; float alpha, beta; } ssr_reproj;
 
@@ -2539,11 +2828,12 @@ static void ssr_pass(int kind, id<MTLTexture> target, id<MTLTexture> target2, id
         rp.colorAttachments[1].loadAction = MTLLoadActionDontCare;
         rp.colorAttachments[1].storeAction = MTLStoreActionStore;
     }
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    id<MTLRenderCommandEncoder> e = stat_render(rp, __func__);
     [e setRenderPipelineState:ssr_pipeline(kind, target.pixelFormat, MTLPixelFormatInvalid)];
     [e setFragmentTexture:t0 atIndex:0];
     [e setFragmentTexture:t1 atIndex:1];
     [e setFragmentTexture:t2 atIndex:2];
+    if (kind == 0) [e setFragmentTexture:ssr_surface atIndex:3];
     [e setFragmentBytes:a length:sizeof *a atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
@@ -2559,7 +2849,7 @@ static void ssr_history_run(id<MTLTexture> next, id<MTLTexture> cur, id<MTLTextu
     rp.colorAttachments[0].texture = next;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    id<MTLRenderCommandEncoder> e = stat_render(rp, __func__);
     [e setRenderPipelineState:ssr_pipeline(4, next.pixelFormat, MTLPixelFormatInvalid)];
     [e setFragmentTexture:cur atIndex:0];
     [e setFragmentTexture:prev atIndex:1];
@@ -2637,9 +2927,21 @@ static NSString *const fx_source =
      "    float j = ign(float2(p));\n"
      "    const float g = 0.35, g1 = 1.0 - g * g, g2 = 1.0 + g * g;\n"
      "    int n = int(a.nlights), steps = int(a.steps);\n"
-     "    for (int i = 0; i < steps; i++) {\n"
-     "        float3 P = ray * ((float(i) + j) * dt);\n"
-     "        for (int k = 0; k < n; k++) {\n"
+          // Each light only over the steps it reaches: inside its range, and where it could
+          // still add a 4096th to the haze over the whole ray (the phase at its most).
+     "    float most = 4096.0 * 3.2 * 1.5 * a.density * a.dist, rr = dot(ray, ray);\n"
+     "    for (int k = 0; k < n; k++) {\n"
+     "        float3 at = L[k].att.xyz;\n"
+     "        float K = most * max(L[k].color.r, max(L[k].color.g, L[k].color.b)), r = 1e30;\n"
+     "        if (at.z > 0.0) r = (-at.y + sqrt(max(at.y * at.y - 4.0 * at.z * (at.x - K), 0.0))) / (2.0 * at.z);\n"
+     "        else if (at.y > 0.0) r = (K - at.x) / at.y;\n"
+     "        if (L[k].pos.w > 0.0) r = min(r, L[k].pos.w);\n"
+     "        float b = dot(ray, L[k].pos.xyz), c = dot(L[k].pos.xyz, L[k].pos.xyz) - r * r, h = b * b - rr * c;\n"
+     "        if (h <= 0.0) continue;\n"
+     "        h = sqrt(h);\n"
+     "        int i0 = max(int(ceil((b - h) / rr / dt - j)), 0), i1 = min(int(floor((b + h) / rr / dt - j)), steps - 1);\n"
+     "        for (int i = i0; i <= i1; i++) {\n"
+     "            float3 P = ray * ((float(i) + j) * dt);\n"
      "            float3 v = L[k].pos.xyz - P;\n"
      "            float d2 = max(dot(v, v), 64.0), d = sqrt(d2);\n"
      "            float3 l = v / d;\n"
@@ -2872,7 +3174,8 @@ static void fx_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTe
     rp.colorAttachments[0].texture = target;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    static const char *const stat_names[] = {"fog_scatter", "fog_blur", "skin_blur", "skin_normal", "skin_normal_blur"};
+    id<MTLRenderCommandEncoder> e = stat_render(rp, stat_names[kind]);
     [e setRenderPipelineState:fx_pipeline(kind, target.pixelFormat)];
     id<MTLTexture> t[5] = {t0, t1, t2, t3, t4};
     for (int i = 0; i < 5; i++) [e setFragmentTexture:t[i] ? t[i] : t0 atIndex:(NSUInteger)i];
@@ -3097,7 +3400,7 @@ static void contact_run(id<MTLTexture> color, id<MTLTexture> z, const struct ao_
     rp.colorAttachments[0].texture = raw;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    id<MTLRenderCommandEncoder> e = stat_render(rp, __func__);
     [e setRenderPipelineState:contact_pipeline()];
     [e setFragmentTexture:z atIndex:0];
     [e setFragmentTexture:info_texture(color) atIndex:1];
@@ -3343,7 +3646,7 @@ static int taa_motion(id<MTLTexture> depth, NSUInteger w, NSUInteger h)
     rp.depthAttachment.texture = taa_z;
     rp.depthAttachment.loadAction = MTLLoadActionDontCare;
     rp.depthAttachment.storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    id<MTLRenderCommandEncoder> e = stat_render(rp, __func__);
     [e setRenderPipelineState:taa_pipeline(0, MTLPixelFormatRG16Float)];
     static id<MTLDepthStencilState> always;
     if (!always) {
@@ -3389,7 +3692,7 @@ static void taa_resolve(id<MTLTexture> color)
     rp.colorAttachments[0].texture = color;
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    id<MTLRenderCommandEncoder> e = stat_render(rp, __func__);
     [e setRenderPipelineState:taa_pipeline(1, color.pixelFormat)];
     [e setFragmentTexture:taa_out atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -3560,7 +3863,7 @@ static void bloom_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MT
     rp.colorAttachments[0].texture = target;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    id<MTLRenderCommandEncoder> e = stat_render(rp, __func__);
     [e setRenderPipelineState:bloom_pipeline(kind)];
     [e setFragmentTexture:t0 atIndex:0];
     [e setFragmentTexture:t1 atIndex:1];
@@ -3627,7 +3930,7 @@ static void exposure_run(id<MTLTexture> color)
     b.rate = dt > 0.5 ? 0 : (float)(1 - exp(-dt / 0.5));
     id<MTLTexture> lum = bloom_texture(2 * BLOOM_LEVELS, 64, 36);
     bloom_pass(3, lum, color, nil, &b);
-    id<MTLComputeCommandEncoder> e = [command_buffer() computeCommandEncoder];
+    id<MTLComputeCommandEncoder> e = stat_compute(__func__);
     [e setComputePipelineState:adapt];
     [e setTexture:lum atIndex:0];
     [e setBytes:&b length:sizeof b atIndex:0];
@@ -3930,7 +4233,10 @@ static id<MTLRenderPipelineState> ssil_pipeline(int kind)
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [lib newFunctionWithName:@"ssil_vs"];
     d.fragmentFunction = [lib newFunctionWithName:names[kind]];
-    d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+    // The normals and the colour copy small (the trace reads them 24 times a pixel).
+    d.colorAttachments[0].pixelFormat = kind == 0   ? MTLPixelFormatRGBA8Snorm
+                                        : kind == 1 ? MTLPixelFormatRG11B10Float
+                                                    : MTLPixelFormatRGBA16Float;
     if (kind == 2) d.colorAttachments[1].pixelFormat = MTLPixelFormatR8Unorm;
     NSError *error = nil;
     id<MTLRenderPipelineState> p = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
@@ -3963,7 +4269,9 @@ static void ssil_pass(int kind, id<MTLTexture> target, id<MTLTexture> target2, i
         rp.colorAttachments[1].loadAction = MTLLoadActionDontCare;
         rp.colorAttachments[1].storeAction = MTLStoreActionStore;
     }
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    static const char *const stat_names[] = {"ssil_normals", "ssil_color", "ssil_trace", "ssil_blur", "ssil_history",
+                                             "ssil_upscale"};
+    id<MTLRenderCommandEncoder> e = stat_render(rp, stat_names[kind]);
     [e setRenderPipelineState:ssil_pipeline(kind)];
     for (int i = 0; i < ntex; i++) [e setFragmentTexture:tex[i] atIndex:(NSUInteger)i];
     [e setFragmentBytes:a length:sizeof *a atIndex:0];
@@ -3990,8 +4298,8 @@ static id<MTLTexture> ssil_run(id<MTLTexture> color, id<MTLTexture> z, id<MTLTex
     static unsigned long before_frame;
     int again = before && before_frame == frames - 1 && !(taa_pending && taa_reset) && before.width == hw && before.height == hh;
     a.feedback = again ? 0.5f * env_ssil_strength : 0;
-    id<MTLTexture> normals = ssil_texture(0, MTLPixelFormatRGBA16Float, hw, hh, 0);
-    id<MTLTexture> picture = ssil_texture(1, MTLPixelFormatRGBA16Float, hw, hh, 1);
+    id<MTLTexture> normals = ssil_texture(0, MTLPixelFormatRGBA8Snorm, hw, hh, 0);
+    id<MTLTexture> picture = ssil_texture(1, MTLPixelFormatRG11B10Float, hw, hh, 1);
     id<MTLTexture> out = ssil_texture(2, MTLPixelFormatRGBA16Float, hw, hh, 0);
     id<MTLTexture> pong = ssil_texture(3, MTLPixelFormatRGBA16Float, hw, hh, 0);
     id<MTLTexture> edges = ssil_texture(4, MTLPixelFormatR8Unorm, hw, hh, 0);
@@ -4084,6 +4392,15 @@ static void post_run(struct d3d_state *s)
         id<MTLTexture> raw = ao_texture(4, MTLPixelFormatRGBA16Float, hw, hh);
         post_aux = ao_texture(6, SSR_AUX_FORMAT, hw, hh);
         post_ssr = ao_texture(5, MTLPixelFormatRGBA16Float, hw, hh);
+        static id<MTLTexture> none;  // 1x1, all 0: no facing known
+        if (!none) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:SURFACE_FORMAT width:1
+                                                                                         height:1 mipmapped:NO];
+            none = [mtl newTextureWithDescriptor:td];
+            uint16_t zero[4] = {0};
+            [none replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:zero bytesPerRow:sizeof zero];
+        }
+        ssr_surface = surface_frame == frames ? surface_texture(color) : none;
         ssr_pass(0, raw, post_aux, z, info_texture(color), post_base, &p);
         ssr_pass(1, post_ssr, nil, raw, z, post_aux, &p);
         if (taa_pending) {
@@ -4263,6 +4580,59 @@ static void log_draw(struct d3d_state *s, const char *what, uint32_t type, uint3
             t ? t->width : 0, t ? t->height : 0, t ? t->format : 0, s->rs[27], s->rs[7], s->rs[14]);
 }
 
+// --- light probes (global illumination) ---------------------------------------------
+//
+// The game lights a model from the ambient cube in c21..c26 (+x -x +y -y +z -z), made of
+// the lightmap under it, the same from every side, and the lights it does not pass
+// on their own. With BL_GI the cube is the light from around the model instead
+// (gi_probes.m: the map's surfaces and lights as seen from probes through the map, each
+// a small cube map rendered at load), at the game's mean brightness: each side takes the
+// colour and share of the light from that way. A model by a red wall turns red
+// on that side; one under a dark ceiling is darker on top.
+static const struct bl_gi *gi_frame;  // the open map's probes this frame, NULL none (yet)
+
+static void gi_frame_start(void)
+{
+    gi_frame = env_gi ? bl_gi_get(1) : NULL;
+}
+
+static float gi_lum(const float c[3]) { return 0.299f * c[0] + 0.587f * c[1] + 0.114f * c[2]; }
+
+static void gi_light(struct d3d_state *s, BLShader *vs, float vc[256][4])
+{
+    (void)s;
+    // Models: shaders that read the cube, with the model's place (or its first bone's) in
+    // c48..c50's w.
+    if (!gi_frame || menu_frame || vs->ff_vertex || !(vs->info.const_read[0] & (1u << 21 | 1u << 23 | 1u << 25)))
+        return;
+    float p[3] = {vc[48][3], vc[49][3], vc[50][3]}, bounce[6][3], direct[6][3];
+    if (!bl_gi_sample(gi_frame, p, bounce, direct)) return;
+    // The probes' light from every side (the map's surfaces and its lights), at the
+    // game's own mean brightness: each side takes the colour and share of the light
+    // from that way.
+    float total[6][3], mean = 0, game = 0;
+    for (int a = 0; a < 6; a++) {
+        for (int c = 0; c < 3; c++) total[a][c] = bounce[a][c] + direct[a][c];
+        mean += gi_lum(total[a]) / 6, game += fmaxf(gi_lum(vc[21 + a]), 0) / 6;
+    }
+    if (mean < 1e-5f || game <= 0) return;
+    float old[6][3];
+    for (int a = 0; a < 6; a++)
+        for (int c = 0; c < 3; c++) {
+            old[a][c] = vc[21 + a][c];
+            float now = fminf(total[a][c] / mean, 4.0f) * game;
+            vc[21 + a][c] += env_gi_mix * (now - old[a][c]);
+        }
+    if (env_gi_log > 0) {
+        env_gi_log--;
+        fprintf(stderr, "[gi] at %.0f %.0f %.0f mean %.3f:", p[0], p[1], p[2], game);
+        for (int a = 0; a < 6; a++)
+            fprintf(stderr, " %.3f,%.3f,%.3f>%.3f,%.3f,%.3f", old[a][0], old[a][1], old[a][2], vc[21 + a][0], vc[21 + a][1],
+                    vc[21 + a][2]);
+        fprintf(stderr, "\n");
+    }
+}
+
 // Everything a draw needs except vertex and index data; returns 0 if it cannot draw.
 // Characters' detail normal maps (BL_DETAIL=0 off; BL_DETAIL_STRENGTH, default 1; the
 // shine they and their roughness maps give skin and cloth, BL_SHINE, default 4; light
@@ -4286,6 +4656,11 @@ static struct hair_swap *hair_swap;  // the draw's, while d3d_render_draw draws 
 static struct lightmap_page *lightmap_draw;
 static uint32_t lightmap_stages;
 static id<MTLTexture> lightmap_rects(struct lightmap_page *p);
+// The lighting rebake (lightmap_rebake...): whether the page has rebaked surfaces to show,
+// its rectangles with them marked, and the rebaked page.
+static int lightmap_rebaked(struct lightmap_page *p);
+static id<MTLTexture> lightmap_rebake_rects(struct lightmap_page *p);
+static id<MTLTexture> lightmap_rebake_page(struct lightmap_page *p, int old);
 
 // Hair's two passes (solid, then the blended see-through rest), except for strips: their
 // blended pass, drawn in no order across thousands of layered cards, shows the dark
@@ -4337,7 +4712,7 @@ static void hair_before_draw(struct d3d_state *s)
     int hair = skinned && s->rs[15] && !s->rs[27] && t0 && t0->type == OBJ_TEXTURE && t0->subs[0] && t0->subs[0]->mem;
     if (hair) {
         id<MTLTexture> color = nil;
-        hair = !bl_detail_normal(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
+        hair = !detail_normal_timed(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
                                  t0->subs[0]->pitch, &color);
     }
     if (!hair) {
@@ -4453,7 +4828,10 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     }
     k->write_mask = rs[168] & 15;
     shadow_variant(s, ps, k);
-    if (lightmap_draw && ps->code) k->psv.lightmap = (uint8_t)lightmap_stages;
+    if (lightmap_draw && ps->code) {
+        k->psv.lightmap = (uint8_t)lightmap_stages;
+        k->psv.rebake = (uint8_t)lightmap_rebaked(lightmap_draw);
+    }
     k->point = type == 1;
     for (int b = 0; b < 16; b++) k->stride[b] = (uint16_t)s->stream_stride[b];
     k->stride[16] = 16;
@@ -4483,7 +4861,7 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         struct obj *t0 = s->texture[0];
         if (k->psv.skin == 1 && env_detail > 0 && t0 && t0->type == OBJ_TEXTURE && t0->subs[0] && t0->subs[0]->mem) {
             id<MTLTexture> color = nil;
-            detail_map = bl_detail_normal(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
+            detail_map = detail_normal_timed(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
                                           t0->subs[0]->pitch, &color);
             detail_color = env_upscale_off ? nil : color;
             if (hair_swap && hair_swap->tex) detail_color = hair_swap->tex;
@@ -4505,7 +4883,7 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         // Eyeballs: no map, but the upscaled colour texture when there is one.
         if (k->psv.skin == 3 && !env_upscale_off && t0 && t0->type == OBJ_TEXTURE && t0->subs[0] && t0->subs[0]->mem) {
             id<MTLTexture> color = nil;
-            bl_detail_normal(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
+            detail_normal_timed(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
                              t0->subs[0]->pitch, &color);
             detail_color = color;
         }
@@ -4515,10 +4893,16 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         k->albedo = !rs[27] && (rs[168] & 7) && !(ps->info.color_outputs & 4) ? 2 : 1;
         k->psv.albedo = k->albedo == 2;
     }
+    // And their facing (shader draws only).
+    if (enc_surface) {
+        k->surface = !rs[27] && (rs[168] & 7) && ps->code && !(ps->info.color_outputs & 8) ? 2 : 1;
+        k->psv.surface = k->surface == 2;
+    }
     if (k->psv.hair && hair_pass >= 2) {  // SRCALPHA, INVSRCALPHA, ADD
         k->blend[0] = 1, k->blend[1] = k->blend[4] = 5, k->blend[2] = k->blend[5] = 6, k->blend[3] = k->blend[6] = 1;
         k->info = 1;
         if (k->albedo) k->albedo = 1;
+        if (k->surface) k->surface = 1, k->psv.surface = 0;
     }
 
     id<MTLFunction> vf = shader_function(vs, &k->vsv), pf = shader_function(ps, &k->psv);
@@ -4540,6 +4924,7 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
     memcpy(vc, s->vs_f, sizeof vc);
     for (int i = 0; i < vs->info.ndefs; i++)
         if (vs->info.defs[i].reg < 256) memcpy(vc[vs->info.defs[i].reg], vs->info.defs[i].value, 16);
+    gi_light(s, vs, vc);
     if (vs->ff_vertex) {
         float m[16], t[16];
         if (vs->ffv.positiont) {
@@ -4664,11 +5049,34 @@ static int setup_draw(struct d3d_state *s, id<MTLRenderCommandEncoder> e, uint32
         pp.fog_mode = table == 3 ? 2 : table == 1 ? 3 : table == 2 ? 4 : 1;
         pp.fog_start = u2f(rs[36]), pp.fog_end = u2f(rs[37]), pp.fog_density = u2f(rs[38]);
     }
+    if (k->psv.surface) {
+        id<MTLTexture> pm = nil;
+        for (int i = 0; i < 8 && !pm; i++)
+            if ((ps->info.sampler_mask & (1u << i)) && s->texture[i] && s->texture[i]->type == OBJ_TEXTURE)
+                if ((pm = (__bridge id<MTLTexture>)s->texture[i]->pbr)) pp.metal = s->texture[i]->metal;
+        pp.pbr = pm != nil;
+        pp.spec = env_pbr_spec;
+        [e setFragmentTexture:pm ? pm : bl_detail_flat(mtl) atIndex:12];
+        id<MTLTexture> ct = target_texture(s->render_target[0]);
+        pp.view[0] = view_proj.p00, pp.view[1] = view_proj.p11;
+        pp.view[2] = 2.0f / (float)ct.width, pp.view[3] = 2.0f / (float)ct.height;
+        pp.bump = env_pbr_bump;
+        // The frame's lights for the bumps' shading (ps_surface).
+        float wl[1 + 4 * FOG_LIGHTS][4] = {{(float)(pm && (env_pbr_bump > 0 || env_pbr_spec > 0) ? view_lights() : 0)}};
+        for (int i = 0; i < (int)wl[0][0]; i++) memcpy(wl[1 + 4 * i], &frame_lights[i], sizeof frame_lights[i]);
+        [e setFragmentBytes:wl length:sizeof wl[0] * (NSUInteger)(1 + 4 * (int)wl[0][0]) atIndex:4];
+    }
     [e setFragmentBytes:&pp length:sizeof pp atIndex:1];
     if (k->psv.detail) detail_bind(e);
     if (k->psv.hair >= 2) [e setFragmentTexture:hair_depth atIndex:14];
     shadow_draw(s, e, k, vs->ff_vertex ? (const float(*)[4])vc : (const float(*)[4])vc + 8, &vp);
-    if (k->psv.lightmap) [e setFragmentTexture:lightmap_rects(lightmap_draw) atIndex:13];
+    if (k->psv.lightmap)
+        [e setFragmentTexture:k->psv.rebake ? lightmap_rebake_rects(lightmap_draw) : lightmap_rects(lightmap_draw)
+                      atIndex:13];
+    if (k->psv.rebake) {
+        [e setFragmentTexture:lightmap_rebake_page(lightmap_draw, 0) atIndex:16];
+        [e setFragmentTexture:lightmap_rebake_page(lightmap_draw, 1) atIndex:17];
+    }
 
     for (uint32_t i = 0; i < D3D_SHADER_MAX_SAMPLERS; i++) {
         if (!(ps->info.sampler_mask & (1u << i))) continue;
@@ -4737,7 +5145,7 @@ static struct hair_swap *hair_swap_for(struct d3d_state *s, struct element *el, 
     for (int i = 0; i < nel; i++)
         if (el[i].stream != pe->stream) return NULL;
     id<MTLTexture> color;
-    bl_detail_normal(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem), t0->subs[0]->pitch,
+    detail_normal_timed(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem), t0->subs[0]->pitch,
                      &color);
     const struct bl_hair_mesh *m = bl_detail_hair(mtl, t0, t0->width, t0->height);
     struct obj *vbo = s->stream[pe->stream], *ibo = s->indices;
@@ -4936,6 +5344,18 @@ struct lightmap_page {
     id<MTLTexture> gpu;
     uint32_t dirty[4];          // rows and columns changed since the upload: x0, y0, x1, y1
     NSMutableSet<NSData *> *ranges;  // draws already read (emptied at LIGHTMAP_MAX_RANGES)
+    // The lighting rebake (BL_REBAKE), for the map rb_gen counts (bl_rebake_gen):
+    int rb_gen;
+    struct lightmap_surf *surfs;  // surfaces seen, not yet matched to the map's faces
+    int nsurfs, capsurfs;
+    struct lightmap_match *matches;  // matched, the first nfilled of them in rb_page
+    int nmatches, capmatches, nfilled;
+    uint8_t *matched;           // by face: matched already
+    uint16_t *rb_rects;         // 4 per texel: a rebaked face's rectangle (x0 + 0x8000), else 0
+    id<MTLTexture> rb_gpu;      // rects, with rb_rects over them
+    id<MTLTexture> rb_page;     // the rebaked light, 4 times the size
+    id<MTLTexture> rb_old;      // the map's own light it changes, encoded alike
+    uint32_t rb_dirty[4];       // as dirty, for rb_gpu
 };
 #define LIGHTMAP_MAX_RANGES 65536
 static NSMutableDictionary<NSValue *, NSValue *> *lightmap_pages;  // by page (struct obj *)
@@ -4970,8 +5390,8 @@ static void lightmap_forget(struct obj *o)
     if (!p) return;
     [lightmap_pages removeObjectForKey:key];
     if (lightmap_draw == p) lightmap_draw = NULL;
-    free(p->rects);
-    p->gpu = nil, p->ranges = nil;
+    free(p->rects), free(p->surfs), free(p->matches), free(p->matched), free(p->rb_rects);
+    p->gpu = nil, p->ranges = nil, p->rb_gpu = nil, p->rb_page = nil, p->rb_old = nil;
     free(p);
 }
 
@@ -4992,6 +5412,405 @@ static id<MTLTexture> lightmap_rects(struct lightmap_page *p)
         p->dirty[0] = p->w, p->dirty[1] = p->h, p->dirty[2] = p->dirty[3] = 0;
     }
     return p->gpu;
+}
+
+static void lightmap_dirty(uint32_t d[4], int x0, int y0, int x1, int y1)
+{
+    if ((uint32_t)x0 < d[0]) d[0] = (uint32_t)x0;
+    if ((uint32_t)y0 < d[1]) d[1] = (uint32_t)y0;
+    if ((uint32_t)x1 > d[2]) d[2] = (uint32_t)x1;
+    if ((uint32_t)y1 > d[3]) d[3] = (uint32_t)y1;
+}
+
+// --- the lighting rebake in the game ------------------------------------------------
+//
+// Shelved (2026-10-26): the bake differs from the 2004 one too much luxel by luxel, so it
+// shows blotched in the game; only BL_REBAKE=1 turns it on, for working on it.
+// With BL_REBAKE=1, the map baked again four times as fine
+// (lm_bake.h) takes the place of the game's own lightmaps, surface by surface. Each
+// surface lightmap_for finds is noted with three of its corners (their positions and
+// lightmap coordinates) and matched to the map face it was made from: one that has those
+// corners, and whose lightmap, placed where the coordinates say, sits on whole texels of
+// the page. That face's bake goes into a page four times the size (rb_page: texel for
+// texel, as lm_bake.h lays it out), and its rectangle, in a copy of the rectangles
+// texture, is marked (x0 + 0x8000) so the shader reads rb_page there
+// (d3d9_shader.c bl_lightmap_rebaked). The bake is linear light and the game's page holds
+// it encoded (its gamma and overbright, then the colour scaled down whole where a
+// channel would pass 1, keeping its hue), so the encoding is learnt from the pages: the
+// map's own samples (its lighting lump) against the bytes the game wrote for them, per
+// channel, from texels not scaled down (no byte at 255). The game adds dynamic lights to
+// its page as it runs (the asylum's green neon), which brighten some texels past what
+// their samples give, so each byte takes the upper quarter of the light seen with it. The
+// rebake goes in as a change to the game's page, not in its place: the bake encoded
+// (rb_page) less the old samples encoded (rb_old), added to the page as the game has it,
+// so its dynamic light stays and the encoding's errors cancel. Left as the game has them: faces with a light
+// style (lights that switch or flicker change their texels), displacements, and the
+// light dynamic lights add to the page.
+struct lightmap_surf {
+    uint16_t rect[4];       // copy 0, in texels
+    int16_t sx, sy;         // to the next copy (bump-mapped), in texels
+    int copies;
+    float pos[3][3], uv[3][2];
+};
+struct lightmap_match { int face, rx, ry, sx, sy, copies; };
+
+static const struct bl_rebake *rebake_now;  // the open map's bake, once done (this frame's)
+static int rebake_gen_now;
+static unsigned long rebake_frame = ~0ul;
+static long rebake_budget;                // luxels left to fill this frame
+static uint32_t rebake_faces, rebake_missed;  // faces filled, surfaces matched to none
+// Why surfaces matched none, by the furthest a candidate face got: no face has the first
+// corner, none has all three, the copies disagree, not on whole texels, off the page.
+static uint32_t rebake_why[5];
+static int rebake_told;  // unmatched surfaces logged in full
+// The encoding learnt: per channel (r, g, b), the mean linear light of each byte.
+struct rebake_pair { float lin; int byte; };
+static struct rebake_pair *rebake_seen[3];
+static long rebake_pairs, rebake_cap;
+static float rebake_lin[3][256];
+static int rebake_learnt;
+#define REBAKE_PAIRS 4000
+// The map's corners, to the faces that have them: (position key, face), sorted.
+struct rebake_vert { uint64_t key; int face; };
+static struct rebake_vert *rebake_verts;
+static int nrebake_verts, rebake_verts_gen = -1;
+
+static uint64_t rebake_key(const float p[3])
+{
+    uint64_t k = 0;
+    for (int i = 0; i < 3; i++) k = k << 21 | ((uint64_t)lroundf(p[i] * 8.0f) & 0x1fffff);
+    return k;
+}
+static int rebake_vert_cmp(const void *a, const void *b)
+{
+    uint64_t x = ((const struct rebake_vert *)a)->key, y = ((const struct rebake_vert *)b)->key;
+    return x < y ? -1 : x > y;
+}
+// A face the rebake replaces: baked, and lit by the map's steady light alone.
+static int rebake_face_ok(const struct bl_rebake *rb, int fi)
+{
+    const struct bl_bsp_face *f = &rb->world->faces[fi];
+    return rb->bake->faces[fi].offset >= 0 && f->nstyles == 1 && f->styles[0] == 0;
+}
+static void rebake_index(const struct bl_rebake *rb)
+{
+    if (rebake_verts_gen == rb->gen) return;
+    const struct bl_bsp_world *w = rb->world;
+    free(rebake_verts);
+    nrebake_verts = 0;
+    for (int i = 0; i < w->nfaces; i++)
+        if (rebake_face_ok(rb, i)) nrebake_verts += w->faces[i].count;
+    rebake_verts = malloc(sizeof *rebake_verts * (nrebake_verts ? nrebake_verts : 1));
+    int n = 0;
+    for (int i = 0; i < w->nfaces; i++) {
+        if (!rebake_face_ok(rb, i)) continue;
+        const struct bl_bsp_face *f = &w->faces[i];
+        for (int c = 0; c < f->count; c++)
+            rebake_verts[n].key = rebake_key(w->verts[w->index[f->first + c]]), rebake_verts[n++].face = i;
+    }
+    qsort(rebake_verts, (size_t)n, sizeof *rebake_verts, rebake_vert_cmp);
+    rebake_verts_gen = rb->gen;
+}
+
+static int rebake_match(const struct bl_rebake *rb, const struct lightmap_page *p, const struct lightmap_surf *sf,
+                        struct lightmap_match *out)
+{
+    const struct bl_bsp_world *w = rb->world;
+    uint64_t k[3] = {rebake_key(sf->pos[0]), rebake_key(sf->pos[1]), rebake_key(sf->pos[2])};
+    int lo = 0, hi = nrebake_verts;
+    while (lo < hi) {
+        int m = (lo + hi) / 2;
+        if (rebake_verts[m].key < k[0]) lo = m + 1;
+        else hi = m;
+    }
+    int why = 0;
+    for (int j = lo; j < nrebake_verts && rebake_verts[j].key == k[0]; j++) {
+        int fi = rebake_verts[j].face;
+        const struct bl_bsp_face *f = &w->faces[fi];
+        int has = 1;
+        for (int c = 1; c < 3 && has; c++) {
+            has = 0;
+            for (int v = 0; v < f->count && !has; v++) has = rebake_key(w->verts[w->index[f->first + v]]) == k[c];
+        }
+        if (!has) {
+            why = why > 1 ? why : 1;
+            continue;
+        }
+        // The page holds the bump directions' copies only where the material is bump-mapped,
+        // though the map has them for every face.
+        if (sf->copies == 4 && !f->bumped) {
+            why = why > 2 ? why : 2;
+            continue;
+        }
+        // Where its lightmap sits on the page: the same whole texel from every corner.
+        const struct bl_bsp_texinfo *ti = &w->texinfo[f->texinfo];
+        float r[3][2];
+        for (int c = 0; c < 3; c++)
+            for (int a = 0; a < 2; a++) {
+                const float *v = ti->lm[a], *q = sf->pos[c];
+                float l = v[0] * q[0] + v[1] * q[1] + v[2] * q[2] + v[3] - (float)f->mins[a];
+                r[c][a] = sf->uv[c][a] * (float)(a ? p->h : p->w) - l - 0.5f;
+            }
+        int rx = (int)lroundf(r[0][0]), ry = (int)lroundf(r[0][1]), ok = 1;
+        for (int c = 0; c < 3; c++) ok &= fabsf(r[c][0] - (float)rx) < 0.05f && fabsf(r[c][1] - (float)ry) < 0.05f;
+        if (!ok) {
+            if (why < 3 && rebake_told < 4) {
+                rebake_told++;
+                fprintf(stderr, "[metal] rebake: surface at %.2f %.2f %.2f (texel %.3f %.3f) on face %d: off whole texels by"
+                                " %.3f %.3f, %.3f %.3f, %.3f %.3f\n",
+                        sf->pos[0][0], sf->pos[0][1], sf->pos[0][2], sf->uv[0][0] * p->w, sf->uv[0][1] * p->h, fi,
+                        r[0][0], r[0][1], r[1][0], r[1][1], r[2][0], r[2][1]);
+            }
+            why = why > 3 ? why : 3;
+            continue;
+        }
+        int sx = sf->sx, sy = sf->sy, n = sf->copies - 1, w0 = f->size[0] + 1, h0 = f->size[1] + 1;
+        if (rx < 0 || ry < 0 || rx + n * sx < 0 || ry + n * sy < 0 || rx + n * sx + w0 > (int)p->w ||
+            ry + n * sy + h0 > (int)p->h || rx + w0 > (int)p->w || ry + h0 > (int)p->h) {
+            why = 4;
+            continue;
+        }
+        *out = (struct lightmap_match){fi, rx, ry, sx, sy, sf->copies};
+        return 1;
+    }
+    if (!why && rebake_told < 4) {
+        rebake_told++;
+        fprintf(stderr, "[metal] rebake: surface at %.3f %.3f %.3f, %.3f %.3f %.3f: no face has that corner\n",
+                sf->pos[0][0], sf->pos[0][1], sf->pos[0][2], sf->pos[1][0], sf->pos[1][1], sf->pos[1][2]);
+    }
+    rebake_why[why]++;
+    return 0;
+}
+
+// The game's bytes for the face's samples (the page's texels in guest memory, B G R A).
+static void rebake_learn(const struct bl_bsp_world *w, const struct lightmap_match *m, const uint8_t *tx, uint32_t pitch)
+{
+    const struct bl_bsp_face *f = &w->faces[m->face];
+    int w0 = f->size[0] + 1, h0 = f->size[1] + 1;
+    for (int c = 0; c < m->copies; c++)
+        for (int y = 0; y < h0; y++)
+            for (int x = 0; x < w0; x++) {
+                float lin[3];
+                bl_bake_rgbe(w->lighting + 4 * ((size_t)f->lightofs + (size_t)(c * h0 + y) * w0 + x), lin);
+                const uint8_t *b = tx + (size_t)(m->ry + c * m->sy + y) * pitch + (size_t)(m->rx + c * m->sx + x) * 4;
+                if (b[0] == 255 || b[1] == 255 || b[2] == 255) continue;  // scaled down
+                if (rebake_pairs == rebake_cap) {
+                    rebake_cap = rebake_cap ? rebake_cap * 2 : 65536;
+                    for (int ch = 0; ch < 3; ch++)
+                        rebake_seen[ch] = realloc(rebake_seen[ch], sizeof *rebake_seen[ch] * (size_t)rebake_cap);
+                }
+                for (int ch = 0; ch < 3; ch++) rebake_seen[ch][rebake_pairs] = (struct rebake_pair){lin[ch], b[2 - ch]};
+                rebake_pairs++;
+            }
+}
+
+static int rebake_pair_cmp(const void *a, const void *b)
+{
+    const struct rebake_pair *x = a, *y = b;
+    return x->byte != y->byte ? x->byte - y->byte : (x->lin > y->lin) - (x->lin < y->lin);
+}
+static void rebake_learn_done(void)
+{
+    for (int ch = 0; ch < 3; ch++) {
+        float *l = rebake_lin[ch];
+        struct rebake_pair *q = rebake_seen[ch];
+        qsort(q, (size_t)rebake_pairs, sizeof *q, rebake_pair_cmp);
+        int at[257] = {0};  // each byte's first pair
+        for (long i = 0, b = 0; b <= 256; b++) {
+            while (i < rebake_pairs && q[i].byte < b) i++;
+            at[b] = (int)i;
+        }
+        int last = -1;
+        for (int b = 0; b < 256; b++) {
+            int n = at[b + 1] - at[b];
+            if (!n && b) continue;
+            l[b] = n ? q[at[b] + n * 3 / 4].lin : 0.0f;
+            for (int g = last + 1; g < b; g++) l[g] = l[last] + (l[b] - l[last]) * (float)(g - last) / (float)(b - last);
+            last = b;
+        }
+        // Past the brightest byte seen: on as gamma 2.2 would go.
+        for (int g = last + 1; g < 256; g++) l[g] = l[last] * powf((float)g / (float)(last ? last : 1), 2.2f);
+        for (int b = 1; b < 256; b++) l[b] = fmaxf(l[b], l[b - 1]);
+    }
+    rebake_learnt = 1;
+    for (int ch = 0; ch < 3; ch++) free(rebake_seen[ch]), rebake_seen[ch] = NULL;
+    fprintf(stderr, "[metal] rebake: the lightmaps' encoding learnt from %ld samples: bytes 64, 128, 255 are %.3f %.3f %.3f\n",
+            rebake_pairs, rebake_lin[1][64], rebake_lin[1][128], rebake_lin[1][255]);
+}
+
+// Linear light to the page's value (byte / 255, between bytes where it falls between),
+// before the scaling down: past 1 for light brighter than byte 255's.
+static float rebake_encode(const float *l, float v)
+{
+    if (!(v > l[0])) return 0.0f;
+    if (v >= l[255]) return powf(v / l[255], 1.0f / 2.2f);
+    int lo = 0, hi = 255;  // l[lo] < v <= l[hi]
+    while (hi - lo > 1) {
+        int m = (lo + hi) / 2;
+        if (l[m] < v) lo = m;
+        else hi = m;
+    }
+    return ((float)lo + (v - l[lo]) / (l[hi] - l[lo])) / 255.0f;
+}
+
+static void rebake_fill(struct lightmap_page *p, const struct bl_rebake *rb, const struct lightmap_match *m,
+                        const uint8_t *tx, uint32_t pitch)
+{
+    const struct bl_bsp_face *f = &rb->world->faces[m->face];
+    const struct bl_bake_face *bf = &rb->bake->faces[m->face];
+    int w0 = f->size[0] + 1, h0 = f->size[1] + 1, sc = rb->bake->scale;
+    if (bf->w != w0 * sc || bf->h != h0 * sc || sc != 4) return;
+    if (!p->rb_page) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                                                                     width:p->w * 4 height:p->h * 4
+                                                                                 mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModeShared;
+        p->rb_page = [mtl newTextureWithDescriptor:d];
+        d.width = p->w, d.height = p->h;
+        p->rb_old = [mtl newTextureWithDescriptor:d];
+    }
+    if (!p->rb_rects) {
+        p->rb_rects = calloc((size_t)p->w * p->h * 4, sizeof *p->rb_rects);
+        p->rb_dirty[0] = p->rb_dirty[1] = 0, p->rb_dirty[2] = p->w, p->rb_dirty[3] = p->h;
+    }
+    __fp16 *buf = malloc(sizeof *buf * 4 * (size_t)bf->w * bf->h);
+    int n0 = w0 * h0;
+    for (int c = 0; c < m->copies; c++) {
+        int x0 = m->rx + c * m->sx, y0 = m->ry + c * m->sy, k = f->bumped ? c : 0;
+        for (int y = 0; y < bf->h; y++)
+            for (int x = 0; x < bf->w; x++) {
+                const float *lin = rb->bake->light[bf->offset + y * bf->w + x][k];
+                __fp16 *o = buf + 4 * ((size_t)y * bf->w + x);
+                float e[3], top = 1.0f;
+                for (int ch = 0; ch < 3; ch++) e[ch] = rebake_encode(rebake_lin[ch], lin[ch]), top = fmaxf(top, e[ch]);
+                for (int ch = 0; ch < 3; ch++) o[ch] = (__fp16)(e[ch] / top);
+                o[3] = (__fp16)(tx[(size_t)(y0 + y / sc) * pitch + (size_t)(x0 + x / sc) * 4 + 3] / 255.0f);
+            }
+        [p->rb_page replaceRegion:MTLRegionMake2D((NSUInteger)x0 * 4, (NSUInteger)y0 * 4, (NSUInteger)bf->w, (NSUInteger)bf->h)
+                      mipmapLevel:0
+                        withBytes:buf
+                      bytesPerRow:(NSUInteger)bf->w * 8];
+        for (int y = 0; y < h0; y++)
+            for (int x = 0; x < w0; x++) {
+                float lin[3], e[3], top = 1.0f;
+                bl_bake_rgbe(rb->world->lighting + 4 * ((size_t)f->lightofs + (size_t)k * n0 + (size_t)y * w0 + x), lin);
+                for (int ch = 0; ch < 3; ch++) e[ch] = rebake_encode(rebake_lin[ch], lin[ch]), top = fmaxf(top, e[ch]);
+                __fp16 *o = buf + 4 * ((size_t)y * w0 + x);
+                for (int ch = 0; ch < 3; ch++) o[ch] = (__fp16)(e[ch] / top);
+                o[3] = 1;
+            }
+        [p->rb_old replaceRegion:MTLRegionMake2D((NSUInteger)x0, (NSUInteger)y0, (NSUInteger)w0, (NSUInteger)h0)
+                     mipmapLevel:0
+                       withBytes:buf
+                     bytesPerRow:(NSUInteger)w0 * 8];
+        uint16_t r[4] = {(uint16_t)(x0 + 0x8000), (uint16_t)y0, (uint16_t)(x0 + w0), (uint16_t)(y0 + h0)};
+        for (int y = y0; y < y0 + h0; y++)
+            for (int x = x0; x < x0 + w0; x++) memcpy(p->rb_rects + ((size_t)y * p->w + x) * 4, r, sizeof r);
+        lightmap_dirty(p->rb_dirty, x0, y0, x0 + w0, y0 + h0);
+        rebake_budget -= (long)bf->w * bf->h;
+    }
+    free(buf);
+    rebake_faces++;
+}
+
+// Starts a page over for a map (another, or the first with the rebake on): its
+// rectangles are found again as it is drawn, so its surfaces are noted for the rebake.
+static void lightmap_rebake_reset(struct lightmap_page *p, int gen)
+{
+    p->rb_gen = gen;
+    p->nsurfs = p->nmatches = p->nfilled = 0;
+    free(p->matched), p->matched = NULL;
+    memset(p->rects, 0, (size_t)p->w * p->h * 4 * sizeof *p->rects);
+    if (p->rb_rects) memset(p->rb_rects, 0, (size_t)p->w * p->h * 4 * sizeof *p->rb_rects);
+    [p->ranges removeAllObjects];
+    lightmap_dirty(p->dirty, 0, 0, (int)p->w, (int)p->h);
+    lightmap_dirty(p->rb_dirty, 0, 0, (int)p->w, (int)p->h);
+}
+
+// For lightmap_for, with the rebake on: matches the surfaces noted so far, once the bake is
+// done, and fills in what it can this frame. Returns whether to note surfaces.
+static int lightmap_rebake_begin(struct lightmap_page *p, struct obj *tex)
+{
+    if (!env_rebake) return 0;
+    if (rebake_frame != frames) {
+        rebake_frame = frames;
+        rebake_now = bl_rebake_get(1), rebake_gen_now = bl_rebake_gen();
+        rebake_budget = 1 << 18;
+    }
+    if (p->rb_gen != rebake_gen_now) lightmap_rebake_reset(p, rebake_gen_now);
+    const struct bl_rebake *rb = rebake_now;
+    if (!rb || rb->gen != p->rb_gen || (!p->nsurfs && p->nfilled == p->nmatches)) return 1;
+    struct obj *sub = tex->subs[0];
+    if (!sub->mem || sub->pitch < p->w * 4) return 1;
+    const uint8_t *tx = bl_g2h(sub->mem);
+    rebake_index(rb);
+    if (!p->matched) p->matched = calloc((size_t)rb->world->nfaces, 1);
+    for (int i = 0; i < p->nsurfs; i++) {
+        struct lightmap_match m;
+        if (!rebake_match(rb, p, &p->surfs[i], &m)) {
+            rebake_missed++;
+            continue;
+        }
+        if (p->matched[m.face]) continue;
+        p->matched[m.face] = 1;
+        if (p->nmatches == p->capmatches)
+            p->capmatches = p->capmatches ? p->capmatches * 2 : 256,
+            p->matches = realloc(p->matches, sizeof *p->matches * (size_t)p->capmatches);
+        p->matches[p->nmatches++] = m;
+        if (!rebake_learnt) rebake_learn(rb->world, &m, tx, sub->pitch);
+    }
+    p->nsurfs = 0;
+    if (!rebake_learnt && rebake_pairs >= REBAKE_PAIRS) rebake_learn_done();
+    while (rebake_learnt && p->nfilled < p->nmatches && rebake_budget > 0)
+        rebake_fill(p, rb, &p->matches[p->nfilled++], tx, sub->pitch);
+    return 1;
+}
+
+static void lightmap_rebake_note(struct lightmap_page *p, const uint16_t rect[4], int sx, int sy, int copies,
+                                 const float (*pos)[3], const float (*uv)[2], const uint32_t corner[3])
+{
+    if (p->nsurfs == p->capsurfs) {
+        p->capsurfs = p->capsurfs ? p->capsurfs * 2 : 256;
+        p->surfs = realloc(p->surfs, sizeof *p->surfs * (size_t)p->capsurfs);
+    }
+    struct lightmap_surf *sf = &p->surfs[p->nsurfs++];
+    memcpy(sf->rect, rect, sizeof sf->rect);
+    sf->sx = (int16_t)sx, sf->sy = (int16_t)sy, sf->copies = copies;
+    for (int c = 0; c < 3; c++) memcpy(sf->pos[c], pos[corner[c]], sizeof sf->pos[c]), memcpy(sf->uv[c], uv[corner[c]], 8);
+}
+
+static int lightmap_rebaked(struct lightmap_page *p)
+{
+    return env_rebake && p->nfilled && p->rb_gen == rebake_gen_now && p->rb_page;
+}
+
+static id<MTLTexture> lightmap_rebake_page(struct lightmap_page *p, int old) { return old ? p->rb_old : p->rb_page; }
+
+static id<MTLTexture> lightmap_rebake_rects(struct lightmap_page *p)
+{
+    lightmap_rects(p);
+    if (!p->rb_gpu) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Uint
+                                                                                     width:p->w height:p->h mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModeShared;
+        p->rb_gpu = [mtl newTextureWithDescriptor:d];
+        p->rb_dirty[0] = p->rb_dirty[1] = 0, p->rb_dirty[2] = p->w, p->rb_dirty[3] = p->h;
+    }
+    if (p->rb_dirty[2] > p->rb_dirty[0]) {
+        uint32_t x0 = p->rb_dirty[0], y0 = p->rb_dirty[1], w = p->rb_dirty[2] - x0, h = p->rb_dirty[3] - y0;
+        uint16_t *t = malloc((size_t)w * h * 8);
+        for (uint32_t y = 0; y < h; y++)
+            for (uint32_t x = 0; x < w; x++) {
+                size_t i = ((size_t)(y0 + y) * p->w + x0 + x) * 4;
+                memcpy(t + ((size_t)y * w + x) * 4, p->rb_rects[i + 2] ? p->rb_rects + i : p->rects + i, 8);
+            }
+        [p->rb_gpu replaceRegion:MTLRegionMake2D(x0, y0, w, h) mipmapLevel:0 withBytes:t bytesPerRow:(NSUInteger)w * 8];
+        free(t);
+        p->rb_dirty[0] = p->w, p->rb_dirty[1] = p->h, p->rb_dirty[2] = p->rb_dirty[3] = 0;
+    }
+    return p->rb_gpu;
 }
 
 // A vertex shader's input with this TEXCOORD index, or -1.
@@ -5067,10 +5886,13 @@ static struct lightmap_page *lightmap_for(struct d3d_state *s, struct element *e
         p->w = tex->width, p->h = tex->height;
         p->rects = calloc((size_t)p->w * p->h * 4, sizeof *p->rects);
         p->dirty[0] = p->w, p->dirty[1] = p->h;
+        p->rb_dirty[0] = p->w, p->rb_dirty[1] = p->h;
+        p->rb_gen = -1;
         p->ranges = [NSMutableSet new];
         lightmap_pages[pk] = [NSValue valueWithPointer:p];
     }
     lightmap_stages = stages;
+    int rec = lightmap_rebake_begin(p, tex);
 
     // This range read already?
     int b = el[uv_el].stream;
@@ -5094,6 +5916,14 @@ static struct lightmap_page *lightmap_for(struct d3d_state *s, struct element *e
     // The step to the copies, read with the coordinates (same stream: Source's world vertices).
     int step = bumped && el[off_el].stream == b ? (int)el[off_el].offset - (int)el[uv_el].offset : 0;
     if (bumped && !step) return p;
+    // The rebake matches surfaces to the map's faces by their corners' positions.
+    int pos_off = 0;
+    if (rec) {
+        rec = 0;
+        for (int i = 0; i < nel && !rec; i++)
+            if (el[i].usage == 0 && el[i].index == 0 && el[i].type == 2 && el[i].stream == b)  // FLOAT3
+                rec = 1, pos_off = (int)el[i].offset - (int)el[uv_el].offset;
+    }
     // Dynamic buffers are known by the coordinates read from them instead (below).
     int dynamic = (v->usage & 0x200) || v->rewrites >= 8 || (ibo->usage & 0x200);  // D3DUSAGE_DYNAMIC
     NSData *kd = nil;
@@ -5107,6 +5937,7 @@ static struct lightmap_page *lightmap_for(struct d3d_state *s, struct element *e
     uint64_t(*corner)[2] = malloc(sizeof *corner * ni);
     uint32_t *up = malloc(sizeof *up * ni);
     float(*uv)[2] = malloc(sizeof *uv * ni), (*dv)[2] = malloc(sizeof *dv * ni);
+    float(*pos)[3] = rec ? malloc(sizeof *pos * ni) : NULL;
     const uint8_t *vd = (const uint8_t *)bl_g2h(v->mem) + key.off;
     uint32_t n = 0;
     for (uint32_t i = 0; i < ni; i++) {
@@ -5114,6 +5945,7 @@ static struct lightmap_page *lightmap_for(struct d3d_state *s, struct element *e
         if (vi < 0 || (uint64_t)vi * stride + key.off - el[uv_el].offset + stride > v->size) break;
         memcpy(uv[i], vd + (size_t)vi * stride, 8);
         if (step) memcpy(dv[i], vd + (size_t)vi * stride + step, 8);
+        if (rec) memcpy(pos[i], vd + (size_t)vi * stride + pos_off, 12);
         corner[i][0] = lightmap_uv_key(uv[i]), corner[i][1] = i;
         up[i] = i - i % 3;
         n = i + 1;
@@ -5128,7 +5960,7 @@ static struct lightmap_page *lightmap_for(struct d3d_state *s, struct element *e
         }
         kd = [NSData dataWithBytes:&ck length:sizeof ck];
         if ([p->ranges containsObject:kd]) {
-            free(uv), free(dv), free(up), free(corner);
+            free(uv), free(dv), free(pos), free(up), free(corner);
             return p;
         }
     }
@@ -5141,6 +5973,30 @@ static struct lightmap_page *lightmap_for(struct d3d_state *s, struct element *e
             uint32_t a = lightmap_root(up, (uint32_t)corner[i][1]), c = lightmap_root(up, (uint32_t)corner[i - 1][1]);
             if (a != c) up[a] = c;
         }
+    // For the rebake, three corners of each surface: the first, the one furthest from it,
+    // and the one furthest from the line through those (fa[root], fb[root]).
+    uint32_t *fa = NULL, *fb = NULL;
+    if (rec) {
+        fa = malloc(sizeof *fa * (n ? n : 1)), fb = malloc(sizeof *fb * (n ? n : 1));
+        float *d = malloc(sizeof *d * (n ? n : 1));
+        for (uint32_t i = 0; i < n; i++) fa[i] = fb[i] = i, d[i] = -1.0f;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t r = lightmap_root(up, i);
+            float e[3] = {pos[i][0] - pos[r][0], pos[i][1] - pos[r][1], pos[i][2] - pos[r][2]};
+            float dd = e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
+            if (dd > d[r]) d[r] = dd, fa[r] = i;
+        }
+        for (uint32_t i = 0; i < n; i++) d[i] = -1.0f;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t r = lightmap_root(up, i);
+            const float *a = pos[r], *c = pos[fa[r]];
+            float e[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]}, q[3] = {pos[i][0] - a[0], pos[i][1] - a[1], pos[i][2] - a[2]};
+            float x[3] = {e[1] * q[2] - e[2] * q[1], e[2] * q[0] - e[0] * q[2], e[0] * q[1] - e[1] * q[0]};
+            float dd = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+            if (dd > d[r]) d[r] = dd, fb[r] = i;
+        }
+        free(d);
+    }
     // Each surface's bounds, in texels: its coordinates are at texel centres.
     float(*box)[4] = malloc(sizeof *box * (n ? n : 1));
     for (uint32_t i = 0; i < n; i++) box[i][0] = box[i][1] = INFINITY, box[i][2] = box[i][3] = -INFINITY;
@@ -5178,14 +6034,17 @@ static struct lightmap_page *lightmap_for(struct d3d_state *s, struct element *e
                         lightmap_clashes++;
                     }
                 }
-            if ((uint32_t)cx0 < p->dirty[0]) p->dirty[0] = (uint32_t)cx0;
-            if ((uint32_t)cy0 < p->dirty[1]) p->dirty[1] = (uint32_t)cy0;
-            if ((uint32_t)cx1 > p->dirty[2]) p->dirty[2] = (uint32_t)cx1;
-            if ((uint32_t)cy1 > p->dirty[3]) p->dirty[3] = (uint32_t)cy1;
+            lightmap_dirty(p->dirty, cx0, cy0, cx1, cy1);
+            lightmap_dirty(p->rb_dirty, cx0, cy0, cx1, cy1);
         }
         lightmap_surfaces += fresh;
+        if (rec && fresh) {
+            uint16_t r[4] = {(uint16_t)x0, (uint16_t)y0, (uint16_t)x1, (uint16_t)y1};
+            uint32_t three[3] = {i, fa[i], fb[i]};
+            lightmap_rebake_note(p, r, sx, sy, step ? 4 : 1, (const float(*)[3])pos, (const float(*)[2])uv, three);
+        }
     }
-    free(box), free(uv), free(dv), free(up), free(corner);
+    free(box), free(uv), free(dv), free(pos), free(fa), free(fb), free(up), free(corner);
     return p;
 }
 
@@ -5292,6 +6151,85 @@ static struct prop_swap *prop_swap_for(struct d3d_state *s, struct element *el, 
     return p->nidx ? p : NULL;
 }
 
+// Props remodelled (prop_remodel.c): a mesh whose triangles are exactly one a remodel
+// was made for, drawn as the remodel in any pass. Looked up once per vertex and index
+// range, of static buffers only (the game rewrites dynamic ones every frame), and only
+// for draws of a listed mesh's size; NULL for anything else.
+static NSMutableDictionary<NSData *, NSValue *> *remodel_swaps;
+
+static struct prop_swap *remodel_swap_for(struct d3d_state *s, struct element *el, int nel, uint32_t start,
+                                          uint32_t count, int32_t base_vertex)
+{
+    if (env_remodel_off || !s->indices || (s->indices->usage & 0x200) || nel > 32 || !prop_remodel_listed(count))
+        return NULL;
+    struct prop_elem pel[32];
+    struct {
+        void *vb[16];
+        uint32_t off[16], stride[16], rewrites[16];
+        void *ib;
+        uint32_t start, count, sample[16];
+        int32_t base;
+    } key;
+    memset(&key, 0, sizeof key);
+    for (int i = 0; i < nel; i++) {
+        int b = el[i].stream;
+        if (b >= 16) return NULL;
+        pel[i] = (struct prop_elem){el[i].stream, el[i].offset, el[i].type, el[i].usage, el[i].index};
+        struct obj *v = s->stream[b];
+        if (!v || !v->mem || (v->usage & 0x200) || v->rewrites >= 8 || v->dirty || !s->stream_stride[b]) return NULL;
+        key.vb[b] = v, key.off[b] = s->stream_offset[b], key.stride[b] = s->stream_stride[b];
+        key.rewrites[b] = (uint32_t)v->rewrites;
+    }
+    struct obj *ibo = s->indices;
+    int is32 = ibo->format == 102;  // D3DFMT_INDEX32
+    uint32_t isz = is32 ? 4 : 2, ni = count * 3;
+    if (!ibo->mem || (uint64_t)start * isz + (uint64_t)ni * isz > ibo->size) return NULL;
+    const uint8_t *ip = (const uint8_t *)bl_g2h(ibo->mem) + (size_t)start * isz;
+#define IDX(i) (is32 ? ((const uint32_t *)ip)[i] : ((const uint16_t *)ip)[i])
+    for (int i = 0; i < 16; i++) key.sample[i] = IDX((uint32_t)i * (ni - 1) / 15);  // as prop_swap_for
+    key.ib = ibo, key.start = start, key.count = count, key.base = base_vertex;
+    NSData *kd = [NSData dataWithBytes:&key length:sizeof key];
+    if (!remodel_swaps) remodel_swaps = [NSMutableDictionary new];
+    NSValue *hit = remodel_swaps[kd];
+    if (hit) {
+        struct prop_swap *p = hit.pointerValue;
+        return p->nidx ? p : NULL;
+    }
+    struct prop_swap *p = calloc(1, sizeof *p);
+    remodel_swaps[kd] = [NSValue valueWithPointer:p];
+    uint32_t *idx = malloc(sizeof *idx * ni);
+    if (!idx) return NULL;
+    for (uint32_t i = 0; i < ni; i++) idx[i] = (uint32_t)(base_vertex + (int32_t)IDX(i));
+#undef IDX
+    struct prop_in in = {.el = pel, .nel = nel, .idx = idx, .ntris = count};
+    for (int i = 0; i < nel; i++) {
+        int b = el[i].stream;
+        struct obj *v = s->stream[b];
+        uint32_t off = s->stream_offset[b], st = s->stream_stride[b];
+        in.data[b] = (const uint8_t *)bl_g2h(v->mem) + off;
+        in.stride[b] = st, in.nverts[b] = v->size > off ? (v->size - off) / st : 0;
+    }
+    struct prop_out o;
+    char name[256];
+    if (prop_remodel(&in, &o, name, sizeof name)) {
+        for (int b = 0; b < 16; b++)
+            if (o.data[b])
+                p->vb[b] = [mtl newBufferWithBytes:o.data[b] length:(NSUInteger)o.nverts * in.stride[b]
+                                           options:MTLResourceStorageModeShared];
+        p->ib = [mtl newBufferWithBytes:o.idx length:(NSUInteger)o.nidx * 4 options:MTLResourceStorageModeShared];
+        p->nidx = o.nidx;
+        static NSMutableSet *logged;
+        if (!logged) logged = [NSMutableSet set];
+        if (![logged containsObject:@(name)]) {
+            [logged addObject:@(name)];
+            fprintf(stderr, "[remodel] %s: %u triangles drawn as %u\n", name, count, o.nidx / 3);
+        }
+    }
+    free(idx);
+    prop_smooth_free(&o);
+    return p->nidx ? p : NULL;
+}
+
 static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, uint32_t min_index, uint32_t nverts,
                         uint32_t start, uint32_t count, int indexed);
 
@@ -5306,7 +6244,8 @@ void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
         struct element el[64];
         int nel = vertex_elements(s, el, 64);
         hs = hair_swap_for(s, el, nel, start, count, base_vertex);
-        if (!hs) ps = prop_swap_for(s, el, nel, start, count, base_vertex);
+        if (!hs) ps = remodel_swap_for(s, el, nel, start, count, base_vertex);
+        if (!hs && !ps) ps = prop_swap_for(s, el, nel, start, count, base_vertex);
         if (!hs && !ps) lightmap_draw = lightmap_for(s, el, nel, start, count, base_vertex);
     }
     lightmap_note_missed(s);
@@ -5674,7 +6613,9 @@ static void next_frame(void)
     if (gpu_stats < 0) gpu_stats = getenv("BL_GPU_STATS") != NULL;
     int stats = gpu_stats;
     unsigned long frame = frames;
+    int slot = frame_slot, pstats = gpu_pass_stats > 0;
     [command_buffer() addCompletedHandler:^(id<MTLCommandBuffer> b) {
+      if (pstats) pass_stats_done(slot, frame);
       if (stats) {  // BL_GPU_STATS=1: mean GPU time per frame, every 100 frames
           static double sum;
           static int n;
@@ -5685,9 +6626,12 @@ static void next_frame(void)
     }];
     [cmd commit];
     cmd = nil;
+    uint64_t t0 = hitch_now();
     dispatch_semaphore_wait(in_flight, DISPATCH_TIME_FOREVER);
+    hitch_wait_ns += hitch_now() - t0;
     frame_slot = (frame_slot + 1) % FRAMES_IN_FLIGHT;
     chunk_index = chunk_used = 0;
+    pass_count[frame_slot] = 0;
 }
 
 // Frame pacing. The game is capped at fps_max (its physics and scripts expect 60), but
@@ -5750,7 +6694,7 @@ static void hdr_draw(id<MTLTexture> pic, id<MTLTexture> world, id<MTLTexture> ou
     rp.colorAttachments[0].texture = out;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> e = [command_buffer() renderCommandEncoderWithDescriptor:rp];
+    id<MTLRenderCommandEncoder> e = stat_render(rp, __func__);
     [e setRenderPipelineState:ssr_pipeline(3, out.pixelFormat, MTLPixelFormatInvalid)];
     [e setFragmentTexture:pic atIndex:0];
     [e setFragmentTexture:world ? world : pic atIndex:1];
@@ -5806,10 +6750,17 @@ static void menu_bars(id<MTLTexture> t, float squeeze)
 
 void d3d_render_present(struct d3d_state *s)
 {
+    hitch_present_start = hitch_now();
     static uint32_t lightmap_logged;
     if (lightmap_reads != lightmap_logged && frames % 300 == 0) {
         fprintf(stderr, "[metal] lightmaps: %lu pages, %u surfaces, %u texels claimed twice, %u draws read\n",
                 (unsigned long)lightmap_pages.count, lightmap_surfaces, lightmap_clashes, lightmap_reads);
+        if (env_rebake)
+            fprintf(stderr,
+                    "[metal] rebake: %s, %u faces in, %u surfaces matched to none (%u no face with the corner, %u not all"
+                    " three corners, %u copies, %u off whole texels, %u off the page); encoding %s\n",
+                    rebake_now ? "baked" : "not baked yet", rebake_faces, rebake_missed, rebake_why[0], rebake_why[1],
+                    rebake_why[2], rebake_why[3], rebake_why[4], rebake_learnt ? "learnt" : "not learnt");
         lightmap_logged = lightmap_reads;
     }
     ensure_device();
@@ -5826,6 +6777,7 @@ void d3d_render_present(struct d3d_state *s)
     taa_frame_end();
     flush_clears(s);
     shadow_frame_start();
+    gi_frame_start();
     frames++;
     bl_cocoa_script_input(frames, game_window);
     struct obj *bb = s->back_buffer;
@@ -5907,6 +6859,30 @@ void d3d_render_present(struct d3d_state *s)
                     shaders_early, (unsigned long long)build_count[0], build_ns[0] / 1e6,
                     (unsigned long long)build_count[1], build_ns[1] / 1e6);
     }
+    if (env_hitch > 0) {
+        static uint64_t last;
+        uint64_t now = hitch_now();
+        double ms = last ? (now - last) / 1e6 : 0;
+        // And every 100 frames, the mean frame and the part of it not waiting for the GPU.
+        static double sum_ms, sum_wait;
+        static int counted;
+        sum_ms += ms, sum_wait += hitch_wait_ns / 1e6, counted++;
+        if (frames % 100 == 0) {
+            fprintf(stderr, "[cpu] frames to %lu: %.2f ms a frame, %.2f of it not waiting for the GPU\n", frames,
+                    sum_ms / counted, (sum_ms - sum_wait) / counted);
+            sum_ms = sum_wait = 0, counted = 0;
+        }
+        if (ms > env_hitch)
+            fprintf(stderr,
+                    "[hitch] frame %lu: %.1f ms (shaders %.1f, textures %.1f of which PBR maps %.1f, normal maps %.1f; "
+                    "waiting for the GPU %.1f, present %.1f; %lu draws)\n",
+                    frames, ms, frame_build_ns / 1e6, hitch_tex_ns / 1e6, hitch_pbr_ns / 1e6, hitch_detail_ns / 1e6,
+                    hitch_wait_ns / 1e6, (now - hitch_present_start) / 1e6, frame_draws);
+        last = now;
+    }
+    hitch_tex_ns = hitch_pbr_ns = hitch_detail_ns = hitch_wait_ns = 0;
+    void bl_hitch_frame(unsigned long frame);
+    bl_hitch_frame(frames);
     frame_build_ns = 0;
     if (frames == 1 || frames % 100 == 0)
         fprintf(stderr, "[d3d9] frame %lu: %lu draws (%lu total), %d perspective\n", frames, frame_draws, draws, last_3d);
@@ -5956,7 +6932,7 @@ void d3d_render_present_pixels(const void *pixels, uint32_t w, uint32_t h, int b
         rp.colorAttachments[0].loadAction = MTLLoadActionClear;
         rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        [[command_buffer() renderCommandEncoderWithDescriptor:rp] endEncoding];
+        [stat_render(rp, __func__) endEncoding];
     }
     // Overwriting src while the GPU still reads the previous frame from it would tear
     // that frame; at movie frame rates the GPU has long finished.
@@ -6067,7 +7043,18 @@ void d3d_render_color_fill(struct obj *surf, uint32_t rect, uint32_t color)
 void d3d_image_changed(struct obj *surface)
 {
     surface->dirty = 1;
-    if (surface->owner && surface->owner->type != OBJ_DEVICE) surface->owner->dirty = 1;
+    struct obj *tex = surface->owner;
+    if (tex && tex->type != OBJ_DEVICE) tex->dirty = 1;
+    // A texture's top level, filled while the map loads: its upscale and normal map start
+    // loading now on other threads, not one by one when first drawn. Only its first fill: one
+    // filled again and again (a texture the game draws into) is not one of the files.
+    if (mtl && tex && tex->type == OBJ_TEXTURE && tex->nsubs && tex->subs[0] == surface && !(tex->usage & 0x200) &&
+        surface->mem && !env_prefetch_off && !tex->prefetched++) {
+        const uint8_t *data = bl_g2h(surface->mem);
+        if (!env_upscale_off) bl_hires_prefetch(mtl, tex->width, tex->height, tex->format, data, surface->pitch);
+        pbr_prefetch(tex->width, tex->height, tex->format, data, surface->pitch);
+        if (env_detail > 0) bl_detail_prefetch(mtl, tex->width, tex->height, tex->format, data, surface->pitch);
+    }
 }
 
 void d3d_buffer_changed(struct obj *buffer) { buffer->dirty = 1; }

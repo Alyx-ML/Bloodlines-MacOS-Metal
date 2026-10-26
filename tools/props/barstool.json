@@ -1,0 +1,9 @@
+{
+  "model": "models/scenery/furniture/barstool/barstool.mdl",
+  "tolerance": 0.02,
+  "round": [
+    {"material": "barstoolsd", "at": [7.97, 15.17], "radius": 0.25},
+    {"material": "barstool", "at": [1.715, 7.68], "radius": 0.35},
+    {"material": "barstool", "at": [2.431, -11.19], "radius": 0.8}
+  ]
+}

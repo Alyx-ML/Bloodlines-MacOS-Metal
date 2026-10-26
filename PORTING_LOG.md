@@ -1895,3 +1895,277 @@ player's machine from their own game files (`BL_HAIR_MESH`, default on; 0 off).
   is tinted by it too. `BL_SSIL=albedo` shows it. `tests/shader_test` gained an
   info/albedo variant: 5388 compiled, 0 failed over the dumped shaders. Runtime built;
   not yet seen in the game.
+
+## 2026-10-26: lighting rebake, step 1: reading the maps' surfaces
+
+The plan: bake each map's lightmaps again on the GPU when it loads (sharper shadows, more
+luxels, several bounces, cached to disk), in place of the 2004 ones. Step 1 only reads
+what that needs; nothing is baked or drawn differently yet.
+
+- `bl_bsp.c` gains `bl_bsp_world_load`: from the map's .bsp (the player's own file, read
+  when the game opens it, as the volumetric light's lights already were) the vertices,
+  each face's corners (surfedges and edges), plane, texinfo (texture and lightmap axes,
+  flags), owning model, light styles, lightmap corner and size and its offset in the
+  lighting lump; the texture names and reflectivity (the mean colours the map compiler
+  bounced light with); every world light (point, spot, glowing surfaces, sun, sky); and
+  the lighting lump itself.
+- Bloodlines' VBSP 17 faces are 104 bytes: Half-Life 2's fields plus eight light styles
+  and eight day and eight night bytes, and a mean colour per style. Found by the face
+  lump's size (3193 x 104 in sm_asylum_1) and confirmed by the lightmaps: every lit
+  face's samples, (w + 1) x (h + 1) x styles, x 4 for bump-mapped faces, tile the
+  lighting lump exactly.
+- Two layouts: the maps the Unofficial Patch compiled again (27 of 209) hold each face's
+  mean colour per style just before its samples, as Half-Life 2's do; the original maps
+  do not. The reader tells them apart by which one fills the lump exactly
+  (`world->means`).
+- `bl_bsp_world_check`, also run at each map's load ("[bsp] ..." in the log), and
+  `tests/bsp_check`: each face's samples inside the lump, none overlapping, and every
+  corner's lightmap coordinate inside its lightmap. All 209 maps (101 original, 108 from
+  the Unofficial Patch) as expected; sm_asylum_1 has 3193 faces, 2991 lit and all
+  bump-mapped, and 448 lights (25 point, 47 spot, 376 glowing surfaces). No corner
+  falls outside its lightmap on any map.
+- Not read yet: displacements (8848 faces over all maps, the outdoor terrain), whose
+  lightmaps follow their grid; their lumps come with the bake. Not run in the game yet:
+  the runtime builds with the load-time check in it.
+
+## 2026-10-26: lighting rebake, step 2: the asylum baked on the GPU
+
+The first bake, outside the game: `runtime/d3d9/lm_bake.m` bakes a map's lightmaps again
+from its own lights and surfaces, and `tests/bake_view` compares them with the 2004 ones.
+Nothing in the game uses it yet (step 3).
+
+- Four times the luxels along each side (16 times as many), each placed on its face and
+  pulled inside the face's outline where the lightmap's grid runs past its edge.
+- Direct light as vrad works it out (point, spot and glowing-surface falloff, sun and sky
+  only where a ray reaches a sky face), for the flat light and the three bump directions.
+  Shadows are ray-traced with Metal's ray tracing (M1 runs it without hardware for it):
+  16 rays per light to points over a ball 6 units across, so shadow edges fade over a
+  few luxels instead of stepping.
+- Three bounces: 512 cosine-weighted rays per luxel read the light where they land from
+  the pass before, times that texture's reflectivity; each bounce is blurred within its
+  face over about one of the map's own luxels, which takes away the rays' speckle.
+- The occluders are the world's faces (not see-through ones or brush entities, as vrad
+  leaves them out). Brush entities' faces (doors, drapery, grates) are in their model's
+  own space: they are now placed at their entity's origin from the entity lump; before
+  that a quarter of the faces came out black.
+- A face's normal is its plane's as stored; the side byte belongs to the BSP node, and
+  flipping by it had turned ceilings to face up.
+- sm_asylum_1: 697,727 luxels, 5,677 occluding triangles, 440 lights, 3 bounces in
+  1.1 s on the M4 Pro. Against the 2004 lightmaps: 1.33 times as bright over the map by
+  area; per face a median of 1.12, quartiles 0.94 to 1.50.
+- `bake_view` draws six views with the texture's mean colour times the light (no
+  textures, normal maps or models), the old and new with the same exposure, into
+  `build/bake/`. The new: sharp spotlight pools on the bar top and floor, the light
+  fittings' pools on the walls, and shadows where the old had a smooth wash.
+- Not done: shadows from props (their models are in the game's archives), displacements,
+  and lights with a style (switching or flickering ones; style 0 only). Not run in the game.
+- Why the new bake is brighter (measured, not fixed): next to the lights the direct light
+  matches the old to within 0.8 to 1.2 times, so the falloff is right. The extra light is
+  where the 2004 bake had props in the way: static props cast shadows in it (their
+  collision models, .phy; flag 0x10 turns it off). In Jeanette's room a painting on the
+  wall leaves a sharp-edged dark patch where the art light behind the stage_light model
+  aims; the new bake lights the whole wall. 84 of the map's 440 lights sit within 32
+  units of a prop; faces those lights mostly light come out 1.42 times as bright, the
+  rest 1.19 (furniture also blocks bounced light). 33 of the map's 45 prop models cast
+  shadows, 26 of them with a .phy in the game's archives (the old IVP format, no "VPHY"
+  header). A flat scale-down would darken the places that already match.
+
+## 2026-10-26: lighting rebake: prop shadows
+
+- `runtime/bl_props.c`: the map's static props (game lump "sprp", version 4, 56 bytes a
+  prop), each one that casts shadows (flag 0x10 clear) placed with its collision model.
+  The .phy comes from the player's files: the mod's folder, then Vampire's, loose files
+  before pack*.vpk (Bloodlines' archives: the directory at the end, its count and offset
+  in the last 9 bytes). The .phy is the old IVP format: a 16-byte header, then per solid
+  its size and a compact surface ("IVPS" at 44, the ledge tree's offset at 32); the tree's
+  leaves are convex ledges, triangles over 16-byte points in metres with Havok's Y and Z
+  swapped and Y negated. Placed with Half-Life's AngleMatrix.
+- Checked against the old bake: the painting in Jeanette's room comes out 192 tall and 140
+  wide, 2.4 units off the wall, and its edges land within two units of the sharp dark
+  patch the 2004 lightmap has there.
+- The bake adds them to the ray tracing as one more unlit face: they block direct and
+  bounced light and give none back. sm_asylum_1: 103 props, 80 casting shadows, 36 of
+  those with a collision model, 996 triangles; the bake takes 1.0 s.
+- Brightness against the 2004 lightmaps: 1.15 over the map by area (was 1.33), direct
+  light alone 1.00; per face a median of 1.10, quartiles 0.94 to 1.47.
+- What is left, measured per light on luxels one light mostly lights: point lights come
+  out at 0.86 to 1.17 of the formula in the old bake; spot lights inside light fittings
+  that have no collision model are dimmer there (the bar's ceiling lights about 0.55, the
+  stage light in Jeanette's room close to 0). So vrad shaded those lights with the
+  fittings' visible meshes; the new bake lets them through. Their models are Bloodlines'
+  own .mdl version (2531, vertices in the .mdl, strips in the .dx80.vtx), not read yet.
+
+## 2026-10-26: lighting rebake: props without a collision model
+
+- `bl_props.c` now also reads Bloodlines' own models: .mdl version 2531 (names 128 bytes,
+  the vertices inside the .mdl in one of three formats: 44 bytes with float positions,
+  or 12 or 8 bytes with positions as 16-bit steps from the model's minimum) and
+  .dx80.vtx version 107 (Half-Life 2's layout but for 20-byte strip groups: a table of
+  16-bit vertex numbers and triangle lists). Checked: the painting's mesh has the same
+  bounds as its .phy and its .mdl hull; the stage light's mesh is 37 x 28 x 36 units
+  round its spot light.
+- The meshes alone did not match the 2004 bake: the stage light is open at its lens, so
+  its spot still lit the wall at three times the old brightness. Five rules were baked and
+  compared with the old lightmaps; the one that matches: box props (solid type 3) cast
+  their model's box (the hull at 0xb4 and 0xc0 in the .mdl), which closes the stage light
+  round its spot; others cast their .phy, and props with no .phy their visible mesh (the
+  bar tables, which bring the floor round them closer to the old). sm_asylum_1: 80 props
+  casting shadows, 34 as boxes, 35 by collision model, 11 by mesh; 3422 triangles.
+- The soft shadows' sample points round each light are now the same for every luxel (seeded
+  by the light), where they were drawn per luxel: lights at the edge of a prop's box had
+  left the walls speckled.
+- Brightness against the 2004 lightmaps: 1.07 over the map by area (1.15 with collision
+  models only, 1.33 with no props); direct light alone 0.93; per face a median of 1.07,
+  quartiles 0.92 to 1.44. The walls round the painting: 0.044 and 0.060 against the old
+  0.030 and 0.037 (were 0.094 and 0.119). The bake takes 1.0 s.
+- Still brighter than the old, not explained: the bar's ceiling lights' spots (about half
+  as bright in the old). Their fittings are thin discs above the lights, so neither box
+  nor mesh shades them.
+
+## 2026-10-26: lighting rebake, step 3: the rebake in the game ("Rebaked Lighting")
+
+- New Visual option "Rebaked Lighting" (BL_REBAKE, registry RebakedLighting, off by
+  default), the tenth box, under "Bounced Light".
+- The bake's grid now lines up with the game's lightmaps: (size + 1) x 4 luxels a side,
+  luxel x at lightmap s = mins + (x + 0.5) / 4 - 0.5, so each of the game's texels holds 4 x 4
+  of the bake's exactly (before: size x 4 + 1, corner to corner). sm_asylum_1: 982,640
+  luxels, 1.4 s; 1.05 times as bright as the 2004 lightmaps by area (was 1.07).
+- `bl_bsp` hands each map it reads over to the rebake (`bl_rebake_note_map`) instead of
+  freeing it; the renderer's first lightmapped draw with the option on starts the bake on
+  a thread of its own (`bl_rebake_get`), and a bake for a map no longer open is dropped.
+- The renderer (metal_render.m, "the lighting rebake in the game"): each surface it finds
+  on a lightmap page is noted with three corners (position and lightmap coordinates) and
+  matched to the map face with those corners whose lightmap, placed where the coordinates
+  say, starts on a whole texel. The face's bake goes into a page 4 times the size
+  (RGBA16Float), its rectangle is marked in a copy of the rectangles texture (x0 + 0x8000),
+  and the shader reads the big page there with the same cubic (`bl_lightmap_rebaked`).
+- The game's pages hold the light encoded (gamma, overbright). The encoding is learnt
+  from the pages: the map's own samples against the bytes the game wrote for them, the
+  mean linear light per byte and channel, from the first 4000 samples matched; the bake is
+  encoded back through it, between bytes where it falls between.
+- Left as the game has them: faces with a light style (switching and flickering lights),
+  displacements, and what dynamic lights add to the page. Needs the smooth lightmaps
+  (BL_LIGHTMAP_SMOOTH, on by default).
+- Verified: the runtime builds and links; `shader_test` compiles all 898 dumped shaders in
+  the lightmap and the rebake variants (7184 compiles, none failed). Not verified yet: the
+  matching, the encoding and the look in the game (the user's test). The log says
+  "[metal] rebake: the lightmaps' encoding learnt ..." and, every 300 frames, faces filled
+  and surfaces matched to none.
+- Fixes after the first test in the game (the user saw no change):
+  - The option box sat below the page's bottom edge; the right-hand column now starts one
+    row higher.
+  - No surface matched: every asylum face has the bump directions' samples, but the page
+    holds their copies only for bump-mapped materials, and the match asked for them.
+    Now 547 faces match in the first view, 7 surfaces match none (their corners are on no
+    face).
+  - The asylum came out magenta where it is green: the game adds dynamic light (the green
+    neon) to its page as it runs, which the map's samples do not hold (mean bytes red,
+    green, blue 20.5 21.3 10.5 on the page against 14.2 10.2 7.8 from the samples). The
+    rebake now goes in as a change: the page as the game has it, plus the bake encoded,
+    less the old samples encoded (a second texture at [[texture(17)]], the page's size), so
+    the dynamic light stays and the encoding's errors cancel. Each byte's light is now the
+    upper quarter of what is seen with it (dynamic light makes some texels brighter than
+    their samples), learnt only from texels the game did not scale down.
+- Verified: headless sm_asylum_1, frame 950 of one run each with BL_REBAKE=0 and 1
+  (build/bake/game/off_950.png, on5_950.png): the green neon stays, the counter front
+  shows the rebake's pools of light between the stools. But the user found it looks
+  awful: the floor and the counter front are blotched orange, green and purple where the
+  old light is an even green.
+- Why, measured against the 2004 lightmaps on the asylum's bump-mapped faces (56,868
+  luxels, the bake taken down to the game's size): each of the four sets is closest to
+  its own (so the bump directions are right), but they differ by 0.057 a luxel on a mean
+  of 0.124 (about half). More bounce rays (4096) or a wider blur change nothing, and the
+  direct light alone differs as much: the difference is in the direct light's shadows,
+  not noise. So the bake is not yet close enough to the old one, luxel by luxel, to swap
+  in; area-wide brightness (1.05) hid it. Debugging: BL_BAKE_RAYS, BL_BAKE_BLUR.
+- Shelved (the user's call): the "Rebaked Lighting" box is gone from the Visual tab and
+  the registry value is no longer read; the rebake runs only with BL_REBAKE=1, for working
+  on it. Off, nothing of it runs in the game: no bake starts and the lightmaps are read
+  as before. What it would need: the bake's direct light matched to vrad's light by light
+  and luxel by luxel (shadows above all), before it goes into the game again.
+
+## 2026-10-26: global illumination from light probes ("Global Illumination")
+
+- Rendered, not ray traced (M1 is the baseline): runtime/d3d9/gi_probes.m. When the game
+  opens a map, bl_bsp hands its surfaces over (bl_map_note, which also tells the shelved
+  rebake the path); on the first frame after, a thread captures probes: a grid 64 units
+  apart, a probe wherever the map is open (BSP leaf not solid, in a cluster) with a floor
+  within 160 units below, so only where models go. Each probe is six 16 x 16 views of the
+  map (its lightmaps on each texture's mean colour, glowing surfaces at their surface
+  lights' radiance, the sky at its ambient light's), drawn 341 probes per instanced draw
+  into the layers of one texture; a compute pass sums each probe's views per axis
+  direction into an ambient cube (and, kept for later, the map's point and spot lights
+  it can see). Probes that see much back face (inside a wall) are dropped.
+- Timing (tests/gi_view.m, M4 Pro): asylum 311 probes 0.07 s; Chinatown hub 9,477 1.0 s;
+  Hollywood hub 20,414 2.0 s; Santa Monica hub 23,207 2.7 s; downtown hub 16,293 3.4 s.
+  No cache needed; until a map's probes are ready its models keep the game's light.
+- Use (metal_render.m gi_light): the game lights models from the ambient cube in c21..c26
+  (640 of the 860 vertex shaders seen read it; the shader parser now records the constants
+  each shader reads). Its same-from-every-side part (the per-channel minimum over the six
+  sides: the lightmap under the model) is swapped for the probes' light at the model's
+  place (c48..c50 w: the model's or its first bone's), at the same mean brightness, so
+  each side takes the colour and share of the light from that way; the lights the game
+  folded into the cube stay. BL_GI, BL_GI_MIX, BL_GI_LOG; a tenth box on the Visual tab
+  (the column moved up a row). Not yet: static props and displacements in the captures.
+- Verified: builds; captures on five maps as above. Not yet seen in the game.
+- Stronger (the user's ask: the first version did not show): the whole cube now comes from
+  the probes, their surfaces' and lights' light together, each side at its share of the
+  probes' mean times the game's mean brightness (capped at four times it), mixed in by
+  BL_GI_MIX. Before and after pictures in build/gi/.
+
+## 2026-10-26: load times, hitches and GPU time
+
+Measured on the asylum (sm_asylum_1, M4 Pro, 1080p, headless runs one at a time).
+- Start-up and map load: FileSystem_Stdio's wildcard search matcher walked its file
+  tree with string work per entry; replaced by a native one (modules/README.md) along with
+  native strnicmp/stricmp signatures (crt/signatures.txt). Start-up before the movies
+  10.4 s to 1.0 s; the slowest frame while the map loads 6.3 s to 1.0 s; loading screen
+  to playing about 12 s to about 6 s.
+- Textures loaded ahead: when the game fills a texture's top level (d3d_image_changed,
+  first fill only), its upscale (tex_hires.m), PBR maps and character normal map
+  (tex_detail.m) start loading on other threads; the draws take them when ready, waiting
+  if one is still loading. The level's first frame spent 1.1 s on these, now about 40 ms.
+  BL_PREFETCH=0 turns it off. Same pictures with it on (checked at frame 950).
+- GPU: BL_GPU_STATS=2 times each pass (Metal counter samples at pass boundaries, each
+  pass charged from the end of the one before), named per shader for the haze, skin and
+  bounced light. 15.1 ms a frame to 11.4 ms:
+  - the haze (fog_scatter) takes each light only over the steps of the view ray it can
+    reach: inside its range, and where it could still add a 4096th of the haze. 3.0 to
+    1.3 ms; the picture is the same (only the bartender's animation and the HUD differ).
+  - the bounced light's trace reads its normals as RGBA8Snorm and its colour copy as
+    RG11B10Float instead of RGBA16Float (it reads them 24 times a pixel). 3.2 to 1.8 ms;
+    the picture differs by at most 1 level outside moving things.
+  What is left: the game's own passes 4.1 ms, the occlusion 0.8, TAA 0.6, the rest small.
+- CPU: getenv("BL_COM_BT") ran on every COM call when unset (bl_com_trace_c); the
+  character normal map lookup made a key string per draw (now a small table in front of
+  the cache).
+- Hitches: BL_HITCH=ms logs slow frames with the time in shaders, textures, PBR maps,
+  normal maps, waiting for the GPU and presenting; BL_HITCH_STACKS=ms (runtime/bl_hitch.c)
+  samples the game thread's stack every 2 ms through a slow frame. The few 30 to 90 ms
+  frames in the first seconds of the level are none of those: they are the game's own
+  code (engine, vampire.dll, StudioRender), about 40% of the samples in the x87 helpers.
+  Making those faster is its own piece of work (SR_INLINE=1 inlining was slower before).
+- Not yet checked on an M1, nor with a window (the user's test).
+
+## 2026-10-26: x87 speed-up looked into (no change kept)
+
+Measured on the Santa Monica hub (sm_hub_1, M4 Pro), headless, one run at a time.
+- The game caps itself at about 63 frames a second by spinning (fps_max): uncapped
+  (`+fps_max 1000`) and with the screen effects off, the game thread needs about 5.5 ms a
+  frame. BL_HITCH now also prints, every 100 frames, the mean frame time and the part not
+  spent waiting for the GPU.
+- Where that goes (5 s `sample` of steady play, the game thread's own time): translated
+  game code 68%, the x87 helpers 15%, the renderer about 8%, the rest system code. The
+  helpers' share was higher (about 40%) only in the busy first seconds of a level.
+- SR_INLINE=1 never inlined the helpers: they are compiled for apple-m1 and the translated
+  procs carry no target, so opt refuses ("conflicting target features"); the 2026-10-23
+  "6% slower" was the same calls to internal copies. An opt plugin that gave the procs the
+  helpers' target and told opt that guest memory and the CPU state never overlap (scoped
+  alias metadata; addresses made from a helper's returned pointer left alone) did inline
+  them all.
+- Result, uncapped hub with effects off: original 5.4 to 6.1 ms a frame; alias metadata
+  alone no change; inlined about the same in steady play and a few percent better in the
+  first seconds, within run-to-run noise. Kept the original build: no gain worth the risk
+  of a wrong alias assumption. The plugin's source is in build/analysis/guest_alias_pass.cpp.
+- What would help: the translated code's own speed (68%), not the x87 helpers. Even all
+  of the helpers' time is under 1 ms a frame here.
