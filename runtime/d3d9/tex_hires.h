@@ -12,3 +12,6 @@
 // bytes apart, or nil.
 id<MTLTexture> bl_hires_texture(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data,
                                 uint32_t pitch);
+// The game's name for the same top level ("materials/wood/floorb"), from names.txt, or
+// NULL. Cheap straight after bl_hires_texture for the same level.
+const char *bl_tex_name(uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch);

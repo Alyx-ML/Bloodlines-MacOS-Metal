@@ -39,7 +39,8 @@ struct d3d_shader_variant {
     uint8_t projected[D3D_SHADER_MAX_SAMPLERS];  // ps_1_x: divide texcoords by component 3 or 4 (0 = no)
     // Pixel: also write [[color(1)]] for screen-space reflections (metal_render.m ssr_run):
     // rgb what the shader's reflection cubemaps added to oc0, a how much a white cubemap
-    // would add (the mean over rgb); zero for shaders without one.
+    // would add (the mean over rgb); for shaders without one, 0 0 0 and the material's
+    // gloss (d3d_ps_params gloss).
     uint8_t reflection_info;
     // Pixel, with reflection_info: a character (metal_render.m skin_run) writes
     // [[color(1)]] as its light alone (the colour texture read as white) and -1, or
@@ -73,6 +74,11 @@ struct d3d_shader_variant {
     // reads become bl_lightmap, a smooth (Catmull-Rom) read kept inside the
     // surface's rectangle of the page, which [[texture(13)]] holds for each of its texels.
     uint8_t lightmap;
+    // Pixel: also write [[color(2)]] for the bounced light (metal_render.m ssil_run): the
+    // surface's own colour, the first 2D texture it reads that is not a lightmap or
+    // shadow (stage 0's with the fixed-function stages), alpha 1; mid grey for one that
+    // reads none.
+    uint8_t albedo;
 };
 
 // Soft shadows from the atlas (variant shadow_receiver): the atlas is seen as 8x8 cells
@@ -126,7 +132,8 @@ struct d3d_ps_params {
     uint32_t fog_mode;        // 0 off, 1 vertex (oFog), 2 linear, 3 exp, 4 exp2 (per pixel)
     float alpha_ref;
     uint32_t alpha_func;      // D3DCMPFUNC; 8 (ALWAYS) when alpha test is off
-    float pad[2];
+    float gloss;              // with reflection info and no cubemap: its a (metal_render.m material_gloss)
+    float pad;
 };
 
 // Fixed-function pixel stages (draws with no pixel shader): the texture stage states

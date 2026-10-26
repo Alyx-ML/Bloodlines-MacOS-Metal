@@ -1835,3 +1835,63 @@ player's machine from their own game files (`BL_HAIR_MESH`, default on; 0 off).
   lifted; fewer black streaks at the pigtail ends, fringe unchanged. The dark-speck count
   is not a reliable measure here (her pose differs between runs). Not verified: a window
   run.
+
+## 2026-10-26: bounced light (BL_SSIL), ported from Godot's SSIL
+
+- Light bounced off what is on screen onto what is near it, for colour the lightmaps
+  cannot carry: the bar's green neon on the floor and stools, club lights on walls and
+  people. A port of Godot 4.4's screen-space indirect lighting (Intel's ASSAO turned into
+  indirect light) with kubaofc123's changes (github.com/kubaofc123/
+  godot-feature-updated_screen_space_shaders: twice the taps, interleaved gradient noise,
+  a smaller sampling disk). MIT; the notices are in `metal_render.m`'s bounced light
+  section.
+- Godot's high preset: 12 taps of two samples, the longer ones reading the AO's smaller
+  depth copies (now made once a frame for both, `ao_depth_copies`), depth edges, haloing
+  reduction, and two edge-aware blur passes after.
+- Differences from Godot: half resolution on the AO's view depth instead of four
+  deinterleaved layers (each pixel takes its layer's sample pattern); normals rebuilt from
+  that depth; this frame's world view as the colour (a half-resolution copy, mipmapped,
+  read at Godot's 1/32 level) rather than last frame's reprojected; no adaptive pass.
+  Godot multiplies the result by each surface's albedo, which the game's shaders do not
+  give, so `post_apply` uses the pixel's own hue at half brightness in its place.
+- "Bounced Light" check box on the Visual tab, under "Eye Adaptation", on until unticked
+  (registry value `BouncedLight`). `BL_SSIL=0|1|show` wins over it; `BL_SSIL_RADIUS`
+  (128 world units), `BL_SSIL_STRENGTH`, `BL_SSIL_BLUR` (2).
+- Verified: it builds, and the shaders compile offline with `xcrun metal`. Not verified:
+  how it looks, its strength, its cost, the check box's place on the page.
+- The user's window run, on and off in the bar: the change was hard to see (a little
+  warmth on the red walls and floor). The strength is now 1 (was 0.5), and under TAA the
+  noise pattern turns each frame (interleaved gradient noise offset by the frame, as in
+  Jimenez 2014) and the result is blended with last frame's along the camera's motion
+  vectors, kept within its 3x3 neighbourhood's range (`ssil_history`), so it is steadier.
+  Built and the shaders compile; not yet seen.
+- The user's next window run (the alcove by the bar, on and off): the bounce showed, but
+  as an even lift of the whole alcove (red walls lighting each other, green from the
+  floor), with little spill from the neon. Two changes: each sample reads the colour copy
+  at a level that grows with its distance, as the depth does (level 1 for the nearest, up
+  to Godot's 1/32 of the screen for the farthest), so thin neon strips are not averaged
+  away; and only light brighter than what the receiving pixel already has bounces
+  (per channel, against the colour copy at the pixel), because the lightmaps already hold
+  the bounce between the map's surfaces. Built and the shaders compile; not yet seen.
+- Two more, at the user's request. Cleaner edges: the half-resolution result is brought to
+  full resolution in its own pass (`ssil_upscale`), each of the four half-resolution
+  pixels around weighted by how close its view depth is to the full-resolution pixel's
+  (from the depth buffer), or the closest one where none is close, so a wall's bounce no
+  longer leaks onto the outline of a character in front. More than one bounce: last
+  frame's half-resolution result is added into the colour copy at half strength, tinted
+  as post_apply tints it and moved along the TAA motion vectors when TAA is on, so light
+  bounces on from what it lit and reaches round corners; each further bounce is halved
+  again, so it cannot build up. Skipped on a camera cut. Built and the shaders compile;
+  not yet seen.
+- The real surface colour, at the user's request, in place of the hue guessed from the
+  lit colour. With bounced light on, the world view's passes on the back buffer get a
+  third colour attachment (`albedo_texture`, RGBA8, cleared to 0 with the frame), and
+  every draw there that replaces the colour writes its surface's colour into it
+  (`d3d_shader_variant albedo`): for game shaders, the first plain 2D texture the shader
+  reads (lightmaps, shadow-atlas reads and cubemaps left out), sampled again at the same
+  coordinate after the body; for the fixed-function stages, stage 0's 2D texture; mid
+  grey for shaders that read none. Draws that blend keep what is there, like the
+  reflection info. post_apply multiplies the bounced light by it, and the second bounce
+  is tinted by it too. `BL_SSIL=albedo` shows it. `tests/shader_test` gained an
+  info/albedo variant: 5388 compiled, 0 failed over the dumped shaders. Runtime built;
+  not yet seen in the game.

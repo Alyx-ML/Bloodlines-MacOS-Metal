@@ -1,8 +1,7 @@
 // The upscaled textures' list (index.txt, written by tools/tex_pack.py) is one line per
 // original mipmap: the first 16 hex digits of the SHA-1 of its contents, its width and
-// height, and the texture's name. <name>.tex is "BLHR", then u32 format (the VTF number:
-// 13/14/15 DXT1/3/5, 0 for BGRA8), width, height and mipmap count, then the mipmaps,
-// largest first. The contents hashed are those the game gives a level: DXT blocks as
+// height, and the texture's name. <name>.tex is "BLHR", then u32 format (98, BC7 as
+// DXGI numbers it), width, height and mipmap count, then the mipmaps, largest first. The contents hashed are those the game gives a level: DXT blocks as
 // they are, 24- and 32-bit pixels as B, G, R, A bytes (A 255 without alpha).
 // names.txt (tools/tex_names.py) lists every texture in the game the same way: a texture
 // drawn without an upscale is logged by name once and added to build/logs/not_upscaled.txt,
@@ -131,10 +130,15 @@ static id<MTLTexture> load_texture(id<MTLDevice> dev, const char *name)
         fprintf(stderr, "[hires] %s is not an upscaled texture file\n", path);
         return nil;
     }
-    uint32_t fmt = h[1], w = h[2], ht = h[3], mips = h[4];
-    MTLPixelFormat pf = fmt == 13 ? MTLPixelFormatBC1_RGBA : fmt == 14 ? MTLPixelFormatBC2_RGBA
-                      : fmt == 15 ? MTLPixelFormatBC3_RGBA : MTLPixelFormatBGRA8Unorm;
-    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:ht
+    uint32_t w = h[2], ht = h[3], mips = h[4];
+    if (h[1] != 98) {
+        fclose(f);
+        fprintf(stderr, "[hires] %s is in an old format: run tools/tex_pack.py --force\n", path);
+        return nil;
+    }
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBC7_RGBAUnorm
+                                                                                 width:w
+                                                                                height:ht
                                                                              mipmapped:mips > 1];
     d.mipmapLevelCount = mips;
     d.usage = MTLTextureUsageShaderRead;
@@ -143,7 +147,7 @@ static id<MTLTexture> load_texture(id<MTLDevice> dev, const char *name)
     uint8_t *buf = NULL;
     for (uint32_t l = 0; t && l < mips; l++) {
         uint32_t lw = w >> l ? w >> l : 1, lh = ht >> l ? ht >> l : 1;
-        size_t row = fmt == 0 ? lw * 4 : (lw + 3) / 4 * (fmt == 13 ? 8 : 16), rows = fmt == 0 ? lh : (lh + 3) / 4;
+        size_t row = (lw + 3) / 4 * 16, rows = (lh + 3) / 4;
         buf = realloc(buf, row * rows);
         if (fread(buf, 1, row * rows, f) != row * rows) {
             fprintf(stderr, "[hires] %s is cut short\n", path);
@@ -157,12 +161,29 @@ static id<MTLTexture> load_texture(id<MTLDevice> dev, const char *name)
     return t;
 }
 
+// The last level hashed (bl_tex_name reuses it).
+static const uint8_t *last_data;
+static uint32_t last_w, last_h;
+static uint64_t last_key;
+
+const char *bl_tex_name(uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch)
+{
+    if (!loaded) load_list();
+    if (!nnames || w < 8 || h < 8) return NULL;
+    struct entry k = {.key = data == last_data && w == last_w && h == last_h ? last_key
+                                                                             : level_key(w, h, format, data, pitch)};
+    if (!k.key) return NULL;
+    struct entry *e = bsearch(&k, names, nnames, sizeof *names, by_key);
+    return e && e->w == w && e->h == h ? e->name : NULL;
+}
+
 id<MTLTexture> bl_hires_texture(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data,
                                 uint32_t pitch)
 {
     if (!loaded) load_list();
     if ((!nentries && !nnames) || w < 8 || h < 8) return nil;
     struct entry k = {.key = level_key(w, h, format, data, pitch)};
+    last_data = data, last_w = w, last_h = h, last_key = k.key;
     if (!k.key) return nil;
     struct entry *e = nentries ? bsearch(&k, entries, nentries, sizeof *entries, by_key) : NULL;
     if (!e || e->w != w || e->h != h) {

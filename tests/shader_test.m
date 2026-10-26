@@ -55,8 +55,10 @@ int main(int argc, char **argv)
             vars[3].projected[i] = 3, vars[4].projected[i] = 4;
         }
         for (int i = 0; i < D3D_SHADER_MAX_INPUTS; i++) vars[1].input_kind[i] = D3D_IN_UINT, vars[2].input_kind[i] = D3D_IN_SINT;
-        static const char *const names[] = {"default", "cube/uint", "volume/sint", "projected3", "projected4", "?"};
-        for (int k = 0; k < 5; k++) {
+        vars[5].reflection_info = vars[5].albedo = 1;
+        static const char *const names[] = {"default", "cube/uint", "volume/sint", "projected3", "projected4",
+                                            "info/albedo"};
+        for (int k = 0; k < 6; k++) {
             char *msl = d3d_shader_msl(code, k ? &vars[k] : NULL, err, sizeof err);
             if (!msl) {
                 printf("FAIL translate %s (%s): %s\n", e->d_name, names[k], err);

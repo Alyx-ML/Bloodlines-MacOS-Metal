@@ -331,6 +331,8 @@ struct gen {
     // kept, which may mask the shine).
     int white_base;
     char base_coord[96];  // what stage 0's 2D texture is read with (for the detail normal map)
+    int alb_stage;        // the first plain 2D texture read, and its coordinate (variant albedo); -1 none yet
+    char alb_coord[96];
 };
 
 static const char comp[] = "xyzw";
@@ -523,6 +525,8 @@ static void sample(struct gen *g, uint32_t stage, const char *coord, const char 
         return;
     }
     if (stage == 0 && k == D3D_TEX_2D && !g->base_coord[0]) snprintf(g->base_coord, sizeof g->base_coord, "%s", coord);
+    if (k == D3D_TEX_2D && g->alb_stage < 0)
+        g->alb_stage = (int)stage, snprintf(g->alb_coord, sizeof g->alb_coord, "%s", coord);
     snprintf(buf, len, "tex%u.sample(smp%u, (%s).%s%s)", stage, stage, coord, k == D3D_TEX_2D ? "xy" : "xyz",
              extra ? extra : "");
 }
@@ -541,7 +545,7 @@ static const char *const header =
     "using namespace metal;\n"
     "struct BLVSParams { int4 i[16]; uint b[16]; float2 inv_viewport; float clip_y; float pad; };\n"
     "struct BLPSParams { int4 i[16]; uint b[16]; float4 bumpenv[8]; float4 bumpenv_l[8]; float4 fog_color;\n"
-    "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float pad0, pad1; };\n"
+    "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float gloss, pad1; };\n"
     "struct BLVSOut {\n"
     "    float4 pos [[position]]; float psize [[point_size]];\n"
     "    float4 d0 [[user(d0)]]; float4 d1 [[user(d1)]];\n"
@@ -1217,6 +1221,8 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         for (int i = 0; i < 4; i++)
             if (g.info.color_outputs & (1u << i)) put(o, "    float4 c%d [[color(%d)]];\n", i, i);
         if (info) put(o, "    float4 c1 [[color(1)]];\n");
+        int albedo = v && v->albedo && !(g.info.color_outputs & 4);
+        if (albedo) put(o, "    float4 c2 [[color(2)]];\n");
         if (g.info.writes_depth) put(o, "    float depth [[depth(any)]];\n");
         put(o, "};\n");
         put(o, "fragment BLPSOut bl_main(BLPSIn in [[stage_in]], constant float4 *c [[buffer(0)]],\n"
@@ -1271,7 +1277,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
             start(&g.ps, code, err, errlen);
         }
         ps_locals(&g);
-        g.base_coord[0] = 0;
+        g.base_coord[0] = 0, g.alb_stage = -1;
         if (gen_body(&g)) goto failed;
         if (g.ps.major == 1) line(o, "oc0 = r0;");
         if (g.env) line(o, "float3 _d = oc0.xyz - _e0, _w = _e1 - _e0;");
@@ -1288,7 +1294,10 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
                  detail && g.base_coord[0] ? (v->hair ? "-1.4" : "-1.25") : "-1.0");
         else if (info && v->skin) line(o, v->skin == 3 ? "out.c1 = float4(0.0, 0.0, 0.0, -3.0);" : "out.c1 = float4(0.0, 0.0, 0.0, -2.0);");
         else if (info && g.env) line(o, "out.c1 = float4(_d * _fog, (_w.x + _w.y + _w.z) * _fog / 3.0);");
-        else if (info) line(o, "out.c1 = 0;");
+        else if (info) line(o, "out.c1 = float4(0.0, 0.0, 0.0, p.gloss * _fog);");
+        if (albedo && g.alb_stage >= 0)
+            line(o, "out.c2 = float4(tex%d.sample(smp%d, (%s).xy).rgb, 1.0);", g.alb_stage, g.alb_stage, g.alb_coord);
+        else if (albedo) line(o, "out.c2 = float4(0.5, 0.5, 0.5, 1.0);");
         if (g.info.writes_depth) line(o, "out.depth = odepth;");
         line(o, "return out;");
         put(o, "}\n");
@@ -1371,10 +1380,13 @@ char *d3d_ff_ps_msl(const struct d3d_ff_ps *k, const struct d3d_shader_variant *
     struct out out = {0}, *o = &out;
     put(o, "%s", header);
     int info = v && v->reflection_info;
-    put(o, "struct BLPSOut { float4 c0 [[color(0)]];%s };\n", info ? " float4 c1 [[color(1)]];" : "");
+    int albedo = v && v->albedo;
+    put(o, "struct BLPSOut { float4 c0 [[color(0)]];%s%s };\n", info ? " float4 c1 [[color(1)]];" : "",
+        albedo ? " float4 c2 [[color(2)]];" : "");
     put(o, "fragment BLPSOut bl_main(BLPSIn in [[stage_in]], constant float4 *c [[buffer(0)]],\n"
            "                         constant BLPSParams &p [[buffer(1)]]");
     uint32_t samplers = d3d_ff_ps_samplers(k);
+    char alb[96] = "";  // stage 0's 2D texture read (variant albedo)
     for (int i = 0; i < 8; i++) {
         if (!(samplers & (1u << i))) continue;
         int kind = v && v->tex_kind[i] ? v->tex_kind[i] : D3D_TEX_2D;
@@ -1393,6 +1405,7 @@ char *d3d_ff_ps_msl(const struct d3d_ff_ps *k, const struct d3d_shader_variant *
             else if (proj == 4) snprintf(coord, sizeof coord, "(in.t%d / in.t%d.w)", tc, tc);
             else snprintf(coord, sizeof coord, "in.t%d", tc);
             line(o, "tex = tex%d.sample(smp%d, %s.%s);", i, i, coord, kind == D3D_TEX_2D ? "xy" : "xyz");
+            if (i == 0 && kind == D3D_TEX_2D) snprintf(alb, sizeof alb, "tex0.sample(smp0, %s.xy).rgb", coord);
         }
         char a[3][80], rgb[400], alpha[400];
         for (int j = 0; j < 3; j++) ff_arg(k->colorarg[i][j], 0, a[j], sizeof a[j]);
@@ -1421,7 +1434,8 @@ char *d3d_ff_ps_msl(const struct d3d_ff_ps *k, const struct d3d_shader_variant *
     if (v && v->shadow_caster) line(o, v->shadow_caster == 2 ? "oc0.w = in.pos.z;" : "oc0.w = 1.0 - in.pos.z;");
     line(o, "BLPSOut out;");
     line(o, "out.c0 = oc0;");
-    if (info) line(o, v->skin == 3 ? "out.c1 = float4(0.0, 0.0, 0.0, -3.0);" : v->skin ? "out.c1 = float4(0.0, 0.0, 0.0, -2.0);" : "out.c1 = 0;");
+    if (info) line(o, v->skin == 3 ? "out.c1 = float4(0.0, 0.0, 0.0, -3.0);" : v->skin ? "out.c1 = float4(0.0, 0.0, 0.0, -2.0);" : "out.c1 = float4(0.0, 0.0, 0.0, p.gloss * _fog);");
+    if (albedo) line(o, "out.c2 = float4(%s, 1.0);", alb[0] ? alb : "float3(0.5)");
     line(o, "return out;");
     put(o, "}\n");
     return o->s;

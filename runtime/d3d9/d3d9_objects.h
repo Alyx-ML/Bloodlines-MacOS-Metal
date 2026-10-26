@@ -36,6 +36,7 @@ struct obj {
     void *gpu;                 // renderer's texture or buffer (metal_render.m)
     int gpu_scale;             // gpu is this many times the size (the shadow atlas; 0 = 1)
     void *hires;               // upscaled texture drawn in place of gpu (tex_hires.h), or NULL
+    float gloss;               // textures: how much its material reflects (metal_render.m material_gloss)
     void *sound;               // DirectSound buffer state (dsound.c)
     int dirty;                 // guest memory changed since the last upload
     int rewrites;              // static vertex buffers: times rewritten after first use

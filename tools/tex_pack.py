@@ -18,9 +18,12 @@ Each PNG is matched to its texture by name, never by its look:
   - a PNG the size of the original is the export itself and is left alone.
 
 The new size is the original's times the largest power of two that fits the PNG (which
-must have the original's shape); the mipmaps are made from the PNG (Lanczos, alpha
-filtered apart from colour). DXT1/3/5 textures stay in their format, encoded by
-tools/dxt_encode.c (compiled into build/tools); 24- and 32-bit ones become BGRA8.
+must have the original's shape). Upscalers shift colours a little, so the PNG's colours
+are first matched to the original's: chaiNNer's wavelet colour fix (as in PBRify_Remix's
+"With Color Fix" chain), which keeps the PNG's fine detail and takes the broad colour from
+the original, with the edges wrapping as brush textures repeat. The mipmaps are made from
+the result (Lanczos, alpha filtered apart from colour) and stored as BC7, encoded by
+tools/bc7_encode.c (compiled into build/tools).
 
 Writes <out>/<name>.tex (see tex_hires.m), <out>/<name>.keys and <out>/index.txt: per
 texture, the SHA-1 of each of the original's three largest mipmaps as the game hands
@@ -46,7 +49,9 @@ sys.path.insert(0, HERE)
 import tex_extract  # noqa: E402
 
 FORMATS = {0: "RGBA8888", 2: "RGB888", 3: "BGR888", 12: "BGRA8888", 13: "DXT1", 14: "DXT3", 15: "DXT5"}
-ONEBITALPHA, ENVMAP = 0x1000, 0x4000
+ENVMAP = 0x4000
+BC7 = 98  # the .tex format: DXGI_FORMAT_BC7_UNORM
+WAVELETS = 5  # the colour fix's levels, as in PBRify_Remix's chain
 
 
 class Refused(Exception):
@@ -54,30 +59,51 @@ class Refused(Exception):
 
 
 def lib_path():
-    src = os.path.join(HERE, "dxt_encode.c")
-    out = os.path.join(HERE, "..", "build", "tools", "libdxt.dylib")
+    src = os.path.join(HERE, "bc7_encode.c")
+    out = os.path.join(HERE, "..", "build", "tools", "libbc7.dylib")
     if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(src):
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        subprocess.run(["clang", "-O2", "-shared", "-o", out, src], check=True)
+        subprocess.run(["clang", "-O3", "-shared", "-o", out, src], check=True)
     return out
 
 
 _lib = None
 
 
-def dxt(rgba, fmt, punch):
+def bc7(rgba):
     global _lib
     if _lib is None:
         _lib = ctypes.CDLL(LIB)
-        _lib.dxt_encode.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                    ctypes.c_char_p]
+        _lib.bc7_encode.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
     h, w = rgba.shape[:2]
     pw, ph = (w + 3) // 4 * 4, (h + 3) // 4 * 4
     if (pw, ph) != (w, h):  # mipmaps under 4 pixels: repeat the edge to fill the block
         rgba = np.pad(rgba, ((0, ph - h), (0, pw - w), (0, 0)), mode="edge")
-    out = ctypes.create_string_buffer(tex_extract.mip_size(pw, ph, fmt))
-    _lib.dxt_encode(np.ascontiguousarray(rgba).tobytes(), pw, ph, fmt, punch, out)
+    out = ctypes.create_string_buffer(pw * ph)
+    _lib.bc7_encode(np.ascontiguousarray(rgba).tobytes(), pw, ph, out)
     return out.raw
+
+
+def wavelet_low(a):
+    """What chaiNNer's wavelet colour fix keeps of an image's colour: its 3x3 binomial blur
+    applied WAVELETS times, the taps 1, 2, 4... pixels apart."""
+    for i in range(WAVELETS):
+        r, b = 1 << i, a * 0.25
+        for dy, dx, k in ((-r, 0, .125), (r, 0, .125), (0, -r, .125), (0, r, .125),
+                          (-r, -r, .0625), (-r, r, .0625), (r, -r, .0625), (r, r, .0625)):
+            b += k * np.roll(a, (dy, dx), (0, 1))
+        a = b
+    return a
+
+
+def colour_fix(o, img):
+    """The image with its fine detail and the original's broad colour."""
+    ref = Image.fromarray(tex_extract.decode(o["levels"][0], o["w"], o["h"], o["fmt"])).convert("RGB")
+    ref = np.asarray(ref.resize(img.size, Image.BOX), np.float32)
+    up = np.asarray(img.convert("RGB"), np.float32)
+    fixed = Image.fromarray(np.clip(up - wavelet_low(up) + wavelet_low(ref) + 0.5, 0, 255).astype(np.uint8), "RGB")
+    fixed.putalpha(img.getchannel("A"))
+    return fixed
 
 
 def mip_dims(w, h, mips):
@@ -137,19 +163,15 @@ def keys(o, name):
 
 
 def build(o, img):
-    """The .tex file for the image: the original's DXT format, or BGRA8."""
+    """The .tex file for the image, in BC7."""
     w, h = img.width, img.height
-    fmt = o["fmt"] if o["fmt"] in (13, 14, 15) else 0
     mips = max(w, h).bit_length()
     rgb, alpha = img.convert("RGB"), img.getchannel("A")
-    out = [b"BLHR" + struct.pack("<4I", fmt, w, h, mips)]
+    out = [b"BLHR" + struct.pack("<4I", BC7, w, h, mips)]
     for mw, mh in mip_dims(w, h, mips):
         lv = np.dstack([np.asarray(rgb.resize((mw, mh), Image.LANCZOS) if (mw, mh) != (w, h) else rgb),
                         np.asarray(alpha.resize((mw, mh), Image.LANCZOS) if (mw, mh) != (w, h) else alpha)])
-        if fmt:
-            out.append(dxt(lv, fmt, int(bool(o["flags"] & ONEBITALPHA))))
-        else:
-            out.append(np.ascontiguousarray(lv[..., [2, 1, 0, 3]]).tobytes())
+        out.append(bc7(lv))
     return b"".join(out)
 
 
@@ -182,14 +204,13 @@ def pack(job):
         tw, th = target_size(o, img)
         if (tw, th) != img.size:
             img = img.resize((tw, th), Image.LANCZOS)
-        tex = build(o, img)
+        tex = build(o, colour_fix(o, img))
         os.makedirs(os.path.dirname(tex_out), exist_ok=True)
         with open(tex_out, "wb") as f:
             f.write(tex)
         with open(keys_out, "w") as f:
             f.write(keys(o, name))
-        fmt = FORMATS[o["fmt"]] if o["fmt"] in (13, 14, 15) else f"{FORMATS[o['fmt']]} as BGRA8"
-        return name, f"{o['w']}x{o['h']} -> {tw}x{th} {fmt}", None
+        return name, f"{o['w']}x{o['h']} {FORMATS[o['fmt']]} -> {tw}x{th} BC7", None
     except Refused as e:
         return name, None, f"{os.path.basename(png)}: {e}"
 
