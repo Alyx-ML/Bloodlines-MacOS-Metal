@@ -12,3 +12,7 @@ loc_1000F7E0,GameUI_CvarToggle_Reset
 loc_10025280,GameUI_PropertyPage_ctor
 loc_10023730,GameUI_Label_ctor
 loc_100220E0,GameUI_Frame_SetMinimizeButtonVisible
+loc_1001FB70,GameUI_Surface
+loc_1001FB50,GameUI_Input
+loc_10023B50,GameUI_Label_GetText
+loc_1001FBA0,GameUI_IPanel

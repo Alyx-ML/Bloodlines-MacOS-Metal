@@ -970,7 +970,7 @@ void d3d_render_shader_created(struct obj *o)
 
 // Internal shaders: partial clears.
 static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelFormat depth, uint32_t mask, int info);
-static id<MTLRenderPipelineState> stretch_pipeline(MTLPixelFormat color);
+static id<MTLRenderPipelineState> stretch_pipeline(MTLPixelFormat color, int blend);
 
 // --- vertex input --------------------------------------------------------------------
 
@@ -1607,6 +1607,7 @@ static id<MTLTexture> surface_texture(id<MTLTexture> color)
 
 static id<MTLTexture> hdr_world;
 static unsigned long hdr_world_frame;
+static int pause_seen, pause_frame;  // the pause menu painted this frame, the last
 
 static BLRender *pass(struct d3d_state *s)
 {
@@ -1698,9 +1699,9 @@ static BLRender *pass(struct d3d_state *s)
         if (info) d.colorAttachments[1].loadAction = MTLLoadActionLoad;
         enc = stat_render(d, __func__);
     }
-    if (world_end && env_hdr) {
+    if (world_end) {
         // A copy of the finished world view, before the view model and HUD: what
-        // hdr_present may brighten.
+        // hdr_present may brighten, and what the pause menu shows behind it.
         [enc endEncoding];
         id<MTLTexture> ct = target_texture(color);
         hdr_world = ao_texture(7, ct.pixelFormat, ct.width, ct.height);
@@ -1992,7 +1993,8 @@ static id<MTLRenderPipelineState> clear_pipeline(MTLPixelFormat color, MTLPixelF
 
 // Scaled StretchRect: one triangle covering the destination rectangle (set as the
 // viewport) samples the source rectangle. p = {u0, v0, u1, v1} in normalized coordinates.
-static id<MTLRenderPipelineState> stretch_pipeline(MTLPixelFormat color)
+// With blend, the source (premultiplied alpha) is laid over the destination.
+static id<MTLRenderPipelineState> stretch_pipeline(MTLPixelFormat color, int blend)
 {
     static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *cache;
     static id<MTLLibrary> lib;
@@ -2011,13 +2013,19 @@ static id<MTLRenderPipelineState> stretch_pipeline(MTLPixelFormat color)
         lib = [mtl newLibraryWithSource:src options:nil error:&error];
         if (!lib) bl_fatal("stretch shader: %s", error.localizedDescription.UTF8String);
     }
-    NSNumber *key = @(color);
+    NSNumber *key = @(color * 2 + (blend != 0));
     id<MTLRenderPipelineState> p = cache[key];
     if (p) return p;
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = [lib newFunctionWithName:@"stretch_vs"];
     d.fragmentFunction = [lib newFunctionWithName:@"stretch_fs"];
     d.colorAttachments[0].pixelFormat = color;
+    if (blend) {
+        d.colorAttachments[0].blendingEnabled = YES;
+        d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        d.colorAttachments[0].destinationRGBBlendFactor = d.colorAttachments[0].destinationAlphaBlendFactor =
+            MTLBlendFactorOneMinusSourceAlpha;
+    }
     NSError *error = nil;
     p = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
     if (!p) bl_fatal("stretch pipeline: %s", error.localizedDescription.UTF8String);
@@ -2025,7 +2033,8 @@ static id<MTLRenderPipelineState> stretch_pipeline(MTLPixelFormat color)
     return p;
 }
 
-static void stretch_draw(id<MTLTexture> a, const uint32_t sr[4], id<MTLTexture> b, const uint32_t dr[4], int linear)
+static void stretch_draw_ex(id<MTLTexture> a, const uint32_t sr[4], id<MTLTexture> b, const uint32_t dr[4], int linear,
+                            int blend)
 {
     if (a == b) {  // a pass cannot sample its own target: copy the source first
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:a.pixelFormat
@@ -2044,7 +2053,7 @@ static void stretch_draw(id<MTLTexture> a, const uint32_t sr[4], id<MTLTexture> 
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     BLRender *e = stat_render(rp, __func__);
-    [e setRenderPipelineState:stretch_pipeline(b.pixelFormat)];
+    [e setRenderPipelineState:stretch_pipeline(b.pixelFormat, blend)];
     [e setViewport:(MTLViewport){dr[0], dr[1], dr[2] - dr[0], dr[3] - dr[1], 0, 1}];
     float p[4] = {(float)sr[0] / a.width, (float)sr[1] / a.height, (float)sr[2] / a.width, (float)sr[3] / a.height};
     [e setVertexBytes:p length:sizeof p atIndex:0];
@@ -2060,6 +2069,11 @@ static void stretch_draw(id<MTLTexture> a, const uint32_t sr[4], id<MTLTexture> 
     [e setFragmentSamplerState:samp[linear] atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
+}
+
+static void stretch_draw(id<MTLTexture> a, const uint32_t sr[4], id<MTLTexture> b, const uint32_t dr[4], int linear)
+{
+    stretch_draw_ex(a, sr, b, dr, linear, 0);
 }
 
 // --- shadows -----------------------------------------------------------------------------
@@ -2480,7 +2494,7 @@ static void note_projection(const float r8[4], const float r9[4], const float r1
 // world view).
 static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h)
 {
-    static id<MTLTexture> t[19];
+    static id<MTLTexture> t[21];
     if (!t[i] || t[i].width != w || t[i].height != h || t[i].pixelFormat != pf) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h
                                                                                  mipmapped:NO];
@@ -5149,7 +5163,7 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
     // stretch.
     float squeeze = 1;
     float target_aspect = rtt.height ? (float)rtt.width / (float)rtt.height : 0;
-    if (env_widescreen && menu_frame && to_back_buffer && target_aspect > 4.0f / 3.0f + 0.01f)
+    if (env_widescreen && menu_frame && !pause_frame && to_back_buffer && target_aspect > 4.0f / 3.0f + 0.01f)
         squeeze = (4.0f / 3.0f) / target_aspect, frame_squeeze = squeeze;
     if (env_widescreen && aspect > 4.0f / 3.0f + 0.01f && perspective && squeeze == 1) {
         float proj = 0;
@@ -6972,6 +6986,123 @@ static void present(id<CAMetalDrawable> drawable)
     present_paced = paced_present();
 }
 
+// The gothic menus (runtime/bl_menu.c, the pause menu; runtime/bl_options.c, the options
+// dialog) have the game behind them, darkened and reddened, as in the mockups: the last
+// world view (hdr_world, without the view model and HUD), softened through a quarter-size
+// copy, under an overlay with the mockup's layers: a dark red gradient, a faint red glow
+// behind the menu, a vignette, and a red glow behind each highlighted label. The menu asks
+// for it when it paints (bl_metal_backdrop), so it goes over the HUD and anything else
+// drawn before, and its frames stay full width (no 4:3 bars). Without a level there is no
+// world to show and the overlay darkens what is behind. The overlay is drawn in software at
+// a quarter of the size, again only when the screen, the style or the glows change.
+#define PAUSE_GLOWS 4
+static struct d3d_state *pause_state;  // the device's state, from the last present
+static int pause_style, pause_world, pause_nglow, pause_glow[PAUSE_GLOWS][4];
+static void pause_backdrop(id<MTLTexture> t);
+
+void bl_metal_backdrop(int style, int world, const int (*glows)[4], int n)
+{
+    pause_seen = 1;
+    pause_style = style, pause_world = world, pause_nglow = n < PAUSE_GLOWS ? n : PAUSE_GLOWS;
+    memset(pause_glow, 0, sizeof pause_glow);
+    if (pause_nglow > 0) memcpy(pause_glow, glows, sizeof pause_glow[0] * pause_nglow);
+    struct d3d_state *s = pause_state;
+    if (!s || !s->back_buffer || s->render_target[0] != s->back_buffer) return;
+    flush_clears(s);
+    pause_backdrop(target_texture(s->back_buffer));
+}
+
+static void over(float *p, float r, float g, float b, float a)
+{
+    if (a <= 0) return;
+    a = fminf(a, 1);
+    p[0] = r / 255 * a + p[0] * (1 - a), p[1] = g / 255 * a + p[1] * (1 - a), p[2] = b / 255 * a + p[2] * (1 - a);
+    p[3] = a + p[3] * (1 - a);
+}
+
+static void pause_overlay(uint8_t *px, uint32_t w, uint32_t h, uint32_t fw, uint32_t fh)
+{
+    float u = fh / 1080.0f;  // the mockup's pixels
+    // Per style, the left-to-right gradient's stops (place, colour, alpha), and the red
+    // glow: its box, its centre, its radii (to the box's farthest corner) and its alpha.
+    static const float stops_for[2][4][5] = {
+        {{0, 10, 4, 5, .95f}, {.30f, 14, 3, 5, .88f}, {.62f, 46, 5, 10, .66f}, {1, 22, 3, 6, .72f}},
+        {{0, 10, 4, 5, .94f}, {.45f, 14, 3, 5, .86f}, {.80f, 40, 5, 9, .70f}, {1, 22, 3, 6, .74f}}};
+    static const float glow_for[2][9] = {{-200, 260, 900, 960, 240, 610, 933, 495, .3f},
+                                         {0, 200, 1400, 960, 490, 580, 1287, 537, .26f}};
+    const float(*stops)[5] = stops_for[pause_style != 0], *gl = glow_for[pause_style != 0];
+    for (uint32_t j = 0; j < h; j++) {
+        float y = (j + .5f) * fh / h;
+        for (uint32_t i = 0; i < w; i++) {
+            float x = (i + .5f) * fw / w, p[4] = {0, 0, 0, 0}, t = x / fw;
+            int k = t < stops[1][0] ? 0 : t < stops[2][0] ? 1 : 2;
+            float f = (t - stops[k][0]) / (stops[k + 1][0] - stops[k][0]);
+            over(p, stops[k][1] + (stops[k + 1][1] - stops[k][1]) * f, stops[k][2] + (stops[k + 1][2] - stops[k][2]) * f,
+                 stops[k][3] + (stops[k + 1][3] - stops[k][3]) * f, stops[k][4] + (stops[k + 1][4] - stops[k][4]) * f);
+            if (x > gl[0] * u && x < gl[2] * u && y > gl[1] * u && y < gl[3] * u) {
+                float dx = (x - gl[4] * u) / (gl[6] * u), dy = (y - gl[5] * u) / (gl[7] * u);
+                over(p, 140, 14, 26, gl[8] * (1 - sqrtf(dx * dx + dy * dy) / .65f));
+            }
+            float vx = (x - fw / 2.0f) / (fw * .7071f), vy = (y - fh / 2.0f) / (fh * .7071f), d = sqrtf(vx * vx + vy * vy);
+            over(p, 5, 2, 3, d < .35f ? 0 : d < .7f ? .55f * (d - .35f) / .35f : .55f + .37f * fminf((d - .7f) / .3f, 1));
+            for (int k = 0; k < pause_nglow; k++) {
+                const int *glow = pause_glow[k];
+                if (glow[2] <= glow[0]) continue;
+                float gx = (x - (glow[0] + glow[2]) / 2.0f) / ((glow[2] - glow[0]) / 2.0f + 22 * u);
+                float gy = (y - (glow[1] + glow[3]) / 2.0f) / ((glow[3] - glow[1]) / 2.0f + 22 * u);
+                float g = 1 - sqrtf(gx * gx + gy * gy);
+                if (g > 0) over(p, 224, 40, 58, .35f * g * g);
+            }
+            uint8_t *o = px + ((size_t)j * w + i) * 4;  // BGRA, premultiplied
+            o[0] = (uint8_t)lroundf(p[2] * 255), o[1] = (uint8_t)lroundf(p[1] * 255);
+            o[2] = (uint8_t)lroundf(p[0] * 255), o[3] = (uint8_t)lroundf(p[3] * 255);
+        }
+    }
+}
+
+static void pause_backdrop(id<MTLTexture> t)
+{
+    uint32_t fw = (uint32_t)t.width, fh = (uint32_t)t.height, full[4] = {0, 0, fw, fh};
+    if (hdr_world && pause_world) {
+        uint32_t ws[4] = {0, 0, (uint32_t)hdr_world.width, (uint32_t)hdr_world.height};
+        uint32_t hr[4] = {0, 0, fw / 2, fh / 2}, qr[4] = {0, 0, fw / 4, fh / 4};
+        id<MTLTexture> half = ao_texture(19, t.pixelFormat, fw / 2, fh / 2), quarter = ao_texture(20, t.pixelFormat, fw / 4, fh / 4);
+        stretch_draw(hdr_world, ws, half, hr, 1);
+        stretch_draw(half, hr, quarter, qr, 1);
+        stretch_draw(quarter, qr, t, full, 1);
+    }
+    uint32_t w = fw / 4, h = fh / 4;
+    if (!w || !h) return;
+    static uint8_t *px;
+    static uint32_t pw, ph;
+    static int made[2 + PAUSE_GLOWS * 4] = {-1}, want[2 + PAUSE_GLOWS * 4];
+    static unsigned long version, uploaded[FRAMES_IN_FLIGHT];
+    want[0] = pause_style, want[1] = pause_nglow;
+    memcpy(want + 2, pause_glow, sizeof pause_glow);
+    if (pw != w || ph != h || memcmp(made, want, sizeof made)) {
+        if (pw != w || ph != h) free(px), px = malloc((size_t)w * h * 4), pw = w, ph = h;
+        if (!px) return;
+        pause_overlay(px, w, h, fw, fh);
+        memcpy(made, want, sizeof made);
+        version++;
+    }
+    static id<MTLTexture> ring[FRAMES_IN_FLIGHT];
+    id<MTLTexture> img = ring[frame_slot];
+    if (!img || img.width != w || img.height != h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                     width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        img = ring[frame_slot] = [mtl newTextureWithDescriptor:td];
+        uploaded[frame_slot] = 0;
+    }
+    if (uploaded[frame_slot] != version) {
+        [img replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px bytesPerRow:w * 4];
+        uploaded[frame_slot] = version;
+    }
+    uint32_t sr[4] = {0, 0, w, h};
+    stretch_draw_ex(img, sr, t, full, 1, 1);
+}
+
 // Black bars either side of a menu narrowed to 4:3: the game's own clears and
 // backgrounds covered the whole width, so the bars may still hold an older frame.
 static void menu_bars(id<MTLTexture> t, float squeeze)
@@ -7040,6 +7171,8 @@ void d3d_render_present(struct d3d_state *s)
     }
     last_3d = frame_has_3d;
     menu_frame = !frame_has_3d;
+    pause_frame = pause_seen, pause_seen = 0;
+    pause_state = s;
     frame_has_3d = 0, frame_squeeze = 1;
     if (back && dump_this_frame(frames)) {
         const char *dir = getenv("BL_DUMP_DIR") ? getenv("BL_DUMP_DIR") : ".";

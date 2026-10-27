@@ -43,6 +43,40 @@ Write hand-made fixes here; the pipeline generates the rest.
   `bl_GameUI_HideUI`. The second replacement also holds `GameUI_Globals`, which returns the
   address of the globals at `0x1006C330`. `global_aliases.manual.sci` names `0x100220E0`
   (`GameUI_Frame_SetMinimizeButtonVisible`).
+- Gothic options screen, with `runtime/bl_options.c` (drawing in `runtime/bl_gothic.c`).
+  Layout, at the end of the game's own (each replaces the `pop esi` epilogue):
+  - `0x10018A4F` `COptionsDialog::PerformLayout` (`bl_options_DialogLayout`): the dialog
+    full screen, Cancel and OK at the bottom right;
+  - `0x1003F4C0` `PropertySheet::PerformLayout` (`bl_options_SheetLayout`): the tabs in a
+    row under the title, the page under them.
+  Each of these first instructions calls a native that may skip the rest of the routine:
+  - `0x10021A40` vgui `Frame::PaintBackground` (`bl_options_FrameBackground`): for the
+    options dialog, places the page's controls, has the renderer draw the darkened
+    backdrop, then draws the title, divider and hairlines; for a confirmation or message
+    box over it, a dark panel in a gold frame with its title;
+  - `0x10032BB0` `Button::Paint` (`bl_options_ButtonPaint`): tabs, buttons, tick boxes,
+    drop-down list items, list headers;
+  - `0x10023D80` `Label::Paint` (`bl_options_LabelPaint`): labels, notes, key list cells;
+  - `0x10036570` `Slider::PaintBackground` (`bl_options_SliderBackground`): the slider;
+  - `0x100271C0` `TextEntry::PaintBackground` (`bl_options_EntryBackground`): drop-down
+    boxes as "< value >";
+  - `0x10025A90` `ComboBox::OnMousePressed` (`bl_options_ComboPressed`): the arrows step
+    to the previous or next choice;
+  - `0x100402E0` `ScrollBarSlider::PaintBackground` (`bl_options_ScrollBackground`);
+  - `0x10034480` `Menu::Paint` (`bl_options_MenuPaint`): drop-down lists;
+  - `0x1001D130` `Panel::PaintBackground` (`bl_options_PanelBackground`): none, a red bar
+    for the key list's selected row;
+  - `0x1001D110` `Panel::PaintBorder`, `0x10025300` `PropertyPage::PaintBorder`,
+    `0x10035490` `ImagePanel::PaintBackground`, `0x10036040` `Slider::Paint` and
+    `0x10040200` `ScrollBarSlider::Paint` (`bl_options_Skip`): left out.
+  - `0x10010EBB` in `VControlsListPanel::Paint`, after the list (`bl_options_KeyCapture`):
+    a red box for the key being set; skipping jumps to the epilogue at `0x10011052`.
+  Only panels inside the dialog, or a box open over it, change. The first replacement also
+  holds `GameUI_OptionsVtable`, which returns `COptionsDialog`'s vtable (`0x10054694` in the
+  DLL); the module's data isn't at the DLL's addresses, so other classes' vtables are found
+  by their distance from it. `global_aliases.manual.sci` names `0x1001FB70`
+  (`GameUI_Surface`), `0x1001FB50` (`GameUI_Input`), `0x1001FBA0` (`GameUI_IPanel`) and
+  `0x10023B50` (`GameUI_Label_GetText`).
 
 ## engine
 Console Pause Fix 1.1.0 (Unofficial Patch's loader plugin), with `runtime/bl_console.c`:
@@ -89,6 +123,19 @@ Console Pause Fix 1.1.0 (Unofficial Patch's loader plugin), with `runtime/bl_con
 - `instruction_replacements.manual.sci`: vtmb-tweaks' bNoTracers, the `test eax, eax; je` at
   `0x10040998` that skips drawing a bullet tracer always jumps
   (`global_aliases.manual.sci` keeps its target `0x10040A4F` as code).
+- `instruction_replacements.manual.sci`: the gothic pause menu (`runtime/bl_menu.c`), in a
+  level only (menu state `0x10067850`, `client_MenuState`, not 0); the start-up menu is
+  unchanged. `CVMainMenu::Paint` (`0x10065AF0`) first calls `bl_menu_Layout`, which moves
+  the buttons under the logo. `PaintBackground` (`0x10065C40`) skips its black fill, and the
+  smoke's call at `0x10065BDC` (`client_MenuSmoke`) is replaced by `bl_menu_Smoke`, which
+  draws the gold divider and tells the renderer to put the darkened game behind the menu
+  (`pause_backdrop` in `runtime/d3d9/metal_render.m`). The logo's draw at `0x10065C15`
+  (`client_ImageDraw`) gets the mockup's place and size from `bl_menu_Logo`.
+  `CVMenuButton::Paint` (`0x100653B0`) asks `bl_menu_ButtonPaint`, which draws the item in
+  Cinzel capitals (a blood drop and an underline when hovered) and returns 1 to skip the
+  game's paint. `global_aliases.manual.sci` also names the surface getter `0x101AC8D0` and
+  the panel's SetPos and SetSize (`0x101A9890`, `0x101A98F0`). The font is
+  `assets/fonts/Cinzel.ttf` (OFL).
 
 ## vampire
 vtmb-tweaks (c6, github.com/c6-dev/vtmb-tweaks), Unofficial Patch's loader plugin, redone

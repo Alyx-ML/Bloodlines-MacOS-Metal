@@ -2696,3 +2696,89 @@ From the runtime audit of this date.
 - `tests/runtime_unit.c` (`tools/runtime_unit.sh`) checks the text conversion, mutexes, named objects, mouse motion and shader loops without game files. 24 of 24 checks pass.
 
 Not verified in the game. The runtime builds and `boot` links.
+
+## 2026-10-26: Gothic pause menu
+
+- New `runtime/bl_menu.c` restyles the in-game Esc menu to the approved mockup:
+  - the game's logo, smaller and at the top left;
+  - a thin gold divider with a diamond and a red dot;
+  - the items in spaced Cinzel capitals;
+  - on the hovered item, a blood drop, a red glow and an underline.
+- Behind it is the game itself, not the menu's red smoke. The renderer keeps the last world
+  view (before the gun and HUD) and draws it behind each pause menu frame. It is softened
+  and darkened with the mockup's layers: a dark gradient from the left, a faint red glow, a
+  vignette and the hovered item's glow (`pause_backdrop` in `metal_render.m`). Pause menu
+  frames stay full width, without the 4:3 bars.
+- The world copy used to be made only with HDR on. It is now made every frame: one
+  full-screen copy on the GPU.
+- The game's buttons still handle the mouse, sounds and actions. The start-up menu is
+  unchanged.
+- The first build drew the old menu's red smoke over the divider and kept the 4:3 layout
+  and big logo. The user rejected it: "nothing like what you gave me".
+- The second build showed the game behind the menu, but drew it at the start of the frame:
+  the HUD and crosshair came out on top, undarkened, and the tint was too light. The
+  backdrop is now drawn when the menu paints, over everything before it, and the tint is
+  darker and redder.
+
+### Not verified
+- Not seen in game yet.
+- Whether Options, Load and Save, opened from the pause menu, still look right with the
+  full-width frame.
+
+## 2026-10-27: Gothic options screen, stage 1
+
+- The options dialog (Esc, then Options) now matches the pause menu's style and the
+  approved options mockup: full screen over the darkened game (or over the start-up menu,
+  darkened, when no level is loaded), the title "OPTIONS" with the gold divider, the tabs in
+  a row in Cinzel capitals, and Cancel and OK at the bottom right. The chosen tab and the
+  button under the mouse are brighter, underlined and have a red glow behind them.
+- New `runtime/bl_options.c`, with five GameUI hooks (see `modules/README.md`). The drawing
+  shared with the pause menu moved to `runtime/bl_gothic.c`. The renderer's
+  `bl_metal_pause_menu` became `bl_metal_backdrop`: two tint styles, up to four glows, and
+  the world view optional.
+- The dialog still does all the work. Its parts are placed again on every paint, because
+  vgui only lays out when a size changes.
+- The page controls (tick boxes, sliders, pickers, the key list) keep the game's look:
+  those are stages 2 and 3.
+- The first build changed nothing: the user still saw the old dialog. The natives compared
+  each panel's vtable with the DLL's address (0x10054694), but a recompiled module's data
+  is placed by the linker, not at the DLL's addresses. The GameUI replacement now also
+  holds `GameUI_OptionsVtable` and `GameUI_PageTabVtable`, which return the module's own
+  vtable addresses. Any check against a DLL data address needs the same.
+
+### Not verified
+- Not seen in game yet.
+
+## 2026-10-27: Gothic options screen, every control
+
+- The user rejected stage 1: only the frame, tabs and OK/Cancel had changed, the tabs and
+  buttons sat where the game's layout put them, and every page still had the old brown
+  controls. The whole dialog was meant to change in one go; no more partial stages.
+- Layout moved out of paint time. The game's PerformLayout ran after the paint-time bounds
+  and put things back. Now the ends of `COptionsDialog::PerformLayout` and
+  `PropertySheet::PerformLayout` place the dialog (full screen), Cancel and OK (bottom
+  right), the tabs (a row under the title) and the page. Page controls are still placed at
+  paint time, since nothing else moves them: one to three columns from the .res x
+  positions, each setting with its label above, notes across the top; on the Controls tab
+  the key list fills the page with its buttons in a row under it.
+- Every control is redrawn: tick boxes (diamond, filled red when ticked, On/Off), sliders
+  (caption and percent, red-to-gold track, diamond knob, ticks), drop-down boxes as
+  "< value >" with the arrows stepping through the choices, drop-down lists, the key list
+  (cells, headers, section headings, selected row, the "press a key" box), scroll bars,
+  labels and notes, the page buttons, and the confirmation and message boxes (dark panel,
+  gold frame, title and divider). Backgrounds and borders are left out.
+- Body text uses Cormorant Garamond Medium (`assets/fonts/Cormorant.ttf`, OFL, cut from
+  the variable font at weight 500) next to Cinzel for capitals.
+- Twelve more GameUI hooks and the `GameUI_IPanel` alias (see `modules/README.md`);
+  `GameUI_PageTabVtable` is gone (the tab class is checked by offset from
+  `GameUI_OptionsVtable`).
+
+### Not verified
+- Not seen in game yet: every tab, the drop-down arrows, the key list's "press a key" box,
+  the Use Defaults confirmation.
+- First run crashed (bus error) when the Controls tab's scroll bar painted: four natives
+  read `ecx` again after calling into the game, which changes it, so they painted some
+  other object. Each native now reads the registers first.
+- The user asked to remove the yellow divider lines: the hairlines under the tabs, above
+  Cancel and OK, under the key list's column headers and under the Enhanced tab's
+  headings are gone. The title's divider with the diamond stays.
