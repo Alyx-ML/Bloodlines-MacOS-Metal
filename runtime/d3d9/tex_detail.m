@@ -397,12 +397,14 @@ static float smooth01(float e0, float e1, float x)
 // (red over green over blue, green a fair way above blue), a little saturated but not
 // strongly (white and grey cloth, jeans and black leather are out; so are reds), and not
 // too dark. Box-blurred and cut again so specks on cloth drop out and skin keeps clean
-// edges. At up to 512 across (an R8 texture); faces get none (all theirs is skin).
+// edges. At up to 512 across (an R8 texture). Faces get theirs from face_mask.
+static void face_mask(id<MTLDevice> dev, const char *rel, const uint8_t *px, size_t w, size_t h);
 static void make_skin_mask(id<MTLDevice> dev, const char *rel)
 {
-    // Faces: all skin. Tongues, teeth and eyes: neither skin nor cloth.
+    // Tongues, teeth and eyes: neither skin nor cloth.
     const char *file = strrchr(rel, '/') ? strrchr(rel, '/') + 1 : rel;
-    if (face_name(rel) || strcasestr(file, "tongue") || strcasestr(file, "teeth") || strcasestr(file, "eye")) return;
+    int face = face_name(rel);
+    if (strcasestr(file, "tongue") || strcasestr(file, "teeth") || strcasestr(file, "eye")) return;
     os_unfair_lock_lock(&mask_lock);
     int have = masks[@(rel)] != nil;
     os_unfair_lock_unlock(&mask_lock);
@@ -431,6 +433,11 @@ static void make_skin_mask(id<MTLDevice> dev, const char *rel)
         CGContextSetBlendMode(cg, kCGBlendModeCopy);
         CGContextDrawImage(cg, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
         CGContextRelease(cg), CGColorSpaceRelease(cs), CGImageRelease(img);
+    }
+    if (face) {
+        face_mask(dev, rel, px, w, h);
+        free(px);
+        return;
     }
     size_t f = w > 512 || h > 512 ? 2 : 1, mw = w / f ? w / f : 1, mh = h / f ? h / f : 1;
     float *m = calloc(mw * mh, sizeof *m), *tmp = malloc((mw > mh ? mw : mh) * sizeof *tmp);
@@ -470,6 +477,75 @@ static void make_skin_mask(id<MTLDevice> dev, const char *rel)
     masks[@(rel)] = t;
     os_unfair_lock_unlock(&mask_lock);
     fprintf(stderr, "[detail] skin mask %zux%zu for %s: %.0f%% skin\n", mw, mh, rel, 100.0 * (double)skin / (double)(mw * mh));
+}
+
+// Where a face texture's pores go and how big, by its colours (RG8, at up to 512 across):
+// r the pores' strength, none on the lips (red, by Cr as the skin pass picks them out),
+// on what is much darker than the face's mean skin (eyebrows, lashes, the lids' lines
+// and make-up, nostrils) or on what is not skin (hair: not warm, or strongly saturated);
+// g their size less 0.5: up to 1.4 times as big where the skin is redder than its mean
+// (cheeks, nose), down to 0.7 where it is paler (the forehead) or a little darker (around
+// the eyes), smoothed over a twentieth of the texture.
+static void face_mask(id<MTLDevice> dev, const char *rel, const uint8_t *px, size_t w, size_t h)
+{
+    size_t f = w > 512 || h > 512 ? 2 : 1, mw = w / f ? w / f : 1, mh = h / f ? h / f : 1, n = mw * mh;
+    float *lum = malloc(n * sizeof *lum), *cr = malloc(n * sizeof *cr), *warm = malloc(n * sizeof *warm);
+    float *amt = malloc(n * sizeof *amt), *size = malloc(n * sizeof *size), *tmp = malloc((mw > mh ? mw : mh) * sizeof *tmp);
+    double sl = 0, sc = 0, sw = 0;
+    for (size_t y = 0; y < mh; y++)
+        for (size_t x = 0; x < mw; x++) {
+            float c[3] = {0, 0, 0};
+            for (size_t j = 0; j < f; j++)
+                for (size_t i = 0; i < f; i++)
+                    for (int k = 0; k < 3; k++) c[k] += px[((y * f + j) * w + x * f + i) * 4 + k] / 255.0f;
+            float R = c[0] / (float)(f * f), G = c[1] / (float)(f * f), B = c[2] / (float)(f * f);
+            float mx = fmaxf(R, fmaxf(G, B)), mn = fminf(R, fminf(G, B)), sat = (mx - mn) / fmaxf(mx, 1e-3f);
+            size_t k = y * mw + x;
+            lum[k] = 0.2126f * R + 0.7152f * G + 0.0722f * B;
+            cr[k] = 0.5f + 0.5f * R - 0.4187f * G - 0.0813f * B;
+            warm[k] = R >= G - 0.01f && G >= B - 0.02f ? smooth01(0.1f, 0.16f, R) * (1 - smooth01(0.45f, 0.6f, sat)) : 0;
+            float b = warm[k] * (1 - smooth01(0.60f, 0.63f, cr[k]));
+            sl += b * lum[k], sc += b * cr[k], sw += b;
+        }
+    float ml = sw > 0 ? (float)(sl / sw) : 0.5f, mc = sw > 0 ? (float)(sc / sw) : 0.53f;
+    for (size_t k = 0; k < n; k++) {
+        float d = lum[k] / fmaxf(ml, 1e-3f), rel_cr = cr[k] - mc;
+        amt[k] = warm[k] * (1 - smooth01(0.60f, 0.63f, cr[k])) * smooth01(0.6f, 0.8f, d);
+        float eye = 1 - smooth01(0.8f, 0.95f, d), fine = smooth01(0.0f, 0.03f, -rel_cr);
+        size[k] = 1 + 0.4f * smooth01(0.0f, 0.04f, rel_cr) - 0.3f * fmaxf(fine, eye);
+    }
+    int r = (int)lrint(3.0 * (double)mw / 512.0);
+    if (r < 1) r = 1;
+    for (size_t y = 0; y < mh; y++) box(amt + y * mw, mw, 1, r, tmp);
+    for (size_t x = 0; x < mw; x++) box(amt + x, mh, mw, r, tmp);
+    for (size_t k = 0; k < n; k++) amt[k] = smooth01(0.3f, 0.7f, amt[k]), size[k] *= amt[k];
+    // The size averaged over the skin alone (weighted by the pores' strength).
+    int rs = (int)lrint(12.0 * (double)mw / 512.0);
+    if (rs < 2) rs = 2;
+    float *wt = lum;  // no longer needed
+    memcpy(wt, amt, n * sizeof *wt);
+    for (size_t y = 0; y < mh; y++) box(size + y * mw, mw, 1, rs, tmp), box(wt + y * mw, mw, 1, rs, tmp);
+    for (size_t x = 0; x < mw; x++) box(size + x, mh, mw, rs, tmp), box(wt + x, mh, mw, rs, tmp);
+    uint8_t *out = malloc(n * 2);
+    size_t on = 0;
+    for (size_t k = 0; k < n; k++) {
+        float sz = fminf(fmaxf(size[k] / fmaxf(wt[k], 1e-3f), 0.6f), 1.4f);
+        out[2 * k] = (uint8_t)lrintf(amt[k] * 255), out[2 * k + 1] = (uint8_t)lrintf((sz - 0.5f) * 255);
+        on += out[2 * k] > 127;
+    }
+    free(lum), free(cr), free(warm), free(amt), free(size), free(tmp);
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG8Unorm
+                                                                                    width:mw height:mh mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> t = [dev newTextureWithDescriptor:td];
+    [t replaceRegion:MTLRegionMake2D(0, 0, mw, mh) mipmapLevel:0 withBytes:out bytesPerRow:mw * 2];
+    free(out);
+    os_unfair_lock_lock(&mask_lock);
+    if (!masks) masks = [NSMutableDictionary new];
+    masks[@(rel)] = t;
+    os_unfair_lock_unlock(&mask_lock);
+    fprintf(stderr, "[detail] face mask %zux%zu for %s: pores on %.0f%%\n", mw, mh, rel, 100.0 * (double)on / (double)n);
 }
 
 // The mean colour of a picture's solid pixels (alpha over 200); 0 without any.

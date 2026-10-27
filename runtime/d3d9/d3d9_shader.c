@@ -961,7 +961,9 @@ static int gen_body(struct gen *g)
 // (bl_dl[2].x its strength; the map's alpha is the roughness), and the light given a direction.
 // Skin detail on faces and bodies' skin, and a weave on bodies' cloth. bl_dl[4]: the
 // pores' strength (0 off), the texture's size in texels, 1 when bl_dsk (a body's skin
-// mask) says where its skin is; bl_dl[5]: the weave's strength (0 off), the largest pore
+// mask) says where its skin is, 2 when it is a face's (r where its pores go, g their size
+// less 0.5: bigger on the cheeks and nose, finer on the forehead and round the eyes);
+// bl_dl[5]: the weave's strength (0 off), the largest pore
 // and thread spacing allowed in world units; bl_dl[6]: texels per pore and per thread.
 // Pores and threads are sized by the texture (a cell every so many texels), except where
 // that would make them bigger in the world than the largest allowed (characters with small
@@ -980,12 +982,15 @@ static void ps_skin_detail(struct out *o)
     line(o, "#define BL_HMIX(x) ((((x) ^ ((x) >> 15u))) * 2246822519u)");
     line(o, "#define BL_HASH(c) BL_HMIX(BL_HMIX((uint((c).x + 8192.0) * 1597334677u ^ uint((c).y + 8192.0) * 3812015801u) * 747796405u + 2891336453u))");
     line(o, "#endif");
-    line(o, "float _skm = bl_dl[4].w > 0.5 ? bl_dsk.sample(bl_ds, _uv).r : 1.0;");
+    line(o, "float2 _skg = bl_dl[4].w > 0.5 ? bl_dsk.sample(bl_ds, _uv).rg : float2(1.0, 0.5);");
+    line(o, "float _skm = _skg.x, _psz = bl_dl[4].w > 1.5 ? _skg.y + 0.5 : 1.0;");
     line(o, "float2 _ut = _uv * bl_dl[4].yz, _tx = _ux * bl_dl[4].yz, _ty = _uy * bl_dl[4].yz;");
     line(o, "float _rt = sqrt(length(cross(_px, _py)) / max(abs(_tx.x * _ty.y - _tx.y * _ty.x), 1e-12));");
     line(o, "if (bl_dl[4].x > 0.0 && _skm > 0.001) {");
     o->indent++;
-    line(o, "float _n0 = 1.0 / bl_dl[6].x, _L = clamp(log2(max(_rt / bl_dl[5].y, _n0) / _n0), 0.0, 8.0), _L0 = floor(_L), _fr = _L - _L0;");
+    // The face's pore size moves the grid's level (bigger: coarser), but never coarser than
+    // the largest size allowed in the world.
+    line(o, "float _n0 = 1.0 / bl_dl[6].x, _L = clamp(max(log2(max(_rt / bl_dl[5].y, 1e-6) / _n0), -log2(_psz)), -1.0, 8.0), _L0 = floor(_L), _fr = _L - _L0;");
     line(o, "float _ph = 0.0, _pw = 0.0; float2 _pg = float2(0.0), _pp0 = _ut * _n0 * exp2(_L0);");
     line(o, "for (int _o = 0; _o < 2; _o++) {");
     line(o, "    float2 _pp = _ut * _n0 * exp2(_L0 + float(_o)), _off = (_L0 + float(_o)) * float2(311.0, 173.0);");
@@ -1012,7 +1017,7 @@ static void ps_skin_detail(struct out *o)
     line(o, "_a2 = _rg * _rg * _rg * _rg;");
     o->indent--;
     line(o, "}");
-    line(o, "if (bl_dl[5].x > 0.0 && bl_dl[4].w > 0.5 && _skm < 0.999) {");
+    line(o, "if (bl_dl[5].x > 0.0 && bl_dl[4].w > 0.5 && bl_dl[4].w < 1.5 && _skm < 0.999) {");
     o->indent++;
     line(o, "float _n0 = 1.0 / bl_dl[6].y, _L = clamp(log2(max(_rt / bl_dl[5].z, _n0) / _n0), 0.0, 8.0), _L0 = floor(_L), _fr = _L - _L0;");
     line(o, "float2 _wg = float2(0.0);");
@@ -1564,8 +1569,10 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         else if (info && g.env) line(o, "out.c1 = float4(_d * _fog, (_w.x + _w.y + _w.z) * _fog / 3.0);");
         else if (info) line(o, "out.c1 = float4(0.0, 0.0, 0.0, p.gloss * _fog);");
         if (albedo && g.alb_stage >= 0)
-            line(o, "out.c2 = float4(tex%d.sample(smp%d, (%s).xy).rgb, 1.0);", g.alb_stage, g.alb_stage, g.alb_coord);
-        else if (albedo) line(o, "out.c2 = float4(0.5, 0.5, 0.5, 1.0);");
+            line(o, "out.c2 = float4(tex%d.sample(smp%d, (%s).xy).rgb, %s);", g.alb_stage, g.alb_stage, g.alb_coord,
+                 v->albedo == 2 ? "0.5" : v->albedo == 3 ? "0.8" : "1.0");
+        else if (albedo)
+            line(o, "out.c2 = float4(0.5, 0.5, 0.5, %s);", v->albedo == 2 ? "0.5" : v->albedo == 3 ? "0.8" : "1.0");
         if (surface) line(o, "out.c3 = _pbo;");
         if (g.info.writes_depth) line(o, "out.depth = odepth;");
         line(o, "return out;");
@@ -1704,7 +1711,9 @@ char *d3d_ff_ps_msl(const struct d3d_ff_ps *k, const struct d3d_shader_variant *
     line(o, "BLPSOut out;");
     line(o, "out.c0 = oc0;");
     if (info) line(o, v->skin == 3 ? "out.c1 = float4(0.0, 0.0, 0.0, -3.0);" : v->skin ? "out.c1 = float4(0.0, 0.0, 0.0, -2.0);" : "out.c1 = float4(0.0, 0.0, 0.0, p.gloss * _fog);");
-    if (albedo) line(o, "out.c2 = float4(%s, 1.0);", alb[0] ? alb : "float3(0.5)");
+    if (albedo)
+        line(o, "out.c2 = float4(%s, %s);", alb[0] ? alb : "float3(0.5)",
+             v->albedo == 2 ? "0.5" : v->albedo == 3 ? "0.8" : "1.0");
     line(o, "return out;");
     put(o, "}\n");
     return o->s;

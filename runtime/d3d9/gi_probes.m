@@ -18,14 +18,17 @@
 #define GI_MAX_PROBES 32768
 #define GI_MAX_CELLS (16L << 20)
 #define GI_FLOOR 160       // a probe's floor at most this far below
+#define GI_VIS_BIAS 8      // a probe counts as seeing a point this much behind what it saw
+#define GI_PROP_NEAR 1024  // props drawn into a batch of probes' views this near it
 
 static NSString *const gi_source =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
      // A corner: position; lightmap atlas coordinates (x < 0: none); the texture's mean
-     // colour; light it gives off; the face's normal; 1 for the sky (never seen from behind).
-     "struct GV { packed_float3 pos; packed_float2 uv; packed_float3 alb, emit, n; float sky; };\n"
-     "struct VO { float4 pos [[position]]; float2 uv; float3 alb, emit, n, w; float sky;\n"
+     // colour; light it gives off (emit; emitb from its back, for props); the face's normal;
+     // 1 for the sky (never seen from behind), 2 for a static prop (seen from both sides).
+     "struct GV { packed_float3 pos; packed_float2 uv; packed_float3 alb, emit, emitb, n; float sky; };\n"
+     "struct VO { float4 pos [[position]]; float2 uv; float3 alb, emit, emitb, n, w; float sky;\n"
      "            float3 probe [[flat]]; uint layer [[render_target_array_index]]; };\n"
      "constant float3 faceF[6] = {float3(1, 0, 0), float3(-1, 0, 0), float3(0, 1, 0), float3(0, -1, 0), float3(0, 0, 1), float3(0, 0, -1)};\n"
      "constant float3 faceU[6] = {float3(0, 0, 1), float3(0, 0, 1), float3(0, 0, 1), float3(0, 0, 1), float3(0, 1, 0), float3(0, 1, 0)};\n"
@@ -38,7 +41,8 @@ static NSString *const gi_source =
      "    float z = dot(d, F);\n"
      "    VO o;\n"
      "    o.pos = float4(dot(d, R), dot(d, U), z * fa / (fa - n) - n * fa / (fa - n), z);\n"
-     "    o.uv = float2(v[vid].uv), o.alb = float3(v[vid].alb), o.emit = float3(v[vid].emit), o.n = float3(v[vid].n);\n"
+     "    o.uv = float2(v[vid].uv), o.alb = float3(v[vid].alb), o.emit = float3(v[vid].emit), o.emitb = float3(v[vid].emitb);\n"
+     "    o.n = float3(v[vid].n);\n"
      "    o.w = W, o.sky = v[vid].sky, o.probe = P, o.layer = inst;\n"
      "    return o;\n"
      "}\n"
@@ -48,12 +52,16 @@ static NSString *const gi_source =
      "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
      "    if (in.sky < 0.5 && dot(in.n, in.probe - in.w) < 0.0) return float4(0.0, 0.0, 0.0, -1.0);\n"
      "    float3 l = in.uv.x >= 0.0 ? lm.sample(s, in.uv).rgb : float3(0.0);\n"
-     "    return float4(in.alb * l + in.emit, length(in.w - in.probe));\n"
+     "    float3 e = in.sky > 1.5 && dot(in.n, in.probe - in.w) < 0.0 ? in.emitb : in.emit;\n"
+     "    return float4(in.alb * l + e, length(in.w - in.probe));\n"
      "}\n"
      // A light, as lm_bake.m has them: origin and type; intensity; normal; stopdot,
      // stopdot2, exponent, radius; attenuation.
      "struct GL { float4 o, i, n, sp, att; };\n"
-     "struct PO { float4 b[6], d[6], back; };\n"
+     // v: how far the probe sees, mean and mean square, over each face's 4 x 4 cells
+     // (GI_VIS), distances capped at `far`.
+     "struct PO { float4 b[6], d[6], back; float2 v[384]; };\n"  // 6 * GI_VIS * GI_VIS
+     "constant uint VIS = 8;\n"  // GI_VIS
      "static uint face_of(float3 d) {\n"
      "    float3 a = abs(d);\n"
      "    return a.x >= a.y && a.x >= a.z ? (d.x > 0.0 ? 0u : 1u) : a.y >= a.z ? (d.y > 0.0 ? 2u : 3u) : (d.z > 0.0 ? 4u : 5u);\n"
@@ -64,7 +72,8 @@ static NSString *const gi_source =
      "}\n"
      "kernel void gi_reduce(texture2d_array<float> cap [[texture(0)]], device const float4 *probes [[buffer(0)]],\n"
      "                      device const GL *lights [[buffer(1)]], constant uint4 &k [[buffer(2)]],\n"
-     "                      device PO *out [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+     "                      device PO *out [[buffer(3)]], constant float &far [[buffer(4)]],\n"
+     "                      uint gid [[thread_position_in_grid]]) {\n"
      "    if (gid >= k.y) return;\n"
      "    uint res = k.w;\n"
      "    float3 P = probes[k.x + gid].xyz;\n"
@@ -82,6 +91,18 @@ static NSString *const gi_source =
      "                if (c.a < 0.0) { back += dw; continue; }\n"
      "                axes(d * rsqrt(l2), w);\n"
      "                for (int a = 0; a < 6; a++) b[a] += c.rgb * (w[a] * dw);\n"
+     "            }\n"
+     "        uint per = res / VIS;\n"
+     "        for (uint cy = 0; cy < VIS; cy++)\n"
+     "            for (uint cx = 0; cx < VIS; cx++) {\n"
+     "                float m = 0.0, m2 = 0.0;\n"
+     "                for (uint j = cy * per; j < (cy + 1) * per; j++)\n"
+     "                    for (uint i = cx * per; i < (cx + 1) * per; i++) {\n"
+     "                        float a = cap.read(uint2(i, j), gid * 6 + f).a, r = a < 0.0 ? 0.0 : min(a, far);\n"
+     "                        m += r, m2 += r * r;\n"
+     "                    }\n"
+     "                float k = 1.0 / float(per * per);\n"
+     "                out[gid].v[f * VIS * VIS + cy * VIS + cx] = float2(m * k, m2 * k);\n"
      "            }\n"
      "    }\n"
      "    for (uint li = 0; li < k.z; li++) {\n"
@@ -116,9 +137,9 @@ static NSString *const gi_source =
      "    out[gid].back = float4(total > 0.0 ? back / total : 1.0);\n"
      "}\n";
 
-struct gv { float pos[3], uv[2], alb[3], emit[3], n[3], sky; };
+struct gv { float pos[3], uv[2], alb[3], emit[3], emitb[3], n[3], sky; };
 struct gl { float o[4], i[4], n[4], sp[4], att[4]; };
-struct po { float b[6][4], d[6][4], back[4]; };
+struct po { float b[6][4], d[6][4], back[4], v[6 * GI_VIS * GI_VIS][2]; };
 
 // Shelf packing, as tests/bake_view.m: each face's rectangle in an atlas `width` wide;
 // returns its height.
@@ -147,8 +168,205 @@ static int pack(const int *w, const int *h, int n, int width, int *x, int *y)
 
 static int drawn(const struct bl_bsp_world *w, const struct bl_bsp_face *f)
 {
-    // Not: displacements (their shape is elsewhere), nodraw, hint and skip faces.
-    return f->texinfo >= 0 && f->disp < 0 && f->count >= 3 && !(w->texinfo[f->texinfo].flags & (0x80 | 0x100 | 0x200));
+    // Not: nodraw, hint and skip faces, or displacements whose surface could not be read.
+    return f->texinfo >= 0 && (f->disp < 0 || f->dside) && f->count >= 3 && !(w->texinfo[f->texinfo].flags & (0x80 | 0x100 | 0x200));
+}
+
+// What every capture of the map's probes shares.
+struct capture {
+    BLJob *job;
+    id<MTLDevice> dev;
+    id<MTLRenderPipelineState> pso;
+    id<MTLComputePipelineState> cps;
+    id<MTLDepthStencilState> dss;
+    id<MTLTexture> lm;
+    id<MTLBuffer> pb, lb, ob;  // the probes' places, the lights, the results (struct po each)
+    int np, nl;
+    float far;                 // how far the probes' views count (struct po v)
+};
+
+// The probes' views `res` texels across of the triangles (verts, idx), summed into ob. The
+// indices from `world` on are the props', each batch of probes drawing those within
+// GI_PROP_NEAR of it (farther ones are smaller than a texel of its views).
+static NSError *draw_probes(const struct capture *c, const struct gv *verts, int nv, const uint32_t *idx, int world, int ni,
+                            int res)
+{
+    id<MTLDevice> dev = c->dev;
+    id<MTLBuffer> vb = [dev newBufferWithBytes:(const void *)verts length:sizeof *verts * (size_t)nv
+                                       options:MTLResourceStorageModeShared];
+    id<MTLBuffer> ib = [dev newBufferWithBytes:(const void *)idx length:4 * (size_t)ni options:MTLResourceStorageModeShared];
+    int nprop = (ni - world) / 3;
+    float(*mid)[3] = malloc(sizeof *mid * (size_t)(nprop + 1));
+    for (int i = 0; i < nprop; i++)
+        for (int a = 0; a < 3; a++)
+            mid[i][a] = (verts[idx[world + 3 * i]].pos[a] + verts[idx[world + 3 * i + 1]].pos[a] + verts[idx[world + 3 * i + 2]].pos[a]) / 3;
+    const float(*pos)[4] = c->pb.contents;
+    MTLTextureDescriptor *cd = [MTLTextureDescriptor new];
+    cd.textureType = MTLTextureType2DArray, cd.pixelFormat = MTLPixelFormatRGBA16Float;
+    cd.width = cd.height = (NSUInteger)res, cd.arrayLength = GI_BATCH * 6;
+    cd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, cd.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> cap = [dev newTextureWithDescriptor:cd];
+    cd.pixelFormat = MTLPixelFormatDepth32Float, cd.usage = MTLTextureUsageRenderTarget;
+    id<MTLTexture> depth = [dev newTextureWithDescriptor:cd];
+    // Each batch's first probe (the vertex shader's), the reduce's parameters and `far`,
+    // free again once the batch before has been waited for.
+    id<MTLBuffer> kb = [dev newBufferWithLength:32 options:MTLResourceStorageModeShared];
+    BLJob *job = c->job;
+    for (id<MTLAllocation> r in @[ vb, ib, cap, depth, kb ]) [job keep:r];
+    id<MTL4ArgumentTable> at = job.table;
+    for (int first = 0; first < c->np; first += GI_BATCH) {
+        uint32_t count = (uint32_t)(c->np - first < GI_BATCH ? c->np - first : GI_BATCH), f32 = (uint32_t)first;
+        // The props near this batch, after the map's indices (the batch before is done with them).
+        float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+        for (uint32_t i = f32; i < f32 + count; i++)
+            for (int a = 0; a < 3; a++) lo[a] = fminf(lo[a], pos[i][a]), hi[a] = fmaxf(hi[a], pos[i][a]);
+        uint32_t *bi = (uint32_t *)ib.contents + world;
+        int n = world;
+        for (int i = 0; i < nprop; i++) {
+            float d2 = 0;
+            for (int a = 0; a < 3; a++) {
+                float o = mid[i][a] < lo[a] ? lo[a] - mid[i][a] : mid[i][a] > hi[a] ? mid[i][a] - hi[a] : 0;
+                d2 += o * o;
+            }
+            if (d2 > GI_PROP_NEAR * GI_PROP_NEAR) continue;
+            for (int k = 0; k < 3; k++) *bi++ = idx[world + 3 * i + k];
+            n += 3;
+        }
+        uint32_t *k4 = kb.contents;
+        k4[0] = f32, k4[1] = count, k4[2] = (uint32_t)c->nl, k4[3] = (uint32_t)res, k4[4] = f32;
+        memcpy(k4 + 5, &c->far, 4);
+        id<MTL4CommandBuffer> cb = [job begin];
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+        rp.colorAttachments[0].texture = cap;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        // Nothing drawn: no light from there, and nothing in the way of the map's lights (the
+        // map has holes where it is never seen from: nodraw faces).
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 65504);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rp.depthAttachment.texture = depth;
+        rp.depthAttachment.loadAction = MTLLoadActionClear;
+        rp.depthAttachment.clearDepth = 1;
+        rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+        rp.renderTargetArrayLength = count * 6;
+        id<MTL4RenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+        [e setRenderPipelineState:c->pso];
+        [e setDepthStencilState:c->dss];
+        [e setCullMode:MTLCullModeNone];
+        [at setAddress:vb.gpuAddress atIndex:0];
+        [at setAddress:c->pb.gpuAddress atIndex:1];
+        [at setAddress:kb.gpuAddress + 16 atIndex:2];
+        [at setTexture:c->lm.gpuResourceID atIndex:0];
+        [e setArgumentTable:at atStages:MTLRenderStageVertex | MTLRenderStageFragment];
+        [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:(NSUInteger)n indexType:MTLIndexTypeUInt32
+                     indexBuffer:ib.gpuAddress indexBufferLength:ib.length instanceCount:count * 6];
+        [e endEncoding];
+        id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        // The views drawn before they are read.
+        [ce barrierAfterQueueStages:MTLStageFragment beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
+        [ce setComputePipelineState:c->cps];
+        [at setTexture:cap.gpuResourceID atIndex:0];
+        [at setAddress:c->pb.gpuAddress atIndex:0];
+        [at setAddress:c->lb.gpuAddress atIndex:1];
+        [at setAddress:kb.gpuAddress atIndex:2];
+        [at setAddress:c->ob.gpuAddress + sizeof(struct po) * (size_t)first atIndex:3];
+        [at setAddress:kb.gpuAddress + 20 atIndex:4];
+        [ce setArgumentTable:at];
+        [ce dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [ce endEncoding];
+        NSError *failed = [job run];
+        if (failed) {
+            free(mid);
+            return failed;
+        }
+    }
+    free(mid);
+    return nil;
+}
+
+// Every other probe each way of g's (a grid twice as coarse), their places into *pb.
+static struct bl_gi *coarse_grid(const struct bl_gi *g, id<MTLDevice> dev, id<MTLBuffer> __strong *pb)
+{
+    struct bl_gi *c = calloc(1, sizeof *c);
+    c->step = 2 * g->step;
+    memcpy(c->origin, g->origin, sizeof c->origin);
+    for (int a = 0; a < 3; a++) c->n[a] = (g->n[a] + 1) / 2;
+    c->slot = malloc(sizeof(int) * (size_t)c->n[0] * c->n[1] * c->n[2]);
+    *pb = [dev newBufferWithLength:16 * (size_t)g->nprobes + 16 options:MTLResourceStorageModeShared];
+    float(*q)[4] = (*pb).contents;
+    for (int z = 0, k = 0; z < c->n[2]; z++)
+        for (int y = 0; y < c->n[1]; y++)
+            for (int x = 0; x < c->n[0]; x++, k++) {
+                int i = g->slot[(2 * z * g->n[1] + 2 * y) * g->n[0] + 2 * x];
+                c->slot[k] = i < 0 ? -1 : c->nprobes;
+                if (i < 0) continue;
+                float *p = q[c->nprobes++];
+                p[0] = g->origin[0] + (float)(2 * x) * g->step, p[1] = g->origin[1] + (float)(2 * y) * g->step;
+                p[2] = g->origin[2] + (float)(2 * z) * g->step, p[3] = 1;
+            }
+    return c;
+}
+
+// The probes' light and how far each sees, from a capture's results.
+static void take_probes(struct bl_gi *g, const struct po *o)
+{
+    int np = g->nprobes;
+    if (!g->bounce) {
+        g->bounce = malloc(sizeof *g->bounce * (size_t)np);
+        g->direct = malloc(sizeof *g->direct * (size_t)np);
+        g->vis = malloc(sizeof *g->vis * (size_t)np);
+        g->valid = malloc((size_t)np);
+    }
+    g->nvalid = 0;
+    for (int i = 0; i < np; i++) {
+        for (int a = 0; a < 6; a++)
+            for (int c = 0; c < 3; c++) g->bounce[i][a][c] = o[i].b[a][c], g->direct[i][a][c] = o[i].d[a][c];
+        // In steps of the grid, which half floats hold (squares of up to 4 steps' distance).
+        for (int k = 0; k < 6 * GI_VIS * GI_VIS; k++)
+            g->vis[i][k][0] = (_Float16)(o[i].v[k][0] / g->step), g->vis[i][k][1] = (_Float16)(o[i].v[k][1] / (g->step * g->step));
+        g->valid[i] = o[i].back[0] < 0.1f;
+        g->nvalid += g->valid[i];
+    }
+}
+
+// The light on a surface facing n from an ambient cube (+x -x +y -y +z -z), as the game
+// lights models: each axis weighted by n's part along it, squared.
+static void cube_light(const float b[6][3], const float d[6][3], const float n[3], float out[3])
+{
+    for (int c = 0; c < 3; c++) {
+        out[c] = 0;
+        for (int a = 0; a < 3; a++) {
+            int side = 2 * a + (n[a] < 0);
+            out[c] += n[a] * n[a] * (b[side][c] + d[side][c]);
+        }
+    }
+}
+
+// The light arriving at a prop's corner p: from the probes round it, else from those of the
+// 4 x 4 x 4 round it that see it, nearest most. 0 where none do (props high on buildings,
+// far from where models go).
+static int prop_light(const struct bl_gi *g, const float p[3], float bounce[6][3], float direct[6][3])
+{
+    if (bl_gi_sample(g, p, bounce, direct)) return 1;
+    int c[3];
+    for (int a = 0; a < 3; a++) c[a] = (int)floorf((p[a] - g->origin[a]) / g->step);
+    float sum = 0;
+    for (int z = c[2] - 1; z <= c[2] + 2; z++)
+        for (int y = c[1] - 1; y <= c[1] + 2; y++)
+            for (int x = c[0] - 1; x <= c[0] + 2; x++) {
+                if (x < 0 || y < 0 || z < 0 || x >= g->n[0] || y >= g->n[1] || z >= g->n[2]) continue;
+                int i = g->slot[(z * g->n[1] + y) * g->n[0] + x];
+                if (i < 0 || !g->valid[i]) continue;
+                float d[3] = {p[0] - (g->origin[0] + (float)x * g->step), p[1] - (g->origin[1] + (float)y * g->step),
+                              p[2] - (g->origin[2] + (float)z * g->step)};
+                float wt = bl_gi_seen(g, i, d) / (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] + 1);
+                for (int a = 0; a < 6; a++)
+                    for (int ch = 0; ch < 3; ch++) bounce[a][ch] += g->bounce[i][a][ch] * wt, direct[a][ch] += g->direct[i][a][ch] * wt;
+                sum += wt;
+            }
+    if (sum <= 1e-12f) return 0;
+    for (int a = 0; a < 6; a++)
+        for (int ch = 0; ch < 3; ch++) bounce[a][ch] /= sum, direct[a][ch] /= sum;
+    return 1;
 }
 
 struct bl_gi *bl_gi_capture(id<MTLDevice> dev, const struct bl_bsp_world *w, char *err, int errlen)
@@ -204,23 +422,40 @@ struct bl_gi *bl_gi_capture(id<MTLDevice> dev, const struct bl_bsp_world *w, cha
     }
     for (int t = 0; t < w->ntexinfo; t++)
         for (int c = 0; c < 3; c++) emit[t][c] = area[t] > 0 ? emit[t][c] * 3.14159265f / area[t] : 0;
-    // The faces as triangles (fans, by index).
+    // The faces as triangles (fans, by index; displacements their grid's).
     int nv = 0, ni = 0;
-    for (int i = 0; i < nf; i++)
-        if (drawn(w, &w->faces[i])) nv += w->faces[i].count, ni += 3 * (w->faces[i].count - 2);
+    for (int i = 0; i < nf; i++) {
+        const struct bl_bsp_face *f = &w->faces[i];
+        if (drawn(w, f)) nv += f->dside ? f->dside * f->dside : f->count, ni += f->dside ? 6 * (f->dside - 1) * (f->dside - 1) : 3 * (f->count - 2);
+    }
     struct gv *verts = calloc((size_t)nv + 1, sizeof *verts);
     uint32_t *idx = calloc((size_t)ni + 1, sizeof *idx);
     float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
+    float refl[3] = {0, 0, 0}, refl_area = 0;  // the map's surfaces' mean colour, by area
     int kv = 0, ki = 0;
     for (int i = 0; i < nf; i++) {
         const struct bl_bsp_face *f = &w->faces[i];
         if (!drawn(w, f)) continue;
         const struct bl_bsp_texinfo *t = &w->texinfo[f->texinfo];
         int is_sky = (t->flags & 4) != 0;
-        for (int c = 1; c + 1 < f->count; c++)
-            idx[ki++] = (uint32_t)kv, idx[ki++] = (uint32_t)(kv + c), idx[ki++] = (uint32_t)(kv + c + 1);
-        for (int c = 0; c < f->count; c++) {
-            const float *p = w->verts[w->index[f->first + c]];
+        if (!is_sky) {
+            for (int c = 0; c < 3; c++) refl[c] += w->texdata[t->texdata].reflectivity[c] * f->area;
+            refl_area += f->area;
+        }
+        int n = f->dside, corners = n ? n * n : f->count;
+        if (n)
+            for (int r = 0; r + 1 < n; r++)
+                for (int c = 0; c + 1 < n; c++) {
+                    uint32_t a = (uint32_t)(kv + r * n + c);
+                    idx[ki++] = a, idx[ki++] = a + (uint32_t)n, idx[ki++] = a + (uint32_t)n + 1;
+                    idx[ki++] = a, idx[ki++] = a + (uint32_t)n + 1, idx[ki++] = a + 1;
+                }
+        else
+            for (int c = 1; c + 1 < f->count; c++)
+                idx[ki++] = (uint32_t)kv, idx[ki++] = (uint32_t)(kv + c), idx[ki++] = (uint32_t)(kv + c + 1);
+        for (int c = 0; c < corners; c++) {
+            const struct bl_bsp_dvert *dv = n ? &w->dverts[f->dfirst + c] : NULL;
+            const float *p = dv ? dv->pos : w->verts[w->index[f->first + c]];
             struct gv *v = &verts[kv++];
             for (int a = 0; a < 3; a++) v->pos[a] = p[a] + f->origin[a];
             if (f->model == 0)
@@ -238,8 +473,8 @@ struct bl_gi *bl_gi_capture(id<MTLDevice> dev, const struct bl_bsp_world *w, cha
                 v->uv[0] = v->uv[1] = -1;
                 continue;
             }
-            float s = p[0] * t->lm[0][0] + p[1] * t->lm[0][1] + p[2] * t->lm[0][2] + t->lm[0][3] - (float)f->mins[0];
-            float u = p[0] * t->lm[1][0] + p[1] * t->lm[1][1] + p[2] * t->lm[1][2] + t->lm[1][3] - (float)f->mins[1];
+            float s = dv ? dv->lux[0] : p[0] * t->lm[0][0] + p[1] * t->lm[0][1] + p[2] * t->lm[0][2] + t->lm[0][3] - (float)f->mins[0];
+            float u = dv ? dv->lux[1] : p[0] * t->lm[1][0] + p[1] * t->lm[1][1] + p[2] * t->lm[1][2] + t->lm[1][3] - (float)f->mins[1];
             v->uv[0] = ((float)ox[i] + s + 0.5f) / (float)aw, v->uv[1] = ((float)oy[i] + u + 0.5f) / (float)ah;
         }
     }
@@ -339,99 +574,136 @@ struct bl_gi *bl_gi_capture(id<MTLDevice> dev, const struct bl_bsp_world *w, cha
     [lm replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)aw, (NSUInteger)ah) mipmapLevel:0 withBytes:atlas
           bytesPerRow:(NSUInteger)aw * 8];
     free(atlas);
-    id<MTLBuffer> vb = [dev newBufferWithBytes:verts length:sizeof *verts * (size_t)nv options:MTLResourceStorageModeShared];
-    id<MTLBuffer> ib = [dev newBufferWithBytes:idx length:4 * (size_t)ki options:MTLResourceStorageModeShared];
-    free(verts), free(idx);
-    MTLTextureDescriptor *cd = [MTLTextureDescriptor new];
-    cd.textureType = MTLTextureType2DArray, cd.pixelFormat = MTLPixelFormatRGBA16Float;
-    cd.width = cd.height = GI_RES, cd.arrayLength = GI_BATCH * 6;
-    cd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, cd.storageMode = MTLStorageModePrivate;
-    id<MTLTexture> cap = [dev newTextureWithDescriptor:cd];
-    cd.pixelFormat = MTLPixelFormatDepth32Float, cd.usage = MTLTextureUsageRenderTarget;
-    id<MTLTexture> depth = [dev newTextureWithDescriptor:cd];
     id<MTLBuffer> ob = [dev newBufferWithLength:sizeof(struct po) * (size_t)np options:MTLResourceStorageModeShared];
-    // Each batch's first probe (the vertex shader's) and the reduce's parameters, free again
-    // once the batch before has been waited for.
-    id<MTLBuffer> kb = [dev newBufferWithLength:32 options:MTLResourceStorageModeShared];
     BLJob *job = [[BLJob alloc] initWithDevice:dev];
     if (!job) {
         snprintf(err, (size_t)errlen, "no Metal 4 queue");
-        free(g->slot), free(g);
+        free(verts), free(idx), bl_gi_free(g);
         return NULL;
     }
-    for (id<MTLAllocation> r in @[ pb, lb, lm, vb, ib, cap, depth, ob, kb ]) [job keep:r];
-    id<MTL4ArgumentTable> at = job.table;
-    for (int first = 0; first < np; first += GI_BATCH) {
-        uint32_t count = (uint32_t)(np - first < GI_BATCH ? np - first : GI_BATCH), f32 = (uint32_t)first;
-        uint32_t *k4 = kb.contents;
-        k4[0] = f32, k4[1] = count, k4[2] = (uint32_t)nl, k4[3] = GI_RES, k4[4] = f32;
-        id<MTL4CommandBuffer> cb = [job begin];
-        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
-        rp.colorAttachments[0].texture = cap;
-        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-        // Nothing drawn: no light from there, and nothing in the way of the map's lights (the
-        // map has holes where it is never seen from: nodraw faces, displacements).
-        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 65504);
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        rp.depthAttachment.texture = depth;
-        rp.depthAttachment.loadAction = MTLLoadActionClear;
-        rp.depthAttachment.clearDepth = 1;
-        rp.depthAttachment.storeAction = MTLStoreActionDontCare;
-        rp.renderTargetArrayLength = count * 6;
-        id<MTL4RenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
-        [e setRenderPipelineState:pso];
-        [e setDepthStencilState:dss];
-        [e setCullMode:MTLCullModeNone];
-        [at setAddress:vb.gpuAddress atIndex:0];
-        [at setAddress:pb.gpuAddress atIndex:1];
-        [at setAddress:kb.gpuAddress + 16 atIndex:2];
-        [at setTexture:lm.gpuResourceID atIndex:0];
-        [e setArgumentTable:at atStages:MTLRenderStageVertex | MTLRenderStageFragment];
-        [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:(NSUInteger)ki indexType:MTLIndexTypeUInt32
-                     indexBuffer:ib.gpuAddress indexBufferLength:ib.length instanceCount:count * 6];
-        [e endEncoding];
-        id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
-        // The views drawn before they are read.
-        [ce barrierAfterQueueStages:MTLStageFragment beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
-        [ce setComputePipelineState:cps];
-        [at setTexture:cap.gpuResourceID atIndex:0];
-        [at setAddress:pb.gpuAddress atIndex:0];
-        [at setAddress:lb.gpuAddress atIndex:1];
-        [at setAddress:kb.gpuAddress atIndex:2];
-        [at setAddress:ob.gpuAddress + sizeof(struct po) * (size_t)first atIndex:3];
-        [ce setArgumentTable:at];
-        [ce dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        [ce endEncoding];
-        NSError *failed = [job run];
-        if (failed) {
-            snprintf(err, (size_t)errlen, "probe capture: %s", failed.localizedDescription.UTF8String);
-            free(g->slot), free(g);
-            return NULL;
+    for (id<MTLAllocation> r in @[ pb, lb, lm, ob ]) [job keep:r];
+    // Distances past the farthest probe a model blends from (the far corner of its cell)
+    // need not be told apart.
+    struct capture cap = {job, dev, pso, cps, dss, lm, pb, lb, ob, np, nl, 2 * step};
+    // The static props: the map alone first, from a grid twice as coarse, for the light
+    // arriving at each prop corner (its two sides lit as the game lights
+    // models, on its model's textures' mean colour, or the map's when they could not be
+    // read); then the map with them, so they block light and give back what they get.
+    const struct bl_props *props = w->props;
+    int nprop = props ? props->ntris : 0;
+    int nprop_corners = 0;
+    NSError *failed = nil;
+    struct bl_gi *coarse = NULL;
+    int world_end = ki, unlit = 0, dropped = 0;  // prop corners no probe of the coarse grid can see
+    if (nprop) {
+        id<MTLBuffer> cpb;
+        coarse = coarse_grid(g, dev, &cpb);
+        id<MTLBuffer> cob = [dev newBufferWithLength:sizeof(struct po) * ((size_t)coarse->nprobes + 1)
+                                             options:MTLResourceStorageModeShared];
+        [job keep:cpb], [job keep:cob];
+        struct capture cc = {job, dev, pso, cps, dss, lm, cpb, lb, cob, coarse->nprobes, nl, 2 * coarse->step};
+        failed = coarse->nprobes ? draw_probes(&cc, verts, kv, idx, ki, ki, GI_RES) : nil;
+        if (!failed) {
+            take_probes(coarse, cob.contents);
+            for (int c = 0; c < 3; c++) refl[c] = refl_area > 0 ? refl[c] / refl_area : 0.5f;
+            verts = realloc(verts, sizeof *verts * ((size_t)kv + 3 * (size_t)nprop));
+            idx = realloc(idx, sizeof *idx * ((size_t)ki + 3 * (size_t)nprop));
+            // The collision models' triangles share their corners: each corner once (so the
+            // views draw it once), lit for the mean of its triangles' normals, by area; corners
+            // of props of different colours apart.
+            size_t cap_n = 64;
+            while (cap_n < 6 * (size_t)nprop) cap_n *= 2;
+            int *at = malloc(sizeof(int) * cap_n);
+            memset(at, 0xff, sizeof(int) * cap_n);
+            int first = kv;
+            for (int i = 0; i < nprop; i++) {
+                const float(*t)[3] = props->tris[i];
+                float e1[3], e2[3], n[3];
+                for (int a = 0; a < 3; a++) e1[a] = t[1][a] - t[0][a], e2[a] = t[2][a] - t[0][a];
+                n[0] = e1[1] * e2[2] - e1[2] * e2[1], n[1] = e1[2] * e2[0] - e1[0] * e2[2], n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+                if (n[0] * n[0] + n[1] * n[1] + n[2] * n[2] < 1e-12f) continue;
+                const float *col = props->refl && props->refl[i][0] >= 0 ? props->refl[i] : refl;
+                for (int k = 0; k < 3; k++) {
+                    uint32_t key[3];
+                    memcpy(key, t[k], 12);
+                    size_t h = ((key[0] * 0x9E3779B1u) ^ (key[1] * 0x85EBCA77u) ^ (key[2] * 0xC2B2AE3Du)) & (cap_n - 1);
+                    while (at[h] >= 0 && (memcmp(verts[at[h]].pos, t[k], 12) || memcmp(verts[at[h]].alb, col, 12)))
+                        h = (h + 1) & (cap_n - 1);
+                    if (at[h] < 0) {
+                        struct gv *v = &verts[kv];
+                        memset(v, 0, sizeof *v);
+                        memcpy(v->pos, t[k], 12), memcpy(v->alb, col, 12);
+                        v->uv[0] = v->uv[1] = -1;
+                        v->sky = 2;
+                        at[h] = kv++;
+                    }
+                    for (int a = 0; a < 3; a++) verts[at[h]].n[a] += n[a];  // summed now, made unit below
+                    idx[ki++] = (uint32_t)at[h];
+                }
+            }
+            free(at);
+            for (int i = first; i < kv; i++) {
+                struct gv *v = &verts[i];
+                float l = sqrtf(v->n[0] * v->n[0] + v->n[1] * v->n[1] + v->n[2] * v->n[2]), back[3], b6[6][3], d6[6][3];
+                float front_light[3] = {0, 0, 0}, back_light[3] = {0, 0, 0};
+                for (int a = 0; a < 3; a++) v->n[a] = l > 1e-9f ? v->n[a] / l : 0, back[a] = -v->n[a];
+                if (prop_light(coarse, v->pos, b6, d6)) cube_light(b6, d6, v->n, front_light), cube_light(b6, d6, back, back_light);
+                else
+                    unlit++, v->sky = -1;  // marked for leaving out
+                for (int c = 0; c < 3; c++) v->emit[c] = v->alb[c] * front_light[c], v->emitb[c] = v->alb[c] * back_light[c];
+            }
+            nprop_corners = kv - first;
+            int kept = world_end;
+            for (int i = world_end; i < ki; i += 3)
+                if (verts[idx[i]].sky > 0 && verts[idx[i + 1]].sky > 0 && verts[idx[i + 2]].sky > 0)
+                    memmove(&idx[kept], &idx[i], 12), kept += 3;
+            dropped = (ki - kept) / 3, ki = kept;
         }
+        bl_gi_free(coarse);
     }
-    g->bounce = malloc(sizeof *g->bounce * (size_t)np);
-    g->direct = malloc(sizeof *g->direct * (size_t)np);
-    g->valid = malloc((size_t)np);
-    const struct po *o = ob.contents;
-    for (int i = 0; i < np; i++) {
-        for (int a = 0; a < 6; a++)
-            for (int c = 0; c < 3; c++) g->bounce[i][a][c] = o[i].b[a][c], g->direct[i][a][c] = o[i].d[a][c];
-        g->valid[i] = o[i].back[0] < 0.1f;
-        g->nvalid += g->valid[i];
+    if (!failed) failed = draw_probes(&cap, verts, kv, idx, world_end, ki, GI_RES);
+    free(verts), free(idx);
+    if (failed) {
+        snprintf(err, (size_t)errlen, "probe capture: %s", failed.localizedDescription.UTF8String);
+        bl_gi_free(g);
+        return NULL;
     }
+    take_probes(g, ob.contents);
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     g->seconds = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
-    snprintf(g->summary, sizeof g->summary, "%s: %d probes %.0f units apart (%d clear of walls), %d lights; %.2f s on %s",
-             w->name, np, step, g->nvalid, nl, g->seconds, dev.name.UTF8String);
+    snprintf(g->summary, sizeof g->summary,
+             "%s: %d probes %.0f units apart (%d clear of walls), %d lights, %d prop triangles (%d of %d props' colours read; %d corners, %d unlit: %d triangles left out); %.2f s on %s",
+             w->name, np, step, g->nvalid, nl, nprop, props ? props->ncolour : 0, props ? props->nfound : 0, nprop_corners, unlit, dropped, g->seconds, dev.name.UTF8String);
     return g;
 }
 
 void bl_gi_free(struct bl_gi *g)
 {
     if (!g) return;
-    free(g->slot), free(g->bounce), free(g->direct), free(g->valid);
+    free(g->slot), free(g->bounce), free(g->direct), free(g->vis), free(g->valid);
     free(g);
+}
+
+float bl_gi_seen(const struct bl_gi *g, int i, const float d[3])
+{
+    static const float F[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    static const float U[6][3] = {{0, 0, 1}, {0, 0, 1}, {0, 0, 1}, {0, 0, 1}, {0, 1, 0}, {0, 1, 0}};
+    float ax = fabsf(d[0]), ay = fabsf(d[1]), az = fabsf(d[2]);
+    float r = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) - GI_VIS_BIAS;
+    if (r <= 0) return 1;
+    int f = ax >= ay && ax >= az ? (d[0] > 0 ? 0 : 1) : ay >= az ? (d[1] > 0 ? 2 : 3) : (d[2] > 0 ? 4 : 5);
+    const float *fv = F[f], *u = U[f];
+    float R[3] = {fv[1] * u[2] - fv[2] * u[1], fv[2] * u[0] - fv[0] * u[2], fv[0] * u[1] - fv[1] * u[0]};
+    float fz = d[0] * fv[0] + d[1] * fv[1] + d[2] * fv[2];
+    float x = (d[0] * R[0] + d[1] * R[1] + d[2] * R[2]) / fz, y = (d[0] * u[0] + d[1] * u[1] + d[2] * u[2]) / fz;
+    int cx = (int)((x + 1) * 0.5f * GI_VIS), cy = (int)((1 - y) * 0.5f * GI_VIS);
+    cx = cx < 0 ? 0 : cx > GI_VIS - 1 ? GI_VIS - 1 : cx, cy = cy < 0 ? 0 : cy > GI_VIS - 1 ? GI_VIS - 1 : cy;
+    const _Float16 *v = g->vis[i][(f * GI_VIS + cy) * GI_VIS + cx];
+    float m = (float)v[0] * g->step, m2 = (float)v[1] * g->step * g->step;
+    if (r <= m) return 1;
+    float var = fmaxf(m2 - m * m, 4.0f), t = r - m, c = var / (var + t * t);
+    return c * c * c;
 }
 
 int bl_gi_sample(const struct bl_gi *g, const float p[3], float bounce[6][3], float direct[6][3])
@@ -450,7 +722,10 @@ int bl_gi_sample(const struct bl_gi *g, const float p[3], float bounce[6][3], fl
         if (x < 0 || y < 0 || z < 0 || x >= g->n[0] || y >= g->n[1] || z >= g->n[2]) continue;
         int i = g->slot[(z * g->n[1] + y) * g->n[0] + x];
         if (i < 0 || !g->valid[i]) continue;
-        float wt = (k & 1 ? f[0] : 1 - f[0]) * (k >> 1 & 1 ? f[1] : 1 - f[1]) * (k >> 2 ? f[2] : 1 - f[2]) + 1e-4f;
+        float d[3] = {p[0] - (g->origin[0] + (float)x * g->step), p[1] - (g->origin[1] + (float)y * g->step),
+                      p[2] - (g->origin[2] + (float)z * g->step)};
+        float wt = ((k & 1 ? f[0] : 1 - f[0]) * (k >> 1 & 1 ? f[1] : 1 - f[1]) * (k >> 2 ? f[2] : 1 - f[2]) + 1e-4f) *
+                   bl_gi_seen(g, i, d);
         for (int a = 0; a < 6; a++)
             for (int ch = 0; ch < 3; ch++) bounce[a][ch] += g->bounce[i][a][ch] * wt, direct[a][ch] += g->direct[i][a][ch] * wt;
         sum += wt;

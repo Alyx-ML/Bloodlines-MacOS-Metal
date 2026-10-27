@@ -2846,6 +2846,54 @@ however they are fenced; a saving would need them as compute passes.
 
 Not verified: a window run, an M1.
 
+## 2026-10-27: Light probes: no light through walls, static props in the capture
+
+Two changes to the light probes (runtime/d3d9/gi_probes.{h,m}), which light characters and
+props from the light around them.
+
+Light through walls. Each probe now keeps how far it sees: for each of its six views, a
+4 x 4 grid of cells (GI_VIS), each with the mean and mean square of the distance to what
+it saw there, capped at twice the probe spacing and stored in probe steps as half floats
+(in world units the square overflowed them on the hub). A model blending its cell's eight
+probes now weights each one by `bl_gi_seen`: 1 when the probe saw at least as far as the
+model in that direction (with GI_VIS_BIAS = 8 units of slack), else Chebyshev's bound on
+its distances there, cubed, as DDGI does. A probe behind a wall from the model counts for
+next to nothing.
+
+Static props in the capture. The props' collision triangles (bl_props) are now drawn into
+the probes' views, so they block light and give back the light that reaches them.
+- That light comes from a first, coarser capture of the map alone (every other probe,
+  twice the spacing, views 8 texels across): at each prop corner, its probes' light (or,
+  past the grid's valid probes, its nearest valid probes within 4 x 4 x 4, by how well they
+  see it over distance squared), on the surface as the game lights models, times the map's
+  mean colour by area. Both sides are lit; a probe sees the side it is in front of.
+- Corners are shared and normals summed by area, so the light is smooth across a prop.
+- Triangles with a corner no probe reaches are left out (props high on buildings, out of
+  the probes' reach).
+- Each batch of probes draws only the props within 1024 units of it.
+
+Verified with tests/gi_view, which now also checks points in open space at a quarter and
+three quarters of each probe cell against their cell's probes, by a line test through the
+map's solid space (props aside). M4 Pro:
+- sm_asylum_1: 945 point and probe pairs with a wall between, 6 still lit (0.6%), mean
+  weight small; of the pairs with no wall between, 4.4% unlit (a prop between, or a wrong
+  call). 3,422 prop triangles, 392 left out. Capture 0.09 s (was 0.06 s).
+- sm_hub_1: 3,345 pairs with a wall between, 13.2% still lit, mean weight 0.139; 3.1% of
+  clear pairs unlit. 72,209 prop triangles, 45,810 left out. Capture 3.85 s (was 2.7 s).
+- Brightness across the probes is close to before on both maps, with no NaN.
+
+The game's runtime builds and `boot` links (after a rebuild of the client module for the
+HUD work's new name, `client_PlayerKindred`).
+
+### Not done
+- Props are lit on the map's mean colour, not their own textures.
+- Displacements are still not in the capture.
+- 13% of the hub's pairs with a wall between still get some light (thin walls, and the
+  coarse 4 x 4 cells).
+
+### Not verified
+- Not seen in game. Not run on an M1.
+
 ## 2026-10-27: Gothic HUD
 
 - Health and blood are two plain glass vials low on the screen's edges (pale blue left,
@@ -2883,3 +2931,115 @@ Not verified: a window run, an M1.
 - Not seen in game yet: the vials' look and fill, the discipline symbol's crop (44 of its
   64 texel rows), the ammo numbers and their position, unusable powers (the game tinted
   them; the symbol isn't dimmed yet).
+
+
+## 2026-10-27: Occlusion, skin, pores, prop contact shadows, characters' bounced light
+
+Eight changes to the effects (runtime/d3d9/metal_render.m unless named).
+
+Ambient occlusion:
+- To full resolution by depth (ao_up, as the bounced light's ssil_upscale): each of the
+  four half-resolution pixels around weighted by how close its depth is to the pixel's.
+  It was a plain bilinear stretch, which left dark fringes along characters' outlines.
+  The contact shadows go through the same step.
+- Under TAA the sample pattern turns each frame and the filtered result is blended with
+  last frame's (ao_history: followed back along the camera's motion vectors, kept within
+  the 3x3 neighbourhood's range, dropped where the depth there changed). Still 3 slices of
+  6 steps; fewer steps not tried.
+- Bright pixels are not darkened (ao_apply now reads the image back, framebuffer fetch):
+  from the brightest channel at 0.7 to 1 the occlusion fades out (lamps, neon, lit signs).
+  The contact shadows keep darkening there.
+
+Skin:
+- The blur is skin's measured profile (d'Eon and Luebke 2007, six Gaussians) in place of
+  one bell curve per channel, scaled so red reaches as far as before (one width is red's
+  spread, 1.18 mm); green and blue now stay nearly sharp, and red's long tail reaches three
+  widths. The weights per half width are worked out with erf (in the comment).
+- Light through thin parts (skin_through, BL_SSS_THROUGH, default 1): with the shadows
+  section's atlas, the skin pass finds each skin pixel in its character's caster (the
+  caster's orthographic rows, now kept per cell by shadow_draw), and how far it lies behind
+  the nearest caster there is the thickness towards that light. The map's lights that
+  shine the way the shadow falls, on the side facing away from them, come through as
+  exp(-thickness / (0.9, 0.3, 0.18) world units) on the skin's own colour (from the
+  surfaces' colour, which is now drawn whenever this is on).
+
+Skin detail (tex_detail.m, d3d9_shader.c): faces get a mask from their texture's colours
+(face_mask, RG8): no pores on the lips (red, by Cr), on what is much darker than the face's
+mean skin (eyebrows, lashes, the lids' lines and make-up, nostrils) or on hair; pores up to
+1.4 times as big where the skin is redder than its mean (cheeks, nose) and down to 0.7
+where it is paler (forehead) or a little darker (round the eyes), smoothed over a twentieth
+of the texture. The size moves the pore grid's level, never coarser than the largest size
+allowed in the world. Tried first in Python on Jeanette's and Bishop Vick's faces (pictures
+in native/build/face_mask_*.png): pores on 69% and 31% of their textures.
+
+Contact shadows: props cast them too (bottles on a bar, chairs on a floor), onto anything.
+Props are marked in the surfaces' colour's alpha (0.5; d3d_shader_variant albedo 2): draws
+with a vertex shader, not skinned, without a second set of texture coordinates (the map's
+brushes read their lightmaps with one). The surfaces' colour is now drawn whenever the
+contact shadows are on.
+
+Bounced light: characters take none of the screen-space bounced light when the light
+probes light them (their ambient cube is the light from all round already); the screen's
+leaves out what is behind the camera, so it changed as the camera turned.
+
+The shaders compile (offline, xcrun metal, but for the pore shader, which the translator
+makes at run time); the runtime builds and `boot` links.
+
+### Not done
+- Occlusion and bounced light in one pass (the visibility bitmasks for both). Waiting
+  until these are seen in game, since it changes how the bounced light looks.
+
+### Not verified
+- Not run at all: not seen in game, no timings, no M1.
+
+## 2026-10-27: Probes with props' colours and displacements; occlusion and bounced light in one pass; the effects' traces as compute
+
+Light probes (gi_probes.m, bl_props.c, bl_bsp.c):
+- Static props give back light in their own colour, not the map's mean: each model's
+  first skin's textures (the .mdl's texture table at 0x124, material folders at 0x12c,
+  skins at 0x134), each one's .vmt, its $basetexture's .tth, whose VTF header holds the
+  texture's mean colour at 0x20. Read for 73 of the asylum's 80 shadow-casting props, 615
+  of the hub's 714, 130 of the pier's 147 (the rest keep the map's mean). Corners of props
+  of different colours are kept apart.
+- Displacements (terrain) are in the capture now; they were holes before. Read as Half-Life
+  2's (176-byte records, 20-byte points); rows of 2^power + 1 points from the face's corner
+  at the start position. Their lightmap is laid over the grid with s from corner 0 to 3 and
+  t from 0 to 1: worked out from three faces whose lightmap sizes do not match the
+  texinfo's projection the other way round (sm_pier_1 4695 and 4705, sm_hub_1 11898). 9 in
+  the hub, 15 on the pier, none in the asylum.
+- gi_vis: asylum unchanged (0.2% of points behind a wall still lit); pier 2.2%.
+
+Contact shadows: from the two lights that give a pixel the most (16 steps towards the first,
+8 towards the second when it gives a sixth or more), each by its share.
+
+Skin, light through thin parts: every light behind the surface comes through, those along
+the shadow's direction in full and the others at half (the atlas measures thickness only
+that way).
+
+Ambient occlusion: 2 slices instead of 3 under TAA (its history makes up the rest).
+
+Occlusion and bounced light in one pass (ao_main_il): the bounced light is gathered along
+the occlusion's own steps, plus 3 a side out to BL_SSIL_RADIUS, each step's colour counting
+for the sectors it is the first to cover (Therrien et al. 2023's indirect light from the
+visibility bitmasks). This replaces the Godot/ASSAO trace and its normals pass; Godot's depth
+edges, smart blur, history and upscale stay. Asylum, BL_GPU_STATS=2: the occlusion and the
+old trace with its normals took about 2.6 ms; now 0.92 ms together.
+
+The traces as compute (post_traces): the occlusion, the contact shadows and the haze are
+kernels in one compute encoder, with no barrier between them (BLCompute dispatchAlongside),
+since none reads another's result; their filters follow as before. Only their five output
+textures are writable (writable textures may not be kept compressed; with all of the
+effects' textures writable it was slower). Asylum, 1500 frames: the effects' GPU time 4.35
+to 4.01 ms a frame, the whole frame unchanged (11.7 ms, BL_GPU_STATS=1, both).
+
+The shaders compile offline (xcrun metal); the runtime builds, `boot` links, and four
+headless asylum runs went 1500 frames without errors.
+
+### Not done
+- Reflections fitted to the room (cubemaps corrected by the probes' distances): the game's
+  shaders sample the cubemaps, so it needs the shader translator to rewrite those lookups,
+  the cubemaps' places (lump 42) and the probes' distances on the GPU. Left for its own step.
+
+### Not verified
+- Not seen in a window: the new bounced light (its look will differ from the Godot trace's),
+  the contact shadows, the skin. No M1.

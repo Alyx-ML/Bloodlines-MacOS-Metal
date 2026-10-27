@@ -57,6 +57,9 @@ __attribute__((objc_direct_members))
 - (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i;
 - (void)setBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i;
 - (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)threads;
+// With no barrier before it, so it runs alongside the dispatches before: for work that
+// reads nothing the encoder's earlier commands write (later commands still wait for it).
+- (void)dispatchAlongside:(MTLSize)groups threadsPerThreadgroup:(MTLSize)threads;
 - (void)copyFromTexture:(id<MTLTexture>)src toTexture:(id<MTLTexture>)dst;
 - (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl
            sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)dst

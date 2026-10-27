@@ -296,6 +296,12 @@ id<MTLFence> mtl4_fence(void) { return fence; }
     [_e dispatchThreadgroups:groups threadsPerThreadgroup:threads];
 }
 
+- (void)dispatchAlongside:(MTLSize)groups threadsPerThreadgroup:(MTLSize)threads
+{
+    _commands++;
+    [_e dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+}
+
 - (void)copyFromTexture:(id<MTLTexture>)src toTexture:(id<MTLTexture>)dst
 {
     mtl4_track(src), mtl4_track(dst);

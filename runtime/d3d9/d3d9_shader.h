@@ -82,8 +82,9 @@ struct d3d_shader_variant {
     uint8_t rebake;
     // Pixel: also write [[color(2)]] for the bounced light (metal_render.m ssil_run): the
     // surface's own colour, the first 2D texture it reads that is not a lightmap or
-    // shadow (stage 0's with the fixed-function stages), alpha 1; mid grey for one that
-    // reads none.
+    // shadow (stage 0's with the fixed-function stages), alpha 1 (0.5 with albedo 2, a prop,
+    // for the contact shadows; 0.8 with 3, the map's own lightmapped surfaces, for the
+    // bounced light); mid grey for one that reads none.
     uint8_t albedo;
     // Pixel: also write [[color(3)]] for the reflections (metal_render.m surface_texture):
     // the view-space normal, from the surface's slope (the view depth, in.fogz, across the

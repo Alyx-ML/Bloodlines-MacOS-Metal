@@ -27,6 +27,13 @@
 // offset), all as in Half-Life 2 but for the strip groups: 20 bytes, the vertex and index
 // counts as 16 bits, flags, and the offsets of a vertex table (16-bit vertex numbers in
 // the mesh), the indices (triangle lists) and the strips.
+//
+// A prop's colour, for the light it gives back (gi_probes.m): the .mdl's textures at 0x124
+// (count, offset; 20 bytes each, the name's offset from the entry first), its material
+// folders at 0x12c (count, offset of name offsets) and its skins at 0x134 (references per
+// family, families, offset of 16-bit texture numbers); the first family's textures, each
+// the first folder holding its .vmt, whose $basetexture's .tth (Troika's header, then a
+// VTF 7.x one) gives its mean colour, linear, at 0x20 into the VTF header.
 #include "bl_props.h"
 #include <dirent.h>
 #include <math.h>
@@ -175,6 +182,65 @@ static uint8_t *search_read(const struct search *s, const char *name, long *size
         free(d);
     }
     return NULL;
+}
+
+// The mean colour of a model's textures (its first skin), from its .mdl; 0 when none read.
+static int mdl_colour(const struct search *s, const uint8_t *m, long mn, float out[3])
+{
+    if (mn < 0x140 || memcmp(m, "IDST", 4) || rd32(m + 4) != 2531) return 0;
+    int nt = rd32(m + 0x124), to = rd32(m + 0x128), nc = rd32(m + 0x12c), co = rd32(m + 0x130);
+    int nref = rd32(m + 0x134), so = rd32(m + 0x13c);
+    if (nt <= 0 || nc <= 0 || to < 0 || to + 20L * nt > mn || co < 0 || co + 4L * nc > mn || nref <= 0 || so < 0 ||
+        so + 2L * nref > mn)
+        return 0;
+    float sum[3] = {0, 0, 0};
+    int got = 0;
+    for (int r = 0; r < nref; r++) {
+        int t = rd16(m + so + 2 * r);
+        if (t < 0 || t >= nt) continue;
+        long name = to + 20L * t + rd32(m + to + 20L * t);
+        if (name < 0 || name >= mn || !memchr(m + name, 0, (size_t)(mn - name))) continue;
+        for (int c = 0; c < nc; c++) {
+            long dir = rd32(m + co + 4 * c);
+            if (dir < 0 || dir >= mn || !memchr(m + dir, 0, (size_t)(mn - dir))) continue;
+            char path[512];
+            snprintf(path, sizeof path, "materials/%s%s.vmt", (const char *)m + dir, (const char *)m + name);
+            for (char *q = path; *q; q++) *q = *q == '\\' ? '/' : *q;
+            long vl = 0;
+            uint8_t *vmt = search_read(s, path, &vl);
+            if (!vmt) continue;
+            // $basetexture's value, quoted or not ($basetexture2 is a blend's second).
+            char *v = realloc(vmt, (size_t)vl + 1), *k = v, tex[256] = "";
+            v[vl] = 0;
+            while ((k = strcasestr(k, "$basetexture"))) {
+                k += 12;
+                if (!*k || !strchr("\" \t", *k)) continue;  // not $basetexture2, $basetexturetransform
+                k += strspn(k, "\" \t");
+                size_t l = strcspn(k, "\" \t\r\n");
+                if (l && l < sizeof tex) memcpy(tex, k, l), tex[l] = 0;
+                break;
+            }
+            free(v);
+            if (!*tex) break;
+            snprintf(path, sizeof path, "materials/%s.tth", tex);
+            for (char *q = path; *q; q++) *q = *q == '\\' ? '/' : *q;
+            long hl = 0;
+            uint8_t *h = search_read(s, path, &hl);
+            for (long i = 0; h && i + 44 <= hl && i < 256; i++)
+                if (!memcmp(h + i, "VTF", 4)) {
+                    float c3[3] = {rdf(h + i + 32), rdf(h + i + 36), rdf(h + i + 40)};
+                    if (c3[0] >= 0 && c3[0] <= 1 && c3[1] >= 0 && c3[1] <= 1 && c3[2] >= 0 && c3[2] <= 1)
+                        for (int a = 0; a < 3; a++) sum[a] += c3[a];
+                    got += c3[0] >= 0 && c3[0] <= 1 && c3[1] >= 0 && c3[1] <= 1 && c3[2] >= 0 && c3[2] <= 1;
+                    break;
+                }
+            free(h);
+            break;
+        }
+    }
+    if (!got) return 0;
+    for (int a = 0; a < 3; a++) out[a] = sum[a] / (float)got;
+    return 1;
 }
 
 // A model's collision triangles, in the model's own space (inches), appended to *out.
@@ -342,6 +408,9 @@ struct bl_props *bl_props_load(const char *bsp_path, const uint8_t *d, long size
     struct tris *phy = calloc((size_t)nnames + 1, sizeof *phy), *mesh = calloc((size_t)nnames + 1, sizeof *mesh),
                 *box = calloc((size_t)nnames + 1, sizeof *box);
     char *tried = calloc((size_t)nnames + 1, 1);
+    float(*colour)[3] = calloc((size_t)nnames + 1, sizeof *colour);
+    float(*refl)[3] = NULL;
+    int refl_cap = 0;
     struct search s;
     search_open(&s, bsp_path);
     struct tris all = {0};
@@ -368,6 +437,7 @@ struct bl_props *bl_props_load(const char *bsp_path, const uint8_t *d, long size
                 strcpy(dot, ".dx80.vtx");
                 uint8_t *vx = md ? search_read(&s, name, &vl) : NULL;
                 if (vx) mdl_tris(md, ml, vx, vl, &mesh[m]);
+                if (!md || !mdl_colour(&s, md, ml, colour[m])) colour[m][0] = -1;
                 if (md && ml >= 0xcc) {  // the hull: its corners at 0xb4 and 0xc0
                     float lo[3], hi[3];
                     for (int k = 0; k < 3; k++) lo[k] = rdf(md + 0xb4 + 4 * k), hi[k] = rdf(md + 0xc0 + 4 * k);
@@ -387,6 +457,7 @@ struct bl_props *bl_props_load(const char *bsp_path, const uint8_t *d, long size
         if (!model->n) continue;
         out->nfound++;
         out->nbox += model == &box[m], out->nmesh += model == &mesh[m];
+        out->ncolour += colour[m][0] >= 0;
         float o[3] = {rdf(q), rdf(q + 4), rdf(q + 8)}, a[3] = {rdf(q + 12), rdf(q + 16), rdf(q + 20)}, r[3][3];
         angle_matrix(a, r);
         for (int t = 0; t < model->n; t++) {
@@ -397,18 +468,20 @@ struct bl_props *bl_props_load(const char *bsp_path, const uint8_t *d, long size
                     v[c][k] = o[k] + r[k][0] * l[0] + r[k][1] * l[1] + r[k][2] * l[2];
                 }
             add_tri(&all, v[0], v[1], v[2]);
+            if (refl_cap < all.cap) refl_cap = all.cap, refl = realloc(refl, sizeof *refl * (size_t)refl_cap);
+            memcpy(refl[all.n - 1], colour[m], 12);
         }
     }
     for (int i = 0; i < nnames; i++) free(phy[i].t), free(mesh[i].t), free(box[i].t);
-    free(phy), free(mesh), free(box), free(tried);
+    free(phy), free(mesh), free(box), free(tried), free(colour);
     search_close(&s);
-    out->tris = all.t, out->ntris = all.n;
+    out->tris = all.t, out->refl = refl, out->ntris = all.n;
     return out;
 }
 
 void bl_props_free(struct bl_props *p)
 {
     if (!p) return;
-    free(p->tris);
+    free(p->tris), free(p->refl);
     free(p);
 }

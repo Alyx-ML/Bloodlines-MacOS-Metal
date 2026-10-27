@@ -36,7 +36,9 @@ struct bl_bsp_face {
     int model;             // 0 the world, else a brush entity (a door, a window)
     float origin[3];       // where its brush entity stands: its corners and plane are the
                            // model's own, so add this for the world position; 0 for the world
-    int disp;              // displacement (not read): -1 none
+    int disp;              // displacement: -1 none
+    int dfirst, dside;     // a displacement's surface: dside x dside points, rows from its
+                           // start corner to the next, world->dverts[dfirst ..]; dside 0: none
     int lightofs;          // into world->lighting, in samples (4 bytes each); -1: no lightmap
     uint8_t styles[8];     // light styles, 255 unused; each a set of samples
     int nstyles;
@@ -77,6 +79,9 @@ struct bl_bsp_world {
     int ntexdata;
     struct bl_bsp_worldlight *lights;
     int nlights;
+    struct bl_bsp_dvert { float pos[3], lux[2]; } *dverts;  // displacements' points, luxels
+                                                            // from their lightmap's corner
+    int ndverts;
     uint8_t *lighting;  // the lighting lump: RGBE samples (r, g, b, signed exponent)
     int nsamples;
     int means;          // each face's mean colour per style comes before its samples

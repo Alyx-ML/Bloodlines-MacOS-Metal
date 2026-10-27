@@ -32,7 +32,8 @@ id<MTLTexture> bl_load_height_map(id<MTLDevice> dev, const char *path);
 int bl_detail_is_face(uint64_t key, uint32_t w, uint32_t h);
 
 // Where a body texture `key` (w x h) shows skin (R8, 1 skin), from its colours when its
-// map was loaded; nil for faces (all skin) and textures without a map.
+// map was loaded; for a face, where its pores go and how big (RG8: strength, size less
+// 0.5); nil for textures without a map.
 id<MTLTexture> bl_detail_skin_mask(uint64_t key, uint32_t w, uint32_t h);
 
 // A flat normal map (roughness 0.5) for character parts without one of their own (hair,

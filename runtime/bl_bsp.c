@@ -255,6 +255,14 @@ int bl_bsp_lights(const float cam[3], struct bl_light *out, int max)
 // Half-Life 2 has four styles in 56 bytes. Maps compiled again for the Unofficial Patch
 // hold each face's mean colour per style just before its samples (lightofs), as Half-Life
 // 2's do; the original maps do not (world->means says which, from the lump's size).
+//
+// Displacements as Half-Life 2's: 176 bytes each (lump 26: the start position, the first
+// of its points in lump 33, the first triangle, the power), points 20 bytes (a direction,
+// a distance, alpha). Its face's four corners, from the one at the start position: rows
+// of 2^power + 1 points run from corner 0 to corner 1 (and 3 to 2), each from the first
+// edge to the second, as the map compiler built them; a point is that place on the face
+// plus its direction times its distance. The lightmap is laid over the grid: across (s)
+// from corner 0 to corner 3, down (t) from corner 0 to corner 1, size + 1 luxels each way.
 
 struct bl_bsp_world *bl_bsp_world_load(const char *path, char *err, int errlen)
 {
@@ -377,6 +385,35 @@ struct bl_bsp_world *bl_bsp_world_load(const char *path, char *err, int errlen)
         memcpy(fc->origin, mo[fc->model], sizeof fc->origin);
     }
     free(mo);
+    int ndisp = len[26] / 176, nraw = len[33] / 20;
+    for (int i = 0; i < w->nfaces; i++) {
+        struct bl_bsp_face *fc = &w->faces[i];
+        if (fc->disp < 0 || fc->disp >= ndisp || fc->count != 4) continue;
+        const uint8_t *q = lump[26] + 176 * fc->disp;
+        int first = rd32(q + 12), power = rd32(q + 20), n = (1 << (power & 7)) + 1;
+        if (power < 2 || power > 4 || first < 0 || first + n * n > nraw) continue;
+        float c[4][3], best = 1e30f;
+        int start = 0;
+        for (int k = 0; k < 4; k++) {
+            float d2 = 0;
+            for (int a = 0; a < 3; a++) c[k][a] = w->verts[w->index[fc->first + k]][a], d2 += (c[k][a] - rdf(q + 4 * a)) * (c[k][a] - rdf(q + 4 * a));
+            if (d2 < best) best = d2, start = k;
+        }
+        w->dverts = realloc(w->dverts, sizeof *w->dverts * (size_t)(w->ndverts + n * n));
+        fc->dfirst = w->ndverts, fc->dside = n;
+        const float *p0 = c[start], *p1 = c[(start + 1) & 3], *p2 = c[(start + 2) & 3], *p3 = c[(start + 3) & 3];
+        for (int r = 0; r < n; r++)
+            for (int k = 0; k < n; k++) {
+                float u = (float)r / (float)(n - 1), v = (float)k / (float)(n - 1);
+                const uint8_t *dv = lump[33] + 20 * (first + r * n + k);
+                struct bl_bsp_dvert *o = &w->dverts[w->ndverts++];
+                for (int a = 0; a < 3; a++) {
+                    float e0 = p0[a] + (p1[a] - p0[a]) * u, e1 = p3[a] + (p2[a] - p3[a]) * u;
+                    o->pos[a] = e0 + (e1 - e0) * v + rdf(dv + 4 * a) * rdf(dv + 12);
+                }
+                o->lux[0] = v * (float)fc->size[0], o->lux[1] = u * (float)fc->size[1];
+            }
+    }
     w->nlights = len[15] / 88;
     w->lights = calloc((size_t)w->nlights + 1, sizeof *w->lights);
     for (int i = 0; i < w->nlights; i++) {
@@ -422,6 +459,7 @@ void bl_bsp_world_free(struct bl_bsp_world *w)
 {
     if (!w) return;
     free(w->verts), free(w->index), free(w->faces), free(w->texinfo), free(w->texdata), free(w->lights), free(w->lighting);
+    free(w->dverts);
     bl_props_free(w->props);
     free(w->planes), free(w->nodes), free(w->leaves);
     free(w);

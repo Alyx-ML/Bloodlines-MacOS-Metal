@@ -8,7 +8,9 @@
 
 struct bl_props {
     float (*tris)[3][3];  // world space
+    float (*refl)[3];     // each triangle's colour: its model's textures' mean (x < 0: unknown)
     int ntris;
+    int ncolour;          // props whose colour was read
     int nprops;           // static props in the map
     int nshadow;          // of those, ones that cast shadows
     int nfound;           // of those, ones whose shape was read

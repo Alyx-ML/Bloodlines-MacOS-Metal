@@ -1,6 +1,8 @@
 // Captures a map's light probes (gi_probes.m) as the game would at load and prints how
 // long it took and what the light is like: how bright the probes in the open are, from
-// the map's surfaces and from its lights, and a few probes in full.
+// the map's surfaces and from its lights, a few probes in full, and how well the probes
+// tell which points they can see (bl_gi_seen against a line test through the map's solid
+// space: a probe that light reaches through a wall leaks).
 //   gi_view <map.bsp>
 //   clang -std=c2x -O2 -Wall -fobjc-arc -Iruntime -Iruntime/d3d9 tests/gi_view.m runtime/d3d9/gi_probes.m
 //     runtime/d3d9/lm_bake.m runtime/bl_bsp.c runtime/bl_props.c -framework Metal -framework Foundation
@@ -8,6 +10,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 
 #include "gi_probes.h"
@@ -68,6 +71,41 @@ int main(int argc, char **argv)
             break;
         }
     }
+    // Points through each probe's cell (in open space), against the cell's eight probes.
+    long clear = 0, blocked = 0, leaks = 0, false_blocks = 0;
+    double seen_blocked = 0;
+    for (int c = 0; c < g->n[0] * g->n[1] * g->n[2]; c++) {
+        if (g->slot[c] < 0) continue;
+        int x = c % g->n[0], y = c / g->n[0] % g->n[1], z = c / (g->n[0] * g->n[1]);
+        for (int k = 0; k < 8; k++) {
+            float q[3] = {g->origin[0] + ((float)x + (k & 1 ? 0.75f : 0.25f)) * g->step,
+                          g->origin[1] + ((float)y + (k & 2 ? 0.75f : 0.25f)) * g->step,
+                          g->origin[2] + ((float)z + (k & 4 ? 0.75f : 0.25f)) * g->step};
+            if (!bl_bsp_world_open(w, q)) continue;
+            for (int j = 0; j < 8; j++) {
+                int px = x + (j & 1), py = y + (j >> 1 & 1), pz = z + (j >> 2);
+                if (px >= g->n[0] || py >= g->n[1] || pz >= g->n[2]) continue;
+                int i = g->slot[(pz * g->n[1] + py) * g->n[0] + px];
+                if (i < 0 || !g->valid[i]) continue;
+                float P[3] = {g->origin[0] + (float)px * g->step, g->origin[1] + (float)py * g->step,
+                              g->origin[2] + (float)pz * g->step};
+                float d[3] = {q[0] - P[0], q[1] - P[1], q[2] - P[2]};
+                float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                int open = 1;
+                for (float t = 2; open && t < len; t += 2) {
+                    float r[3] = {P[0] + d[0] * t / len, P[1] + d[1] * t / len, P[2] + d[2] * t / len};
+                    open = bl_bsp_world_open(w, r);
+                }
+                float s = bl_gi_seen(g, i, d);
+                if (open) clear++, false_blocks += s < 0.5f;
+                else blocked++, leaks += s >= 0.5f, seen_blocked += s;
+            }
+        }
+    }
+    printf("points against their cell's probes: %ld with a wall between, of those %ld still lit (%.1f%%), mean %.3f;\n"
+           "  %ld with none, of those %ld left unlit (%.1f%%: a prop between, or wrongly)\n",
+           blocked, leaks, blocked ? 100.0 * (double)leaks / (double)blocked : 0, blocked ? seen_blocked / (double)blocked : 0,
+           clear, false_blocks, clear ? 100.0 * (double)false_blocks / (double)clear : 0);
     bl_gi_free(g);
     bl_bsp_world_free(w);
     return 0;
