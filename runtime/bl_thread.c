@@ -110,6 +110,9 @@ struct waitable {
     int signaled, manual;
     int sem_count, sem_max;  // semaphores: signaled while sem_count > 0
     int is_sem;
+    // mutexes: signaled while no thread owns it; the owner may take it again (depth)
+    int is_mutex, depth;
+    uint64_t owner;
     // threads only
     pthread_t thread;
     int started;
@@ -134,6 +137,13 @@ static void waitable_signal(struct waitable *w)
     pthread_mutex_unlock(&w->m);
 }
 
+static uint64_t self_id(void)
+{
+    uint64_t tid;
+    pthread_threadid_np(NULL, &tid);
+    return tid;
+}
+
 static uint32_t waitable_wait(struct waitable *w, uint32_t ms)
 {
     struct timespec until;
@@ -144,6 +154,11 @@ static uint32_t waitable_wait(struct waitable *w, uint32_t ms)
         if (until.tv_nsec >= 1000000000) until.tv_sec++, until.tv_nsec -= 1000000000;
     }
     pthread_mutex_lock(&w->m);
+    if (w->is_mutex && w->owner == self_id()) {  // taken again by its owner, as on Windows
+        w->depth++;
+        pthread_mutex_unlock(&w->m);
+        return WAIT_OBJECT_0;
+    }
     int timed_out = 0;
     while (!w->signaled && !timed_out) {
         if (ms == INFINITE)
@@ -157,16 +172,61 @@ static uint32_t waitable_wait(struct waitable *w, uint32_t ms)
             w->signaled = --w->sem_count > 0;
         else if (!w->manual)
             w->signaled = 0;
+        if (w->is_mutex) w->owner = self_id(), w->depth = 1;
         r = WAIT_OBJECT_0;
     }
     pthread_mutex_unlock(&w->m);
     return r;
 }
 
+// Named events, mutexes and semaphores: creating one with a name already in use opens
+// the existing object, with ERROR_ALREADY_EXISTS (single-instance checks read that).
+// Objects are never freed (bl_sync_close), so the table holds them for good.
+enum { KIND_EVENT, KIND_MUTEX, KIND_SEMAPHORE };
+static struct named { char *name; int kind; struct waitable *w; } *named;
+static size_t nnamed;
+static pthread_mutex_t named_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// The object `name` (guest string, or 0) already has, or what make() returns, as a new
+// handle; 0 if the name belongs to another kind of object.
+static uint32_t create_named(uint32_t name, int kind, struct waitable *(*make)(void *), void *arg)
+{
+    if (!name) {
+        bl_set_last_error(0);
+        return bl_handle_new(BL_H_EVENT, make(arg));
+    }
+    const char *n = (const char *)bl_g2h(name);
+    pthread_mutex_lock(&named_lock);
+    for (size_t i = 0; i < nnamed; i++)
+        if (!strcmp(named[i].name, n)) {
+            struct waitable *w = named[i].kind == kind ? named[i].w : NULL;
+            pthread_mutex_unlock(&named_lock);
+            if (!w) {
+                bl_set_last_error(BL_ERROR_INVALID_HANDLE);
+                return 0;
+            }
+            bl_set_last_error(BL_ERROR_ALREADY_EXISTS);
+            return bl_handle_new(BL_H_EVENT, w);
+        }
+    struct waitable *w = make(arg);
+    named = realloc(named, (nnamed + 1) * sizeof *named);
+    named[nnamed++] = (struct named){strdup(n), kind, w};
+    pthread_mutex_unlock(&named_lock);
+    bl_set_last_error(0);
+    return bl_handle_new(BL_H_EVENT, w);
+}
+
+static struct waitable *make_event(void *arg)
+{
+    const int *a = arg;  // manual, initial
+    return waitable_new(a[0], a[1]);
+}
+
 uint32_t bl_k32_CreateEventA_c(uint32_t sec, uint32_t manual, uint32_t initial, uint32_t name)
 {
-    (void)sec, (void)name;
-    return bl_handle_new(BL_H_EVENT, waitable_new(manual != 0, initial != 0));
+    (void)sec;
+    int a[2] = {manual != 0, initial != 0};
+    return create_named(name, KIND_EVENT, make_event, a);
 }
 
 uint32_t bl_k32_SetEvent_c(uint32_t h)
@@ -196,24 +256,61 @@ uint32_t bl_k32_ResetEvent_c(uint32_t h)
     return 1;
 }
 
-// Mutexes are auto-reset events that start signaled (not recursive: a thread that
-// takes one twice deadlocks, unlike Windows). Semaphores keep a count.
-uint32_t bl_k32_CreateMutexA_c(uint32_t sec, uint32_t owned, uint32_t name)
+// Mutexes are auto-reset events, signaled while free, that remember their owner: it may
+// take one again without blocking, and must release it as many times. Semaphores keep a
+// count.
+static struct waitable *make_mutex(void *arg)
 {
-    (void)sec, (void)name;
-    return bl_handle_new(BL_H_EVENT, waitable_new(0, !owned));
+    int owned = *(const int *)arg;
+    struct waitable *w = waitable_new(0, !owned);
+    w->is_mutex = 1;
+    if (owned) w->owner = self_id(), w->depth = 1;
+    return w;
 }
 
-uint32_t bl_k32_ReleaseMutex_c(uint32_t h) { return bl_k32_SetEvent_c(h); }
+uint32_t bl_k32_CreateMutexA_c(uint32_t sec, uint32_t owned, uint32_t name)
+{
+    (void)sec;
+    int o = owned != 0;  // ignored for an existing named mutex, as on Windows
+    return create_named(name, KIND_MUTEX, make_mutex, &o);
+}
+
+uint32_t bl_k32_ReleaseMutex_c(uint32_t h)
+{
+    struct waitable *w = bl_handle_get(h, BL_H_EVENT);
+    if (!w || !w->is_mutex) {
+        bl_set_last_error(BL_ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    pthread_mutex_lock(&w->m);
+    if (w->owner != self_id()) {
+        pthread_mutex_unlock(&w->m);
+        bl_set_last_error(288);  // ERROR_NOT_OWNER
+        return 0;
+    }
+    if (--w->depth == 0) {
+        w->owner = 0, w->signaled = 1;
+        pthread_cond_broadcast(&w->c);
+    }
+    pthread_mutex_unlock(&w->m);
+    return 1;
+}
+
+static struct waitable *make_semaphore(void *arg)
+{
+    const uint32_t *a = arg;  // initial, max
+    struct waitable *w = waitable_new(0, a[0] > 0);
+    w->is_sem = 1;
+    w->sem_count = (int)a[0];
+    w->sem_max = (int)a[1];
+    return w;
+}
 
 uint32_t bl_k32_CreateSemaphoreA_c(uint32_t sec, uint32_t initial, uint32_t max, uint32_t name)
 {
-    (void)sec, (void)name;
-    struct waitable *w = waitable_new(0, initial > 0);
-    w->is_sem = 1;
-    w->sem_count = (int)initial;
-    w->sem_max = (int)max;
-    return bl_handle_new(BL_H_EVENT, w);
+    (void)sec;
+    uint32_t a[2] = {initial, max};
+    return create_named(name, KIND_SEMAPHORE, make_semaphore, a);
 }
 
 uint32_t bl_k32_ReleaseSemaphore_c(uint32_t h, uint32_t n, uint32_t prev)
@@ -243,7 +340,7 @@ uint32_t bl_k32_WaitForMultipleObjects_c(uint32_t n, uint32_t handles, uint32_t 
             struct waitable *w = waitable_of(U32(handles + 4 * i));
             if (!w) return 0xffffffffu;
             if (!all && waitable_wait(w, 0) == WAIT_OBJECT_0) return WAIT_OBJECT_0 + i;
-            if (all) ready += w->signaled != 0;
+            if (all) ready += w->signaled || (w->is_mutex && w->owner == self_id());
         }
         if (all && ready == n) {
             for (uint32_t i = 0; i < n; i++) waitable_wait(waitable_of(U32(handles + 4 * i)), 0);

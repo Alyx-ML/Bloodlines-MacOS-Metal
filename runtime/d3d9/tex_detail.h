@@ -11,7 +11,7 @@
 // format `format`, rows `pitch` bytes apart), or nil; *color the upscaled texture to draw
 // in its place (tools/tex_upscale.py), or nil. Remembered per texture; `stamp` changes
 // when the game refills it.
-id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t stamp, uint32_t w, uint32_t h,
+id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, uint64_t key, uint32_t stamp, uint32_t w, uint32_t h,
                                 uint32_t format, const uint8_t *data, uint32_t pitch, id<MTLTexture> *color);
 
 // Starts loading the normal map and upscaled colour for a top level the game just filled,
@@ -29,11 +29,11 @@ id<MTLTexture> bl_load_height_map(id<MTLDevice> dev, const char *path);
 
 // Whether the texture `key` (w x h) is a face or a head by its file's name (with "face"
 // or "head" in it, not "hair"), for the skin detail; after bl_detail_normal saw it.
-int bl_detail_is_face(const void *key, uint32_t w, uint32_t h);
+int bl_detail_is_face(uint64_t key, uint32_t w, uint32_t h);
 
 // Where a body texture `key` (w x h) shows skin (R8, 1 skin), from its colours when its
 // map was loaded; nil for faces (all skin) and textures without a map.
-id<MTLTexture> bl_detail_skin_mask(const void *key, uint32_t w, uint32_t h);
+id<MTLTexture> bl_detail_skin_mask(uint64_t key, uint32_t w, uint32_t h);
 
 // A flat normal map (roughness 0.5) for character parts without one of their own (hair,
 // teeth, characters not in the list), so they get the same light as the rest.
@@ -59,4 +59,7 @@ struct bl_hair_mesh {
 };
 
 // The hair mesh for the texture `key` (w x h), or NULL; after bl_detail_normal saw it.
-const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, const void *key, uint32_t w, uint32_t h);
+const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, uint64_t key, uint32_t w, uint32_t h);
+
+// The texture `key` (w x h) is gone: what was remembered for it is dropped.
+void bl_detail_forget(uint64_t key, uint32_t w, uint32_t h);

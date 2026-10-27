@@ -101,6 +101,12 @@ static void set_out(int o, int down)
         bl_cocoa_key(out_key[o], down);
 }
 
+// The window lost focus (bl_cocoa.m release_all): the pad's keys and buttons go up.
+void bl_gc_release(void)
+{
+    for (int o = 0; o < O_COUNT; o++) set_out(o, 0);
+}
+
 // Stick deflection past a dead zone, rescaled to 0..1 and squared for fine aim.
 static double curve(double v)
 {

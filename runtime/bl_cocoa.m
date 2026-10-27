@@ -63,11 +63,16 @@ static const struct { uint16_t mac; uint8_t dik, vk; } keymap[] = {
 void bl_gc_init(void);
 void bl_gc_poll(int captured);
 int bl_gc_raw_mouse(void);
+void bl_gc_release(void);
 
 static NSWindow *window;
 static CAMetalLayer *metal_layer;
 static uint32_t game_hwnd, client_w = 1024, client_h = 768;
 static int captured, mouse_buttons;
+static int buttons_down;          // the game's buttons 0-7 it saw go down (bit n)
+static uint8_t mac_down[128];     // keys the game saw go down, by Mac key code
+static NSEventModifierFlags mod_flags;  // the modifiers as last seen (modifiers)
+static double became_key_at;      // when the window last became key (system uptime)
 
 @interface BLView : NSView
 @end
@@ -81,6 +86,8 @@ static int captured, mouse_buttons;
 @interface BLWindowDelegate : NSObject <NSWindowDelegate>
 @end
 
+static void release_all(void);
+
 @implementation BLWindowDelegate
 - (BOOL)windowShouldClose:(NSWindow *)sender
 {
@@ -91,6 +98,7 @@ static int captured, mouse_buttons;
 - (void)windowDidBecomeKey:(NSNotification *)n
 {
     (void)n;
+    became_key_at = NSProcessInfo.processInfo.systemUptime;
     bl_u32_PostMessageA_c(game_hwnd, WM_ACTIVATEAPP, 1, 0);
     bl_u32_PostMessageA_c(game_hwnd, WM_ACTIVATE, 1, 0);
     bl_u32_PostMessageA_c(game_hwnd, WM_SETFOCUS, 0, 0);
@@ -99,6 +107,7 @@ static int captured, mouse_buttons;
 {
     (void)n;
     bl_cocoa_capture_mouse(0);
+    release_all();
     bl_u32_PostMessageA_c(game_hwnd, WM_KILLFOCUS, 0, 0);
     bl_u32_PostMessageA_c(game_hwnd, WM_ACTIVATE, 0, 0);
     bl_u32_PostMessageA_c(game_hwnd, WM_ACTIVATEAPP, 0, 0);
@@ -249,6 +258,7 @@ static void key(uint16_t mac, int down, int repeat, NSString *chars)
     }
     uint8_t dik = keymap[i].dik, vk = keymap[i].vk;
     int alt = vk == 0x12;
+    if (mac < 128) mac_down[mac] = (uint8_t)(down != 0);
     if (!repeat) bl_input_key(dik, down);
     bl_input_vk(vk, down);
     if (bl_input_trace() && !repeat) fprintf(stderr, "[input] key mac %u dik %#x vk %#x %s\n", mac, dik, vk, down ? "down" : "up");
@@ -265,15 +275,14 @@ static void key(uint16_t mac, int down, int repeat, NSString *chars)
 // Modifier keys arrive as flag changes.
 static void modifiers(NSEvent *e)
 {
-    static NSEventModifierFlags old;
     NSEventModifierFlags now = e.modifierFlags;
     static const struct { NSEventModifierFlags flag; uint16_t mac; } mods[] = {
         {NSEventModifierFlagShift, kVK_Shift}, {NSEventModifierFlagControl, kVK_Control},
         {NSEventModifierFlagOption, kVK_Option}, {NSEventModifierFlagCapsLock, kVK_CapsLock},
     };
     for (size_t i = 0; i < sizeof mods / sizeof mods[0]; i++)
-        if ((now ^ old) & mods[i].flag) key(mods[i].mac, (now & mods[i].flag) != 0, 0, nil);
-    old = now;
+        if ((now ^ mod_flags) & mods[i].flag) key(mods[i].mac, (now & mods[i].flag) != 0, 0, nil);
+    mod_flags = now;
 }
 
 static uint32_t mouse_wparam(void)
@@ -285,6 +294,7 @@ static uint32_t mouse_wparam(void)
 
 static void button(int b, int down, uint32_t lp)
 {
+    buttons_down = down ? buttons_down | 1 << b : buttons_down & ~(1 << b);
     bl_input_mouse_button(b, down);
     static const uint32_t flag[3] = {MK_LBUTTON, MK_RBUTTON, MK_MBUTTON};
     static const uint32_t msg[3][2] = {{WM_LBUTTONUP, WM_LBUTTONDOWN}, {WM_RBUTTONUP, WM_RBUTTONDOWN},
@@ -383,6 +393,19 @@ static uint32_t cursor_lparam(void)
 // controllers (bl_gamecontroller.m).
 void bl_cocoa_key(uint16_t mac, int down) { key(mac, down, 0, nil); }
 void bl_cocoa_button(int b, int down) { button(b, down, cursor_lparam()); }
+
+// The window lost focus: what is held goes up, since the releases happen in another app
+// and would never reach the game (it would keep walking after Cmd+Tab). Caps Lock is a
+// state, not a held key: it stays.
+static void release_all(void)
+{
+    bl_gc_release();
+    for (uint16_t m = 0; m < 128; m++)
+        if (mac_down[m] && m != kVK_CapsLock) key(m, 0, 0, nil);
+    mod_flags &= NSEventModifierFlagCapsLock;
+    for (int b = 0; b < 8; b++)
+        if (buttons_down & 1 << b) button(b, 0, cursor_lparam());
+}
 void bl_cocoa_wheel(int dz) { wheel(dz, cursor_lparam()); }
 
 void bl_cocoa_motion(int dx, int dy)
@@ -429,6 +452,7 @@ static void mouse(NSEvent *e)
         x = (int32_t)unsqueeze_x((p.x - r.origin.x) * client_w / r.size.width);
         y = (int32_t)((NSMaxY(r) - p.y) * client_h / r.size.height);
         x = x < 0 ? 0 : x >= (int32_t)client_w ? (int32_t)client_w - 1 : x;
+        y = y < 0 ? 0 : y >= (int32_t)client_h ? (int32_t)client_h - 1 : y;
         bl_window_set_cursor(game_hwnd, x, y);
     }
     uint32_t lp = (uint32_t)(x & 0xFFFF) | (uint32_t)(y & 0xFFFF) << 16;
@@ -461,6 +485,26 @@ static void mouse(NSEvent *e)
         break;
     }
     default: break;
+    }
+}
+
+// Whether a mouse event over the window is the game's: a press only inside the picture
+// (not on the title bar, whose drag AppKit tracks and keeps the release of) and not the
+// click that brings the window back to the front; a release only of a press the game saw.
+static int mouse_for_game(NSEvent *e)
+{
+    switch (e.type) {
+    case NSEventTypeLeftMouseDown: case NSEventTypeRightMouseDown: case NSEventTypeOtherMouseDown: {
+        NSView *v = window.contentView;
+        return window.isKeyWindow && e.timestamp > became_key_at &&
+               NSPointInRect([v convertPoint:e.locationInWindow fromView:nil], v.bounds);
+    }
+    case NSEventTypeLeftMouseUp: case NSEventTypeRightMouseUp: case NSEventTypeOtherMouseUp: {
+        int b = e.type == NSEventTypeLeftMouseUp ? 0 : e.type == NSEventTypeRightMouseUp ? 1 : (int)e.buttonNumber;
+        return b <= 7 && (buttons_down & 1 << b);
+    }
+    default:
+        return 1;
     }
 }
 
@@ -511,7 +555,7 @@ int bl_cocoa_pump(void)
             case NSEventTypeOtherMouseDragged: case NSEventTypeLeftMouseDown: case NSEventTypeLeftMouseUp:
             case NSEventTypeRightMouseDown: case NSEventTypeRightMouseUp: case NSEventTypeOtherMouseDown:
             case NSEventTypeOtherMouseUp: case NSEventTypeScrollWheel:
-                if (e.window == window || captured) mouse(e);
+                if (captured || (e.window == window && mouse_for_game(e))) mouse(e);
                 break;
             default: break;
             }

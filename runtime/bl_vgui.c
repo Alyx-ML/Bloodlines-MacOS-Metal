@@ -203,11 +203,22 @@ void bl_vgui_VisualDestroy_c(_cpu *cpu)
     call_this(cpu, GameUI_PropertyPage_dtor, page, 0, NULL);
 }
 
+// A box's setting is saved when the player changes the box, compared with the box as last
+// seen rather than with the effect: an effect forced by its environment variable stays as
+// forced, and would otherwise be saved again every frame.
+static void poll_box(uint32_t box, int effect, uint32_t *seen_box, int *seen_on)
+{
+    int on = *(const uint8_t *)bl_g2h(box + 0xba) != 0;
+    if (*seen_box == box && *seen_on == on) return;
+    int fresh = *seen_box != box;  // a new box: saved only if it differs from the setting
+    *seen_box = box, *seen_on = on;
+    if (!fresh || on != (bl_effect_enabled(effect) != 0)) bl_effect_set(effect, on);
+}
+
 void bl_vgui_poll(void)
 {
-    for (int i = 0; i < NBOXES; i++) {
-        if (!boxes[i]) continue;
-        int on = *(const uint8_t *)bl_g2h(boxes[i] + 0xba) != 0;
-        if (on != (bl_effect_enabled(i) != 0)) bl_effect_set(i, on);
-    }
+    static uint32_t seen_box[NBOXES];
+    static int seen_on[NBOXES];
+    for (int i = 0; i < NBOXES; i++)
+        if (boxes[i]) poll_box(boxes[i], i, &seen_box[i], &seen_on[i]);
 }

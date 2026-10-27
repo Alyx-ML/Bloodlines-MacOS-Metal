@@ -207,7 +207,7 @@ static uint64_t hitch_tex_ns, hitch_pbr_ns;
 static uint64_t hitch_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 static uint64_t hitch_detail_ns;
 static uint64_t hitch_wait_ns, hitch_present_start;  // waiting for the GPU's frames in flight; present's start
-static id<MTLTexture> detail_normal_timed(id<MTLDevice> dev, const void *key, uint32_t stamp, uint32_t w, uint32_t h,
+static id<MTLTexture> detail_normal_timed(id<MTLDevice> dev, uint64_t key, uint32_t stamp, uint32_t w, uint32_t h,
                                           uint32_t format, const uint8_t *data, uint32_t pitch, id<MTLTexture> *color)
 {
     uint64_t t0 = hitch_now();
@@ -1723,6 +1723,20 @@ static void flush_clears(struct d3d_state *s)
         (clear_depth_target && clear_depth_target == s->depth_stencil))
         pass(s);
     end_pass();
+}
+
+static NSMutableSet<NSNumber *> *dead_buffers;  // serials of buffers freed since the last swaps_forget
+
+// The game destroyed `o`: what the caches remember of it goes (its serial is never used
+// again, so nothing would find it; this frees the memory).
+void d3d_render_forget(struct obj *o)
+{
+    if (o->type == OBJ_TEXTURE || o->type == OBJ_CUBETEXTURE)
+        bl_detail_forget(o->serial, o->width, o->height);
+    else if (o->type == OBJ_VERTEXBUFFER || o->type == OBJ_INDEXBUFFER) {
+        if (!dead_buffers) dead_buffers = [NSMutableSet new];
+        [dead_buffers addObject:@(o->serial)];
+    }
 }
 
 static void lightmap_forget(struct obj *o);
@@ -4846,7 +4860,7 @@ static void hair_before_draw(struct d3d_state *s)
     int hair = skinned && s->rs[15] && !s->rs[27] && t0 && t0->type == OBJ_TEXTURE && t0->subs[0] && t0->subs[0]->mem;
     if (hair) {
         id<MTLTexture> color = nil;
-        hair = !detail_normal_timed(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
+        hair = !detail_normal_timed(mtl, t0->serial, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
                                  t0->subs[0]->pitch, &color);
     }
     if (!hair) {
@@ -5018,11 +5032,11 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
         struct obj *t0 = s->texture[0];
         if (k->psv.skin == 1 && env_detail > 0 && t0 && t0->type == OBJ_TEXTURE && t0->subs[0] && t0->subs[0]->mem) {
             id<MTLTexture> color = nil;
-            detail_map = detail_normal_timed(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
+            detail_map = detail_normal_timed(mtl, t0->serial, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
                                           t0->subs[0]->pitch, &color);
             detail_color = env_upscale_off ? nil : color;
-            detail_face = detail_map && bl_detail_is_face(t0, t0->width, t0->height);
-            if (detail_map && !detail_face) detail_mask = bl_detail_skin_mask(t0, t0->width, t0->height);
+            detail_face = detail_map && bl_detail_is_face(t0->serial, t0->width, t0->height);
+            if (detail_map && !detail_face) detail_mask = bl_detail_skin_mask(t0->serial, t0->width, t0->height);
             if (hair_swap && hair_swap->tex) detail_color = hair_swap->tex;
             if (hair_swap && !hair_swap->vb && hair_swap->base_tex && !env_upscale_off) detail_color = hair_swap->base_tex;
             // Hair: alpha-tested and without a map of its own (hair textures get none),
@@ -5042,7 +5056,7 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
         // Eyeballs: no map, but the upscaled colour texture when there is one.
         if (k->psv.skin == 3 && !env_upscale_off && t0 && t0->type == OBJ_TEXTURE && t0->subs[0] && t0->subs[0]->mem) {
             id<MTLTexture> color = nil;
-            detail_normal_timed(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
+            detail_normal_timed(mtl, t0->serial, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem),
                              t0->subs[0]->pitch, &color);
             detail_color = color;
         }
@@ -5289,6 +5303,8 @@ static id<MTLBuffer> index_data(uint32_t type, const void *src, int is32, uint32
 // placed by fitting the strips' anchors onto the draw's vertices (scale, a turn between
 // axes, offset). For a texture with only a part to keep (the hair ties), the draw's
 // triangles inside that part of the texture. Made once per mesh; NULL when not hair.
+// Keyed by the mesh and the buffers' serials (they are dropped with the buffers, swaps_forget).
+struct hair_key { const void *m; uint64_t vb, ib; uint32_t voff, start, count; int32_t base; };
 static NSMutableDictionary<NSData *, NSValue *> *hair_swaps;
 
 static struct hair_swap *hair_swap_for(struct d3d_state *s, struct element *el, int nel, uint32_t start,
@@ -5309,13 +5325,12 @@ static struct hair_swap *hair_swap_for(struct d3d_state *s, struct element *el, 
     for (int i = 0; i < nel; i++)
         if (el[i].stream != pe->stream) return NULL;
     id<MTLTexture> color;
-    detail_normal_timed(mtl, t0, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem), t0->subs[0]->pitch,
+    detail_normal_timed(mtl, t0->serial, 0, t0->width, t0->height, t0->format, bl_g2h(t0->subs[0]->mem), t0->subs[0]->pitch,
                      &color);
-    const struct bl_hair_mesh *m = bl_detail_hair(mtl, t0, t0->width, t0->height);
+    const struct bl_hair_mesh *m = bl_detail_hair(mtl, t0->serial, t0->width, t0->height);
     struct obj *vbo = s->stream[pe->stream], *ibo = s->indices;
     if (!m || !vbo || !vbo->mem) return NULL;
-    struct { const void *m, *vb, *ib; uint32_t voff, start, count; int32_t base; } key = {
-        m, vbo, ibo, s->stream_offset[pe->stream], start, count, base_vertex};
+    struct hair_key key = {m, vbo->serial, ibo->serial, s->stream_offset[pe->stream], start, count, base_vertex};
     NSData *kd = [NSData dataWithBytes:&key length:sizeof key];
     if (!hair_swaps) hair_swaps = [NSMutableDictionary new];
     NSValue *known = hair_swaps[kd];
@@ -6069,12 +6084,12 @@ static struct lightmap_page *lightmap_for(struct d3d_state *s, struct element *e
     const uint8_t *ip = (const uint8_t *)bl_g2h(ibo->mem) + (size_t)start * isz;
 #define IDX(i) (is32 ? ((const uint32_t *)ip)[i] : ((const uint16_t *)ip)[i])
     struct {
-        void *vb, *ib;
+        uint64_t vb, ib;  // the buffers' serials
         uint32_t off, stride, rewrites, start, count, sample[8];
         int32_t base, bumped;
     } key;
     memset(&key, 0, sizeof key);  // padding too: the key is compared as bytes
-    key.vb = v, key.ib = ibo, key.off = s->stream_offset[b] + el[uv_el].offset, key.stride = stride;
+    key.vb = v->serial, key.ib = ibo->serial, key.off = s->stream_offset[b] + el[uv_el].offset, key.stride = stride;
     key.rewrites = (uint32_t)v->rewrites, key.start = start, key.count = count, key.base = base_vertex;
     key.bumped = bumped;
     // The step to the copies, read with the coordinates (same stream: Source's world vertices).
@@ -6226,6 +6241,17 @@ static NSMutableDictionary<NSData *, NSValue *> *prop_swaps;
 static size_t prop_bytes;  // all of them, held to PROP_MAX_BYTES
 #define PROP_MAX_BYTES ((size_t)768 << 20)
 
+// Smoothed and remodelled props' key: the buffers' serials (dropped with the buffers,
+// swaps_forget), layout and range, and a sample of the indices.
+struct prop_key {
+    uint64_t vb[16];
+    uint32_t off[16], stride[16], rewrites[16];
+    uint64_t ib;
+    uint32_t start, count, sample[16];
+    int32_t base;
+    int split;
+};
+
 static struct prop_swap *prop_swap_for(struct d3d_state *s, struct element *el, int nel, uint32_t start,
                                        uint32_t count, int32_t base_vertex)
 {
@@ -6238,14 +6264,7 @@ static struct prop_swap *prop_swap_for(struct d3d_state *s, struct element *el, 
             return NULL;
     struct prop_elem pel[32];
     int has_pos = 0, has_nrm = 0;
-    struct {
-        void *vb[16];
-        uint32_t off[16], stride[16], rewrites[16];
-        void *ib;
-        uint32_t start, count, sample[16];
-        int32_t base;
-        int split;
-    } key;
+    struct prop_key key;
     memset(&key, 0, sizeof key);
     for (int i = 0; i < nel; i++) {
         int b = el[i].stream;
@@ -6255,7 +6274,7 @@ static struct prop_swap *prop_swap_for(struct d3d_state *s, struct element *el, 
         pel[i] = (struct prop_elem){el[i].stream, el[i].offset, el[i].type, el[i].usage, el[i].index};
         struct obj *v = s->stream[b];
         if (!v || !v->mem || (v->usage & 0x200) || v->rewrites >= 8 || v->dirty || !s->stream_stride[b]) return NULL;
-        key.vb[b] = v, key.off[b] = s->stream_offset[b], key.stride[b] = s->stream_stride[b];
+        key.vb[b] = v->serial, key.off[b] = s->stream_offset[b], key.stride[b] = s->stream_stride[b];
         key.rewrites[b] = (uint32_t)v->rewrites;
     }
     if (!has_pos || !has_nrm) return NULL;
@@ -6268,7 +6287,7 @@ static struct prop_swap *prop_swap_for(struct d3d_state *s, struct element *el, 
     // Index buffers are read per draw, with no note of rewrites: a sample of this range
     // in the key stands for its contents.
     for (int i = 0; i < 16; i++) key.sample[i] = IDX((uint32_t)i * (ni - 1) / 15);
-    key.ib = ibo, key.start = start, key.count = count, key.base = base_vertex, key.split = env_tess;
+    key.ib = ibo->serial, key.start = start, key.count = count, key.base = base_vertex, key.split = env_tess;
     NSData *kd = [NSData dataWithBytes:&key length:sizeof key];
     if (!prop_swaps) prop_swaps = [NSMutableDictionary new];
     NSValue *hit = prop_swaps[kd];
@@ -6327,13 +6346,7 @@ static struct prop_swap *remodel_swap_for(struct d3d_state *s, struct element *e
     if (env_remodel_off || !s->indices || (s->indices->usage & 0x200) || nel > 32 || !prop_remodel_listed(count))
         return NULL;
     struct prop_elem pel[32];
-    struct {
-        void *vb[16];
-        uint32_t off[16], stride[16], rewrites[16];
-        void *ib;
-        uint32_t start, count, sample[16];
-        int32_t base;
-    } key;
+    struct prop_key key;
     memset(&key, 0, sizeof key);
     for (int i = 0; i < nel; i++) {
         int b = el[i].stream;
@@ -6341,7 +6354,7 @@ static struct prop_swap *remodel_swap_for(struct d3d_state *s, struct element *e
         pel[i] = (struct prop_elem){el[i].stream, el[i].offset, el[i].type, el[i].usage, el[i].index};
         struct obj *v = s->stream[b];
         if (!v || !v->mem || (v->usage & 0x200) || v->rewrites >= 8 || v->dirty || !s->stream_stride[b]) return NULL;
-        key.vb[b] = v, key.off[b] = s->stream_offset[b], key.stride[b] = s->stream_stride[b];
+        key.vb[b] = v->serial, key.off[b] = s->stream_offset[b], key.stride[b] = s->stream_stride[b];
         key.rewrites[b] = (uint32_t)v->rewrites;
     }
     struct obj *ibo = s->indices;
@@ -6351,7 +6364,7 @@ static struct prop_swap *remodel_swap_for(struct d3d_state *s, struct element *e
     const uint8_t *ip = (const uint8_t *)bl_g2h(ibo->mem) + (size_t)start * isz;
 #define IDX(i) (is32 ? ((const uint32_t *)ip)[i] : ((const uint16_t *)ip)[i])
     for (int i = 0; i < 16; i++) key.sample[i] = IDX((uint32_t)i * (ni - 1) / 15);  // as prop_swap_for
-    key.ib = ibo, key.start = start, key.count = count, key.base = base_vertex;
+    key.ib = ibo->serial, key.start = start, key.count = count, key.base = base_vertex;
     NSData *kd = [NSData dataWithBytes:&key length:sizeof key];
     if (!remodel_swaps) remodel_swaps = [NSMutableDictionary new];
     NSValue *hit = remodel_swaps[kd];
@@ -6392,6 +6405,48 @@ static struct prop_swap *remodel_swap_for(struct d3d_state *s, struct element *e
     free(idx);
     prop_smooth_free(&o);
     return p->nidx ? p : NULL;
+}
+
+// Hair, smoothed and remodelled props of buffers the game freed (d3d_render_forget), let go
+// between frames.
+static void prop_swap_release(struct prop_swap *p, size_t *bytes)
+{
+    if (!p) return;
+    size_t n = p->ib.length;
+    for (int b = 0; b < 16; b++) n += p->vb[b].length, p->vb[b] = nil;
+    p->ib = nil;
+    if (bytes) *bytes -= n < *bytes ? n : *bytes;
+    free(p);
+}
+
+static void swaps_forget(void)
+{
+    if (!dead_buffers.count) return;
+    NSMutableArray<NSData *> *gone = [NSMutableArray new];
+    for (NSData *kd in hair_swaps) {
+        const struct hair_key *k = kd.bytes;
+        if ([dead_buffers containsObject:@(k->vb)] || [dead_buffers containsObject:@(k->ib)]) [gone addObject:kd];
+    }
+    for (NSData *kd in gone) {
+        struct hair_swap *hs = hair_swaps[kd].pointerValue;
+        if (hs) hs->vb = hs->ib = hs->base_ib = nil, hs->tex = hs->base_tex = nil, free(hs);
+        [hair_swaps removeObjectForKey:kd];
+    }
+    NSMutableDictionary<NSData *, NSValue *> *props[2] = {prop_swaps, remodel_swaps};
+    for (int d = 0; d < 2; d++) {
+        [gone removeAllObjects];
+        for (NSData *kd in props[d]) {
+            const struct prop_key *k = kd.bytes;
+            int dead = [dead_buffers containsObject:@(k->ib)];
+            for (int b = 0; b < 16 && !dead; b++) dead = k->vb[b] && [dead_buffers containsObject:@(k->vb[b])];
+            if (dead) [gone addObject:kd];
+        }
+        for (NSData *kd in gone) {
+            prop_swap_release(props[d][kd].pointerValue, d == 0 ? &prop_bytes : NULL);
+            [props[d] removeObjectForKey:kd];
+        }
+    }
+    [dead_buffers removeAllObjects];
 }
 
 static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, uint32_t min_index, uint32_t nverts,
@@ -6573,6 +6628,7 @@ static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex,
         first = (uint32_t)base_vertex, nv = type == 6 ? count + 2 : index_count(type, count);
     }
     int any_rebased = 0, all_rebased = 1;
+    uint32_t in_place = 0;  // streams bound as the static buffer itself (bit n), by stream_data
     struct stream_src src[16];
     for (int b = 0; b < 16; b++) {
         int used = 0;
@@ -6594,15 +6650,15 @@ static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex,
             return;
         }
         any_rebased |= rebased, all_rebased &= rebased;
+        if (!rebased) in_place |= 1u << b;
         [e setVertexBuffer:src[b].buf offset:src[b].offset atIndex:(NSUInteger)b];
     }
     if (any_rebased && !all_rebased) {
-        // Mixed static and dynamic streams: express everything relative to `first`.
+        // Mixed static and dynamic streams: express everything relative to `first`. Only
+        // the streams bound in place move; copies (dynamic or often rewritten buffers)
+        // already start at `first`.
         for (int b = 0; b < 16; b++) {
-            int used = 0;
-            for (int i = 0; i < 16; i++)
-                if (k.attr[i].format && k.attr[i].buffer == b) used = 1;
-            if (!used || !s->stream[b] || (s->stream[b]->usage & 0x200)) continue;
+            if (!(in_place & 1u << b)) continue;
             [e setVertexBuffer:src[b].buf offset:src[b].offset + (NSUInteger)first * src[b].stride atIndex:(NSUInteger)b];
         }
     }
@@ -6764,12 +6820,15 @@ static int dump_this_frame(unsigned long n)
 
 void d3d_render_read_back(struct obj *rt)
 {
-    // GetRenderTargetData: the guest copy of a render target after GPU rendering.
-    if (!rt->gpu || !rt->mem || target_format(rt->format) != MTLPixelFormatBGRA8Unorm || obj_scale(rt) > 1 ||
-        ((__bridge id<MTLTexture>)rt->gpu).pixelFormat != MTLPixelFormatBGRA8Unorm)  // the shadow atlas (shadows)
+    // GetRenderTargetData: the guest copy of a render target after GPU rendering. The
+    // game's copy is 32-bit (A8R8G8B8, X8R8G8B8); ours may be deeper (the back buffer in
+    // 16-bit float with BL_DEEP_COLOR), which read_target converts. Not the shadow atlas.
+    id<MTLTexture> t = (__bridge id<MTLTexture>)rt->gpu;
+    if (!t || !rt->mem || (rt->format != 21 && rt->format != 22) || rt == shadow_atlas || obj_scale(rt) > 1 ||
+        t.width != rt->width || t.height != rt->height || rt->pitch < rt->width * 4)
         return;
     end_pass();
-    id<MTLBuffer> b = read_target((__bridge id<MTLTexture>)rt->gpu);
+    id<MTLBuffer> b = read_target(t);
     for (uint32_t y = 0; y < rt->height; y++)
         memcpy((uint8_t *)bl_g2h(rt->mem) + y * rt->pitch, (uint8_t *)b.contents + y * rt->width * 4, rt->width * 4);
 }
@@ -6935,6 +6994,7 @@ static void menu_bars(id<MTLTexture> t, float squeeze)
 
 void d3d_render_present(struct d3d_state *s)
 {
+    swaps_forget();
     hitch_present_start = hitch_now();
     static uint32_t lightmap_logged;
     if (lightmap_reads != lightmap_logged && frames % 300 == 0) {

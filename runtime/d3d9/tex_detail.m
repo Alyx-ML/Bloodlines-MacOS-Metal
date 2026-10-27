@@ -586,15 +586,19 @@ static NSArray *take_ready(const char *path)
 // The cache's entries by texture, size and stamp, with a small table in front of it: draws ask
 // for the same few hundred textures every frame, and making the key string each time showed
 // in profiles.
-static struct { const void *key; uint32_t stamp, w, h; } memo_key[512];
+static struct { uint64_t key; uint32_t stamp, w, h; } memo_key[512];
 static NSArray *memo_hit[512];
-static NSString *cache_key(const void *key, uint32_t stamp, uint32_t w, uint32_t h)
+static NSString *cache_key(uint64_t key, uint32_t stamp, uint32_t w, uint32_t h)
 {
-    return [NSString stringWithFormat:@"%p/%u/%ux%u", key, stamp, w, h];
+    return [NSString stringWithFormat:@"%llu/%u/%ux%u", (unsigned long long)key, stamp, w, h];
 }
-static NSArray *cache_find(const void *key, uint32_t stamp, uint32_t w, uint32_t h)
+static unsigned memo_slot(uint64_t key, uint32_t stamp)
 {
-    unsigned i = (unsigned)(((uintptr_t)key >> 4) ^ ((uintptr_t)key >> 13) ^ stamp * 31u) % 512u;
+    return (unsigned)((key * 0x9E3779B97F4A7C15ull) >> 40 ^ stamp * 31u) % 512u;
+}
+static NSArray *cache_find(uint64_t key, uint32_t stamp, uint32_t w, uint32_t h)
+{
+    unsigned i = memo_slot(key, stamp);
     if (memo_hit[i] && memo_key[i].key == key && memo_key[i].stamp == stamp && memo_key[i].w == w && memo_key[i].h == h)
         return memo_hit[i];
     NSArray *hit = cache[cache_key(key, stamp, w, h)];
@@ -602,7 +606,7 @@ static NSArray *cache_find(const void *key, uint32_t stamp, uint32_t w, uint32_t
     return hit;
 }
 
-id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t stamp, uint32_t w, uint32_t h,
+id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, uint64_t key, uint32_t stamp, uint32_t w, uint32_t h,
                                 uint32_t format, const uint8_t *data, uint32_t pitch, id<MTLTexture> *color)
 {
     *color = nil;
@@ -635,7 +639,15 @@ id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, const void *key, uint32_t sta
     return result;
 }
 
-int bl_detail_is_face(const void *key, uint32_t w, uint32_t h)
+void bl_detail_forget(uint64_t key, uint32_t w, uint32_t h)
+{
+    if (!cache) return;
+    [cache removeObjectForKey:cache_key(key, 0, w, h)];
+    unsigned i = memo_slot(key, 0);
+    if (memo_key[i].key == key) memo_hit[i] = nil;
+}
+
+int bl_detail_is_face(uint64_t key, uint32_t w, uint32_t h)
 {
     if (!cache) return 0;
     NSArray *hit = cache_find(key, 0, w, h);
@@ -643,7 +655,7 @@ int bl_detail_is_face(const void *key, uint32_t w, uint32_t h)
     return [hit[3] boolValue];
 }
 
-id<MTLTexture> bl_detail_skin_mask(const void *key, uint32_t w, uint32_t h)
+id<MTLTexture> bl_detail_skin_mask(uint64_t key, uint32_t w, uint32_t h)
 {
     if (!cache) return nil;
     NSArray *hit = cache_find(key, 0, w, h);
@@ -673,7 +685,7 @@ id<MTLTexture> bl_detail_flat(id<MTLDevice> dev)
 // the rectangle of the game's texture to keep (u0 v0 u1 v1), all little-endian floats; then
 // optionally a count (uint32) and that many centres (xyz) of the game's triangles to draw
 // under the strips.
-const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, const void *key, uint32_t w, uint32_t h)
+const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, uint64_t key, uint32_t w, uint32_t h)
 {
     static NSMutableDictionary<NSString *, NSValue *> *meshes;
     if (!cache) return NULL;

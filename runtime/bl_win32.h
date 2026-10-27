@@ -31,6 +31,11 @@ enum {
 };
 
 void bl_set_last_error(uint32_t err);
+
+// Code page 1252 (Windows' Western one) and UTF-16 (bl_codepage.c): the wide character
+// for a byte, and the byte for a wide character or -1 where the code page has none.
+uint16_t bl_cp1252_to_wide(uint8_t c);
+int bl_wide_to_cp1252(uint16_t c);
 uint32_t bl_errno_to_win32(int err);
 
 // Handle table. Types are distinct so a handle of the wrong kind is rejected.

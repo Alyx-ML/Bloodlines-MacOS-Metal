@@ -1146,22 +1146,24 @@ uint32_t bl_k32_CompareStringW_c(uint32_t lcid, uint32_t flags, uint32_t s1, uin
     return compare(at16, flags, s1, n1, s2, n2);
 }
 
+static int is_cp1252(uint32_t cp) { return cp == 0 || cp == 3 || cp == 1252; }  // CP_ACP, CP_THREAD_ACP
+
 uint32_t bl_k32_MultiByteToWideChar_c(uint32_t cp, uint32_t flags, uint32_t src, uint32_t n, uint32_t dst,
                                       uint32_t cap)
 {
-    (void)cp, (void)flags;
+    (void)flags;
     const uint8_t *s = G(src);
     if ((int32_t)n < 0) n = (uint32_t)strlen((const char *)s) + 1;
     if (!cap) return n;
     if (cap < n) { bl_set_last_error(BL_ERROR_INSUFFICIENT_BUFFER); return 0; }
-    for (uint32_t i = 0; i < n; i++) U16(dst + 2 * i) = s[i];
+    for (uint32_t i = 0; i < n; i++) U16(dst + 2 * i) = is_cp1252(cp) ? bl_cp1252_to_wide(s[i]) : s[i];
     return n;
 }
 
 uint32_t bl_k32_WideCharToMultiByte_c(uint32_t cp, uint32_t flags, uint32_t src, uint32_t n, uint32_t dst,
                                       uint32_t cap, uint32_t defchar, uint32_t used_default)
 {
-    (void)cp, (void)flags;
+    (void)flags;
     if ((int32_t)n < 0) {
         for (n = 0; U16(src + 2 * n); n++) {}
         n++;
@@ -1170,8 +1172,10 @@ uint32_t bl_k32_WideCharToMultiByte_c(uint32_t cp, uint32_t flags, uint32_t src,
     if (!cap) return n;
     if (cap < n) { bl_set_last_error(BL_ERROR_INSUFFICIENT_BUFFER); return 0; }
     for (uint32_t i = 0; i < n; i++) {
-        unsigned c = U16(src + 2 * i);
-        if (c > 0xff) {
+        int c = U16(src + 2 * i);
+        if (is_cp1252(cp)) c = bl_wide_to_cp1252((uint16_t)c);
+        else if (c > 0xff) c = -1;
+        if (c < 0) {
             c = defchar ? *(const uint8_t *)G(defchar) : '?';
             if (used_default) U32(used_default) = 1;
         }

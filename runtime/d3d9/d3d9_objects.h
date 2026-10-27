@@ -45,6 +45,8 @@ struct obj {
     int rewrites;              // static vertex buffers: times rewritten after first use
     int used;                  // textures: bound for a draw since the last upload
     int prefetched;            // textures: their upscale and maps asked for ahead (d3d_image_changed)
+    uint64_t serial;           // never reused, unlike the address once freed: what the renderer's
+                               // caches remember objects by
 };
 
 struct obj *obj_new(enum obj_type type, uint32_t vtbl);

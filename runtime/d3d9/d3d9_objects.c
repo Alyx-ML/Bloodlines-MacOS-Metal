@@ -23,8 +23,10 @@ struct obj *obj_new(enum obj_type type, uint32_t vtbl)
         if (!table) bl_fatal("out of memory");
     }
     struct obj *o = calloc(1, sizeof *o);
+    static uint64_t serials;
     o->type = type;
     o->refs = 1;
+    o->serial = ++serials;
     o->guest = bl_guest_malloc(8);
     G32(o->guest) = vtbl;
     G32(o->guest + 4) = ntable;
@@ -41,14 +43,17 @@ struct obj *obj_of(uint32_t guest)
 }
 
 void d3d_render_free(struct obj *o);
+void d3d_render_forget(struct obj *o);
 void dsound_buffer_free(struct obj *o);
 
 static void obj_free(struct obj *o)
 {
     if (o->type == OBJ_DSOUND_BUFFER) dsound_buffer_free(o);
+    d3d_render_forget(o);
     d3d_render_free(o);
     for (uint32_t i = 0; i < o->nsubs; i++) {
         struct obj *s = o->subs[i];
+        d3d_render_forget(s);
         d3d_render_free(s);
         if (s->mem) bl_guest_free(s->mem);
         table[G32(s->guest + 4)] = NULL;

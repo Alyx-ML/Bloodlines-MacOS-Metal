@@ -2546,3 +2546,20 @@ Not verified: the look in the game.
 ## 2026-10-26: new pictures for the asylum's ram frieze and stone door
 
 The user supplied 2048×2048 pictures for `materials/stone/bar` (the ram-head frieze above the bar; the file was named `bar_h.png` but is a colour picture) and `materials/stone/doorb` (the stone doorway with wooden doors). Their layouts match the originals (luminance correlation 0.96 and 0.999). They went in as `<name>-replace.png`, replacing the PBRify upscales (removed, since tex_pack refuses two upscales of one texture). The bump and roughness maps were remade from each picture at the game texture's size (128 and 512, read as a tile), and the height maps from the pictures with tools/tex_height.py (27 s). tex_pack wrote both at 2048×2048 BC7. Not yet checked in the game.
+
+## 2026-10-26: Audit fixes (cache keys and the medium findings)
+
+From the runtime audit of this date.
+- Texture and buffer caches (`tex_detail.m` and the hair, smoothed-prop, remodel and lightmap-range caches in `metal_render.m`) are keyed by a serial number each `struct obj` gets in `obj_new`, which is never reused. Before, they were keyed by the object's address, which the next object can reuse. `obj_free` calls `d3d_render_forget`: a texture's detail entry goes at once, and the hair and prop copies of freed buffers go at the next present.
+- Focus loss (`bl_cocoa.m`): every key and mouse button the game saw go down, and the pad's (`bl_gc_release`), is released. Caps Lock is left as it is.
+- Mouse motion and wheel (`dinput8.c`) add up only while the mouse is acquired, and are cleared on Acquire and Unacquire.
+- Mouse presses reach the game only inside the content view (not the title bar), and not the click that brings the window to the front. A release reaches the game only for a press it saw. y is clamped like x.
+- The Enhanced tab's boxes (`bl_vgui.c`) save when the box changes, not while it differs from a forced effect, which used to save every frame.
+- Shader `rep` reads its count from p[0] and `loop` its integer register from p[1]. Both used to read after a destination they don't have.
+- Mixed static and copied vertex streams: only streams bound in place are shifted by `first`. A buffer rewritten 8 or more times was shifted twice.
+- GetRenderTargetData reads 32-bit targets whatever the GPU copy's format, so it works with the deep-colour back buffer. It skips only the shadow atlas, scaled targets and targets whose size differs.
+- Code page 1252 (`bl_codepage.c`): bytes 0x80-0x9F convert to the right characters (quotes, dashes, ellipsis, euro), both ways.
+- Mutexes have an owner and a count, so the owner can take one again. ReleaseMutex by a non-owner fails. Named events, mutexes and semaphores open the existing object with ERROR_ALREADY_EXISTS, and creates set the last error.
+- `tests/runtime_unit.c` (`tools/runtime_unit.sh`) checks the text conversion, mutexes, named objects, mouse motion and shader loops without game files. 24 of 24 checks pass.
+
+Not verified in the game. The runtime builds and `boot` links.

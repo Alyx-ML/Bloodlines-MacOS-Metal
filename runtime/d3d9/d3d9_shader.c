@@ -766,15 +766,17 @@ static int gen_body(struct gen *g)
             else snprintf(e, sizeof e, "float4(%s, %s, 0.0, 0.0)", rowexpr[0], rowexpr[1]);
             break;
         }
-        // Flow control (vertex shader model 2).
+        // Flow control (vertex shader model 2). rep and loop write nothing: their operands
+        // start at p[0] (rep i#; loop aL, i#), not after a destination.
         case OP_REP:
-            if (src(g, &s, a, sizeof a)) return -1;
+            if (src(g, &p, a, sizeof a)) return -1;
             line(&g->o, "for (int _rep%d = 0; _rep%d < int((%s).x); _rep%d++) {", g->o.indent, g->o.indent, a,
                  g->o.indent);
             g->o.indent++;
             continue;
         case OP_LOOP: {
-            uint32_t it = s[1];
+            if (in.nparams < 2) return -1;
+            uint32_t it = p[1];
             line(&g->o, "aL = p.i[%u].y;", reg_num(it));
             line(&g->o, "for (int _n%d = 0; _n%d < p.i[%u].x; _n%d++, aL += p.i[%u].z) {", g->o.indent, g->o.indent,
                  reg_num(it), g->o.indent, reg_num(it));

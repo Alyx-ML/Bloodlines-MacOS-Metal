@@ -76,8 +76,11 @@ void bl_input_key(int dik, int down)
     push(KIND_KEYBOARD, (uint32_t)dik, down ? 0x80 : 0);
 }
 
+// Motion and wheel add up only while the game has the mouse: moved in a menu, it is not
+// applied all at once when play resumes.
 void bl_input_mouse_move(int dx, int dy)
 {
+    if (!acquired[KIND_MOUSE]) return;
     mouse_dx += dx, mouse_dy += dy;
     if (dx) push(KIND_MOUSE, DIMOFS_X, (uint32_t)dx);
     if (dy) push(KIND_MOUSE, DIMOFS_Y, (uint32_t)dy);
@@ -85,6 +88,7 @@ void bl_input_mouse_move(int dx, int dy)
 
 void bl_input_mouse_wheel(int dz)
 {
+    if (!acquired[KIND_MOUSE]) return;
     mouse_dz += dz;
     if (dz) push(KIND_MOUSE, DIMOFS_Z, (uint32_t)dz);
 }
@@ -185,6 +189,7 @@ uint32_t bl_IDirectInputDevice8A_Acquire_c(uint32_t self)
 {
     int kind = (int)dev(self)->input_kind;
     if (!acquired[kind]) TRACE("Acquire %s\n", kind_name[kind]);
+    if (!acquired[kind] && kind == KIND_MOUSE) mouse_dx = mouse_dy = mouse_dz = 0;
     acquired[kind] = 1;
     return DI_OK;
 }
@@ -195,6 +200,7 @@ uint32_t bl_IDirectInputDevice8A_Unacquire_c(uint32_t self)
     if (acquired[o->input_kind]) TRACE("Unacquire %s\n", kind_name[o->input_kind]);
     acquired[o->input_kind] = 0;
     queues[o->input_kind].count = 0;
+    if (o->input_kind == KIND_MOUSE) mouse_dx = mouse_dy = mouse_dz = 0;
     return DI_OK;
 }
 
