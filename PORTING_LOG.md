@@ -3043,3 +3043,69 @@ headless asylum runs went 1500 frames without errors.
 ### Not verified
 - Not seen in a window: the new bounced light (its look will differ from the Godot trace's),
   the contact shadows, the skin. No M1.
+
+## 2026-10-27: Ray-traced lighting: Wicked Engine's RT tried and removed
+
+Wicked Engine's ray-traced shadows, DDGI bounced light and ray-traced reflections were
+put over the game's picture (BL_RT, a box on the Enhanced tab on M3 and newer): its
+scene built from the map, props and materials at map load, the game's draws writing
+their colour, facing and see-through layers for it, and its lighting composed back over
+the world's surfaces. After four rounds of window tests it still flickered in motion,
+broke the characters' look, lost the characters' shadows, gave no visible reflections
+and its bounced light looked bad, so the user had it removed entirely. Gone with it:
+rt_wicked.mm/.h and its HLSL, rt_scene.m/.h (the scene, which RayTracedGL1 had left
+behind), tools/build_wicked.sh with its patch and source list, the Wicked link and
+compile steps, the BL_RT box and effect, the see-through draws' layers (variant `over`,
+over_texture), bl_materials and the props-as-drawn meshes (bl_props.c), bl_hires_named
+and BLCompute's acceleration-structure builds. Kept: the map's pakfile in the props'
+search (pak_open), the light probes' disk cache (gi_probes.m).
+
+## 2026-10-27: Ray-traced lighting: RayTracedGL1 tried and removed
+
+A port of RayTracedGL1 (its shaders converted to MSL, a Metal 4 host of its passes, MetalFX
+denoising, characters as its dynamic geometry) put a half-size traced picture in place of
+the game's. It looked no better than the baked lightmaps (the same lights, and its
+brightness was matched to them) and worse on characters (their normal maps, detail and skin
+shading lost, edges stepped), so it is gone: third_party/RTGL1, rt_path, rtgl_msl.py and the
+mix. (What it left for a successor went with Wicked Engine's RT, above.)
+
+## 2026-10-27: Bounced light, ReShade-RTGI style
+
+The screen-space bounced light (BL_SSIL) reworked towards ReShade's RTGI, which cannot
+be used itself (ReShade does not run on Metal; RTGI is closed source):
+- Added up over frames (ssil_history): each half-resolution pixel keeps how many frames
+  it holds (alpha, up to 32) and takes the new frame as 1/that, so a still view settles
+  on the mean of the turning pattern's directions. Last frame's is followed along the
+  camera's motion vectors and dropped where its view depth there (a copy kept each frame,
+  ssil_texture 8) differs by more than 15% (or 8 units): something moved in or out. Kept
+  within the 3x3 range as before; where that cuts it back much it restarts from 4 frames.
+  The history now comes before the edge-aware blur (the sums are kept unblurred).
+- Longer reach: BL_SSIL_RADIUS 128 to 384 units (about 10 m), at most 0.6 of the screen
+  height instead of 0.3, 6 steps a side past the occlusion's radius instead of 3.
+- More bounces: last frame's bounced light goes back into the picture it gathers from at
+  full strength (was half), on the map's surfaces too, each bounce keeping at most 80%
+  (the surfaces' colour capped at 0.8), so it stays bounded.
+- Everything on screen gives back light. Before, the map's own surfaces gave back only
+  the light they give off (neon) and a pixel took only light brighter than its own, since
+  the lightmaps hold the map's bounced light; on the asylum that left the final picture
+  within half a level of 255 of it being off. Now the lightmaps' bounce is counted again,
+  as RTGI does, at BL_SSIL_STRENGTH 3 (was 1). The inverse of the gather's soft shoulder
+  is capped at 5x: without it, with full feedback, the light ran away to infinity and the
+  picture went black.
+
+Checked headless on sm_asylum_1 (camera still, turning for 20 frames, still again):
+- With it on against off, the picture changes by a mean of 4 to 5 levels: the red walls
+  warmer, the floor by the bar's doorway green from the neon. Characters are unchanged
+  (the light probes light them, not this).
+- Still frames after the turn: consecutive frames differ by a mean of 0.17 to 0.20
+  (0.16 to 0.18 with it off). The bounced light alone, while turning, stays smooth from
+  frame to frame.
+- GPU, BL_GPU_STATS: about 12.1 ms a frame (11.7 before); post_traces 2.5 to 2.8 ms.
+
+### Not verified
+- Not seen in a window; other maps not checked; no M1.
+
+Options boxes: a box the player clicks now always takes effect. Before, an effect set
+in the environment (BL_SSIL=1 and the like) kept it on whatever the box said: the click
+was saved but the effect stayed, and the box came back ticked. The environment still
+sets an effect at start.

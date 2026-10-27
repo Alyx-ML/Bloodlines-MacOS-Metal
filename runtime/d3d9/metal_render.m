@@ -91,8 +91,8 @@
 //                            BL_EXPOSURE_RANGE (lo,hi: 0.8,1.3)
 //   BL_BLOOM_AT=n            debugging: bloom and eye adaptation only from frame n
 //   BL_SSIL=0|1|show|albedo  bounced light (see the bounced light section), over the options' check
-//                            box (on until unticked); albedo shows the surfaces' colour; BL_SSIL_RADIUS (world units, default 128),
-//                            BL_SSIL_STRENGTH (default 1), BL_SSIL_BLUR (passes, default 2)
+//                            box (on until unticked); albedo shows the surfaces' colour; BL_SSIL_RADIUS (world units, default 384),
+//                            BL_SSIL_STRENGTH (default 3), BL_SSIL_BLUR (passes, default 2)
 //   BL_GI=0|1                global illumination: characters' and props' light from around them
 //                            (see the light probes section), over the options' check box (on
 //                            until unticked); BL_GI_MIX (0..1, default 1) how much of the game's
@@ -171,7 +171,7 @@ static int env_ssil, env_ssil_show, env_ssil_blur = 2;  // BL_SSIL (the effects 
 static int env_gi, env_gi_log;  // BL_GI (the effects table), BL_GI_LOG
 static const struct bl_gi *gi_frame;  // the open map's probes this frame, NULL none (yet)
 static float env_gi_mix = 1;    // BL_GI_MIX
-static float env_ssil_radius = 128, env_ssil_strength = 1;
+static float env_ssil_radius = 384, env_ssil_strength = 3;
 static float env_bloom_strength = 0.35f, env_bloom_threshold = 0.6f, env_exposure_lo = 0.8f, env_exposure_hi = 1.3f;
 static int env_upscale_off;  // BL_UPSCALE=0: the game's own colour textures (characters, tex_hires.h)
 static int env_remodel_off;  // BL_REMODEL=0: the game's own prop models (prop_remodel.h)
@@ -254,7 +254,8 @@ static void taa_resolve(id<MTLTexture> color);
 static void taa_frame_end(void);
 
 // The Visual options tab's check boxes (bl_vgui.c, read once a frame by bl_vgui_poll)
-// set the effects and save them in the registry; the environment, when set, wins over both.
+// set the effects and save them in the registry. The environment, when set, wins over the
+// registry at start; a box the player clicks wins over both from then on.
 #define EFFECT_KEY "HKCU\\Software\\Troika\\Vampire\\Native"
 enum { BL_EFFECT_AO, BL_EFFECT_SSR, BL_EFFECT_HDR, BL_EFFECT_FOG, BL_EFFECT_SSS, BL_EFFECT_SHADOWS,
        BL_EFFECT_BLOOM, BL_EFFECT_EXPOSURE, BL_EFFECT_SSIL, BL_EFFECT_GI, BL_EFFECT_ROUND, BL_EFFECT_SHARPEN,
@@ -290,7 +291,7 @@ static const struct { const char *env, *value; int *on, *show, def; } effects[BL
     {"BL_SHARPEN", "SharpenAfterAA", &env_sharpen, NULL, 1},
     {"BL_SKIN_DETAIL", "SkinDetail", &env_skin_detail, NULL, 1},
 };
-static int effects_loaded, effect_forced[BL_EFFECTS];
+static int effects_loaded;
 void bl_vgui_poll(void);
 
 static void effect_settings(void)
@@ -300,7 +301,6 @@ static void effect_settings(void)
     for (int i = 0; i < BL_EFFECTS; i++) {
         const char *e = getenv(effects[i].env);
         int show = !e ? 0 : !strcmp(e, "show") ? 1 : !strcmp(e, "hits") || !strcmp(e, "albedo") ? 2 : 0;
-        effect_forced[i] = e != NULL;
         if (effects[i].show) *effects[i].show = show;
         *effects[i].on = e ? atoi(e) != 0 || show : bl_reg_get_dword(EFFECT_KEY, effects[i].value, effects[i].def) != 0;
     }
@@ -317,7 +317,8 @@ void bl_effect_set(int effect, int on)
     effect_settings();
     if (effect < 0 || effect >= BL_EFFECTS) return;
     bl_reg_set_dword(EFFECT_KEY, effects[effect].value, on != 0);
-    if (!effect_forced[effect]) *effects[effect].on = on != 0;
+    *effects[effect].on = on != 0;
+    if (!on && effects[effect].show) *effects[effect].show = 0;
 }
 
 #define LOG_ONCE(...) do { static int once_; if (!once_++) fprintf(stderr, __VA_ARGS__); } while (0)
@@ -2405,11 +2406,8 @@ static NSString *const ao_source =
      // frames up.
      "    n0 = fract(n0 + a.frame * 0.618034), n1 = fract(n1 + a.frame * 0.754878);\n"
      // The bounced light also takes FAR steps a side past the occlusion's radius, out to its own.
-     "    const int SLICES = int(a.slices), STEPS = 6, FAR = il && rfar > rpx ? 3 : 0;\n"
+     "    const int SLICES = int(a.slices), STEPS = 6, FAR = il && rfar > rpx ? 6 : 0;\n"
      "    constexpr sampler cs(filter::linear, mip_filter::linear, address::clamp_to_edge);\n"
-     // Only light brighter than what the pixel has already: the lightmaps hold the light
-     // bounced between the map's surfaces, so a lit wall next to another adds nothing.
-     "    float3 own = il ? ct.sample(cs, (float2(p) + 0.5) / a.hsize, level(1.0)).rgb : 0.0;\n"
      "    float vis = 0.0, wsum = 0.0;\n"
      "    float3 lit = 0.0;\n"
      "    for (int s = 0; s < SLICES; s++) {\n"
@@ -2460,7 +2458,6 @@ static NSString *const ao_source =
      // averaged away up close; fireflies tamed before the sum.
      "                    if (fresh != 0u) {\n"
      "                        float3 col = ct.sample(cs, c / a.hsize, level(clamp(log2(len) - 1.0, 0.0, a.il_level))).rgb;\n"
-     "                        col = max(col - own, 0.0);\n"
      "                        got += col / (1.0 + dot(col, luma)) * (float(popcount(fresh)) / 32.0);\n"
      "                    }\n"
      "                }\n"
@@ -2470,7 +2467,7 @@ static NSString *const ao_source =
      "    }\n"
      "    if (il) {\n"
      "        float3 g = lit / max(wsum, 1e-4);\n"
-     "        g /= max(1.0 - dot(g, luma), 1e-3);\n"
+     "        g /= max(1.0 - dot(g, luma), 0.2);\n"
      "        bounce = a.il * g * saturate(P.z * a.fade_mul + a.fade_add);\n"
      "    }\n"
      // Weighted by how much of the normal each slice holds; an open half circle is 1
@@ -4445,25 +4442,24 @@ static void exposure_run(id<MTLTexture> color)
 //   OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //
 // The light is gathered with the ambient occlusion (ao_main_il), along its slices'
-// steps and 3 more a side out to BL_SSIL_RADIUS: each step's colour counts for the
+// steps and 6 more a side out to BL_SSIL_RADIUS: each step's colour counts for the
 // sectors of the slice it is the first to cover (Therrien, Levesque and Gilet 2023's
 // indirect light from the same visibility bitmasks), so what is nearer hides what is
 // behind it and the depth is walked once for both. What stays from Godot's: the depth
-// edges and its smart blur, and only light brighter than what the receiving pixel has
-// already counting (the lightmaps hold the light bounced between the map's surfaces). The
-// colour is this frame's world view as a half-resolution copy with mipmaps, read at a
+// edges and its smart blur. Everything on screen gives back its light, the map's own
+// surfaces too, as ReShade's RTGI has it (the lightmaps' own bounced light is counted
+// again: BL_SSIL_STRENGTH sets how much shows). The colour is this frame's world view as a half-resolution copy with mipmaps, read at a
 // level that grows with the step. Each surface's own colour comes from the game's
 // shaders, which also write it (albedo_texture, d3d_shader_variant albedo), and post_apply
-// multiplies by that. Last frame's bounced light is added into the colour it reads (at
-// half strength), so light bounces on again from what it lit and reaches round corners.
-// The map's own surfaces (marked in the surfaces' colour) give back only the light they
-// give off (neon, lamps): their lightmaps hold what they reflect already. The
-// half-resolution result is brought to full resolution guided by the depth buffer, so it
+// multiplies by that. Last frame's bounced light is added into the colour it reads, on
+// the surfaces' colour as post_apply adds it, so light bounces on again from what it lit
+// and reaches round corners; each bounce keeps at most 80% of it, so it stays bounded.
+// The half-resolution result is brought to full resolution guided by the depth buffer, so it
 // does not leak across the outlines of things in front. BL_SSIL=1 turns it on (the
 // options' check box), BL_SSIL=show shows the bounced light alone and BL_SSIL=albedo the
-// surfaces' colour; BL_SSIL_RADIUS (world units, default 128), BL_SSIL_STRENGTH (default
-// 1), BL_SSIL_BLUR (edge-aware blur passes, default 2). Under TAA the occlusion's pattern
-// turns each frame and the result is blended with last frame's.
+// surfaces' colour; BL_SSIL_RADIUS (world units, default 384), BL_SSIL_STRENGTH (default
+// 3), BL_SSIL_BLUR (edge-aware blur passes, default 2). Under TAA the occlusion's pattern
+// turns each frame and the result is added up over up to 32 frames (ssil_history).
 
 struct ssil_params {
     float hsize[2], px[2];         // half-resolution size, and one pixel of it in uv
@@ -4478,6 +4474,7 @@ static NSString *const ssil_source =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
      "struct SLP { float2 hsize, px; float edge_sharpness, feedback, alpha, beta; float2 full; float use_mv, pad; };\n"
+     "constant float SSIL_FRAMES = 32.0;\n"
      "struct V { float4 pos [[position]]; };\n"
      "vertex V ssil_vs(uint id [[vertex_id]]) {\n"
      "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
@@ -4489,16 +4486,16 @@ static NSString *const ssil_source =
      "                           constant SLP &a [[buffer(0)]]) {\n"
      "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
      "    float2 uv = in.pos.xy * a.px;\n"
-     "    float3 col = c.sample(s, uv).rgb;\n"
-     // The map's own surfaces (the surfaces' colour's alpha 0.8) give back only the light
-     // they give off themselves (neon, lamps: their brightest channel from 0.6 up): what
-     // they reflect, from the map's lights and bounced on, is in the lightmaps already.
-     "    float ma = alb.read(uint2(min(int2(in.pos.xy) * 2, int2(alb.get_width(), alb.get_height()) - 1))).w;\n"
-     "    if (ma > 0.75 && ma < 0.9) return float4(col * smoothstep(0.6, 1.0, max(col.r, max(col.g, col.b))), 1.0);\n"
+     // Within white, as the back buffer held it when this was tuned.
+     "    float3 col = min(c.sample(s, uv).rgb, 1.0);\n"
+     // What this bounced light added last frame goes on, as it lit each surface.
      "    if (a.feedback > 0.0) {\n"
      "        float2 q = uv;\n"
      "        if (a.use_mv > 0.0) q += mv.read(uint2(min(int2(in.pos.xy) * 2, int2(mv.get_width(), mv.get_height()) - 1))).xy;\n"
-     "        if (all(q >= 0.0) && all(q <= 1.0)) col += a.feedback * prev.sample(s, q).rgb * alb.sample(s, uv).rgb;\n"
+     "        float3 b = prev.sample(s, q).rgb;\n"
+     // Each bounce keeps at most 80% (the surfaces' colour capped), so the light added
+     // on frame by frame stays bounded.
+     "        if (all(q >= 0.0) && all(q <= 1.0) && all(isfinite(b))) col += a.feedback * b * min(alb.sample(s, uv).rgb, 0.8);\n"
      "    }\n"
      "    return float4(col, 1.0); }\n"
      "static float4 unpack_edges(float v, float sharpness) {\n"
@@ -4517,26 +4514,39 @@ static NSString *const ssil_source =
      "    sum += src.read(uint2(clamp(p - int2(0, 1), int2(0), m))) * e.z, sw += e.z;\n"
      "    sum += src.read(uint2(clamp(p + int2(0, 1), int2(0), m))) * e.w, sw += e.w;\n"
      "    return sum / sw; }\n"
-     // Under TAA: blended with last frame's, kept within the 3x3 neighbourhood's range (a
-     // little wider) so that it follows when the light really changes. mv: the camera's
-     // motion vectors (full resolution, texture coordinates, taa_motion).
+     // Under TAA: added up over frames, before the blur. Each pixel keeps how many frames
+     // it holds (alpha, up to SSIL_FRAMES) and takes this frame's as 1 / that, so a still
+     // view settles on the mean of the turning pattern's many directions. Last frame's is
+     // followed back along the camera's motion vectors (mv, full resolution, texture
+     // coordinates, taa_motion) and dropped where the view depth there then (zp) differs
+     // from this pixel's (zt): something moved in or out from behind. It is kept within
+     // the 3x3 neighbourhood's range (a little wider), and where that cuts it back much
+     // (the light itself changed) it starts again from a few frames.
      "fragment float4 ssil_history(V in [[stage_in]], texture2d<float> cur [[texture(0)]],\n"
      "                             texture2d<float> hist [[texture(1)]], texture2d<float> mv [[texture(2)]],\n"
+     "                             texture2d<float> zt [[texture(3)]], texture2d<float> zp [[texture(4)]],\n"
      "                             constant SLP &a [[buffer(0)]]) {\n"
      "    int2 p = int2(in.pos.xy), hs = int2(a.hsize) - 1;\n"
-     "    float4 c = cur.read(uint2(p)), lo = c, hi = c;\n"
+     "    float4 c = cur.read(uint2(p));\n"
+     "    float3 lo = c.rgb, hi = c.rgb;\n"
      "    for (int j = -1; j <= 1; j++)\n"
      "        for (int i = -1; i <= 1; i++) {\n"
-     "            float4 v = cur.read(uint2(clamp(p + int2(i, j), int2(0), hs)));\n"
+     "            float3 v = cur.read(uint2(clamp(p + int2(i, j), int2(0), hs))).rgb;\n"
      "            lo = min(lo, v), hi = max(hi, v);\n"
      "        }\n"
+     "    float z = zt.read(uint2(p)).x;\n"
      "    float2 m = mv.read(uint2(min(p * 2, int2(mv.get_width(), mv.get_height()) - 1))).xy;\n"
      "    float2 q = (in.pos.xy * a.px + m) * a.hsize;\n"
-     "    if (any(q < 0.0) || any(q >= a.hsize)) return c;\n"
+     "    if (z <= 0.0 || any(q < 0.0) || any(q >= a.hsize)) return float4(c.rgb, 1.0);\n"
+     "    float zh = zp.read(uint2(clamp(int2(q), int2(0), hs))).x;\n"
+     "    if (zh <= 0.0 || abs(zh - z) > max(0.15 * z, 8.0)) return float4(c.rgb, 1.0);\n"
      "    constexpr sampler hs_(filter::linear, address::clamp_to_edge);\n"
      "    float4 h = hist.sample(hs_, q * a.px);\n"
-     "    float4 ext = (hi - lo) * 0.25;\n"
-     "    return mix(clamp(h, lo - ext, hi + ext), c, 0.1); }\n"
+     "    float3 ext = (hi - lo) * 0.25, hc = clamp(h.rgb, lo - ext, hi + ext);\n"
+     "    if (!all(isfinite(h))) return float4(c.rgb, 1.0);\n"
+     "    float n = min(max(h.a, 1.0) + 1.0, SSIL_FRAMES);\n"
+     "    if (length(h.rgb - hc) > 0.02 + 0.25 * dot(hc, float3(0.299, 0.587, 0.114))) n = min(n, 4.0);\n"
+     "    return float4(mix(hc, c.rgb, 1.0 / n), n); }\n"
      // To full resolution: the four half-resolution pixels around, each weighted by how
      // close its depth is to this pixel's (dt, the depth buffer), so the light of a wall
      // behind does not spill onto the edge of a character in front; where none is close,
@@ -4589,7 +4599,7 @@ static id<MTLRenderPipelineState> ssil_pipeline(int kind)
 
 static id<MTLTexture> ssil_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h, int mipmapped)
 {
-    static id<MTLTexture> t[8];
+    static id<MTLTexture> t[9];
     if (!t[i] || t[i].width != w || t[i].height != h || t[i].pixelFormat != pf) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h
                                                                                  mipmapped:mipmapped != 0];
@@ -4620,7 +4630,7 @@ static void ssil_pass(int kind, id<MTLTexture> target, id<MTLTexture> const *tex
 // bounces off, from the world view `color` (half resolution, mipmapped), and the
 // occlusion's bounced-light parameters in *ap.
 static struct ssil_params ssil_frame;
-static id<MTLTexture> ssil_before;  // last frame's result (half resolution), bounced on at half strength
+static id<MTLTexture> ssil_before;  // last frame's result (half resolution), bounced on
 static unsigned long ssil_before_frame;
 static id<MTLTexture> ssil_picture(id<MTLTexture> color, id<MTLTexture> depth, id<MTLTexture> albedo, struct ao_params *ap)
 {
@@ -4630,7 +4640,7 @@ static id<MTLTexture> ssil_picture(id<MTLTexture> color, id<MTLTexture> depth, i
                             (float)taa_pending, 0};
     int again = ssil_before && ssil_before_frame == frames - 1 && !(taa_pending && taa_reset) &&
                 ssil_before.width == hw && ssil_before.height == hh;
-    a.feedback = again ? 0.5f * env_ssil_strength : 0;
+    a.feedback = again ? 1.0f : 0;
     id<MTLTexture> picture = ssil_texture(1, MTLPixelFormatRG11B10Float, hw, hh, 1);
     id<MTLTexture> color_in[4] = {color, again ? ssil_before : color, taa_pending ? taa_mv : color, albedo};
     ssil_pass(0, picture, color_in, 4, &a);
@@ -4640,39 +4650,44 @@ static id<MTLTexture> ssil_picture(id<MTLTexture> color, id<MTLTexture> depth, i
     ssil_frame = a;
     // Godot's settings, in world units (about 39 to the metre): fade out from 2000 to 8000.
     float from = 2000, to = 8000;
-    ap->il = 1, ap->il_radius = env_ssil_radius, ap->il_max_px = 0.3f * (float)hh;
+    ap->il = 1, ap->il_radius = env_ssil_radius, ap->il_max_px = 0.6f * (float)hh;
     ap->il_level = fminf(4, (float)(picture.mipmapLevelCount - 1));
     ap->fade_mul = -1 / (to - from), ap->fade_add = from / (to - from) + 1;
     return picture;
 }
 
-// After the occlusion: its bounced light `out` (ssil_texture 2) and depth edges filtered,
-// blended with last frame's under TAA, and brought to full resolution for post_apply.
+// After the occlusion: its bounced light `out` (ssil_texture 2) added up over frames under
+// TAA (the history keeps the sums before the blur), filtered by the depth edges, and
+// brought to full resolution for post_apply.
 static id<MTLTexture> ssil_run(id<MTLTexture> out, id<MTLTexture> edges, id<MTLTexture> z, id<MTLTexture> depth)
 {
     NSUInteger hw = z.width, hh = z.height;
     const struct ssil_params *a = &ssil_frame;
     id<MTLTexture> pong = ssil_texture(3, MTLPixelFormatRGBA16Float, hw, hh, 0);
-    for (int i = 0; i < env_ssil_blur; i++) {
-        id<MTLTexture> blur_in[2] = {out, edges};
-        ssil_pass(1, pong, blur_in, 2, a);
-        id<MTLTexture> t = out;
-        out = pong, pong = t;
-    }
     if (taa_pending) {
         static unsigned long last;
         static int which;
         id<MTLTexture> prev = ssil_texture(5 + which, MTLPixelFormatRGBA16Float, hw, hh, 0);
         id<MTLTexture> next = ssil_texture(6 - which, MTLPixelFormatRGBA16Float, hw, hh, 0);
+        id<MTLTexture> zprev = ssil_texture(8, MTLPixelFormatR32Float, hw, hh, 0);
         if (last == frames - 1 && !taa_reset) {
-            id<MTLTexture> hist_in[3] = {out, prev, taa_mv};
-            ssil_pass(2, next, hist_in, 3, a);
+            id<MTLTexture> hist_in[5] = {out, prev, taa_mv, z, zprev};
+            ssil_pass(2, next, hist_in, 5, a);
         } else {
             BLCompute *blit = stat_compute(__func__);
             [blit copyFromTexture:out toTexture:next];
             [blit endEncoding];
         }
+        BLCompute *blit = stat_compute(__func__);
+        [blit copyFromTexture:z toTexture:zprev];
+        [blit endEncoding];
         out = next, which ^= 1, last = frames;
+    }
+    for (int i = 0; i < env_ssil_blur; i++) {
+        id<MTLTexture> blur_in[2] = {out, edges};
+        id<MTLTexture> dst = i ? (out == pong ? ssil_texture(2, MTLPixelFormatRGBA16Float, hw, hh, 0) : pong) : pong;
+        ssil_pass(1, dst, blur_in, 2, a);
+        out = dst;
     }
     ssil_before = out, ssil_before_frame = frames;
     id<MTLTexture> full = ssil_texture(7, MTLPixelFormatRGBA16Float, depth.width, depth.height, 0);
