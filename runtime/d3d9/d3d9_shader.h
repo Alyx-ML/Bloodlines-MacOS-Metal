@@ -82,8 +82,8 @@ struct d3d_shader_variant {
     uint8_t rebake;
     // Pixel: also write [[color(2)]] for the bounced light (metal_render.m ssil_run): the
     // surface's own colour, the first 2D texture it reads that is not a lightmap or
-    // shadow (stage 0's with the fixed-function stages), alpha 1 (0.5 with albedo 2, a prop,
-    // for the contact shadows; 0.8 with 3, the map's own lightmapped surfaces, for the
+    // shadow (stage 0's with the fixed-function stages), alpha 1 (with albedo 2, a prop, its
+    // tag, p.tag, for the contact shadows; 0.8 with 3, the map's own lightmapped surfaces, for the
     // bounced light); mid grey for one that reads none.
     uint8_t albedo;
     // Pixel: also write [[color(3)]] for the reflections (metal_render.m surface_texture):
@@ -156,7 +156,11 @@ struct d3d_ps_params {
     float pom;                // variant surface: parallax depth from the height map at [[texture(19)]],
                               // a share of the texture's size (0 none)
     float pom_dist;           // variant surface: view distance the parallax has faded out by
-    float pad3[3];
+    float tag;                // variant albedo 2: which prop this is, the surfaces' colour's alpha
+                              // (0.26 to 0.73, metal_render.m setup_draw)
+    float out_max;            // the most oc0's colour may be (1, or more for the world view on the
+                              // back buffer, which holds light above white: metal_render.m setup_draw)
+    float pad3[1];
 };
 
 // Fixed-function pixel stages (draws with no pixel shader): the texture stage states

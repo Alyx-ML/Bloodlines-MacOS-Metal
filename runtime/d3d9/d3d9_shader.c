@@ -556,7 +556,7 @@ static const char *const header =
     "struct BLVSParams { int4 i[16]; uint b[16]; float2 inv_viewport; float clip_y; float pad; };\n"
     "struct BLPSParams { int4 i[16]; uint b[16]; float4 bumpenv[8]; float4 bumpenv_l[8]; float4 fog_color;\n"
     "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float gloss, pbr; float4 view;\n"
-    "    float bump, metal, spec, pom; float pom_dist, pad3, pad4, pad5; };\n"
+    "    float bump, metal, spec, pom; float pom_dist, tag, out_max, pad5; };\n"
     "struct BLVSOut {\n"
     "    float4 pos [[position]]; float psize [[point_size]];\n"
     "    float4 d0 [[user(d0)]]; float4 d1 [[user(d1)]];\n"
@@ -1558,7 +1558,10 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         ps_alpha_and_fog(o);
         if (v && v->shadow_caster) line(o, v->shadow_caster == 2 ? "oc0.w = in.pos.z;" : "oc0.w = 1.0 - in.pos.z;");
         line(o, "BLPSOut out;");
-        for (int i = 0; i < 4; i++)
+        // The colour as an 8-bit target would take it (0 to 1, alpha too), except that the
+        // world view may go past white on the back buffer (p.out_max), which holds more.
+        if (g.info.color_outputs & 1) line(o, "out.c0 = float4(clamp(oc0.xyz, 0.0, p.out_max), saturate(oc0.w));");
+        for (int i = 1; i < 4; i++)
             if (g.info.color_outputs & (1u << i)) line(o, "out.c%d = oc%d;", i, i);
         // -1.25: shone here (ps_detail), so the skin pass does not add its own shine; -1.4:
         // hair, shone here too.
@@ -1570,9 +1573,9 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         else if (info) line(o, "out.c1 = float4(0.0, 0.0, 0.0, p.gloss * _fog);");
         if (albedo && g.alb_stage >= 0)
             line(o, "out.c2 = float4(tex%d.sample(smp%d, (%s).xy).rgb, %s);", g.alb_stage, g.alb_stage, g.alb_coord,
-                 v->albedo == 2 ? "0.5" : v->albedo == 3 ? "0.8" : "1.0");
+                 v->albedo == 2 ? "p.tag" : v->albedo == 3 ? "0.8" : "1.0");
         else if (albedo)
-            line(o, "out.c2 = float4(0.5, 0.5, 0.5, %s);", v->albedo == 2 ? "0.5" : v->albedo == 3 ? "0.8" : "1.0");
+            line(o, "out.c2 = float4(0.5, 0.5, 0.5, %s);", v->albedo == 2 ? "p.tag" : v->albedo == 3 ? "0.8" : "1.0");
         if (surface) line(o, "out.c3 = _pbo;");
         if (g.info.writes_depth) line(o, "out.depth = odepth;");
         line(o, "return out;");

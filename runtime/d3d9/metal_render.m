@@ -47,7 +47,8 @@
 //                            surfaces with a height map goes, as a share of their texture's
 //                            size, BL_POM_DIST (default 1500) how far out it fades
 //   BL_HDR=0|1               HDR output on screens that have it (see hdr_present), over the
-//                            options' check box; BL_HDR_PEAK, BL_HDR_KNEE, BL_HDR_HEADROOM tune it
+//                            options' check box; BL_HDR_PEAK (default 4) is the brightest it goes,
+//                            times normal white, BL_HDR_HEADROOM stands in for the screen's
 //   BL_FOG=0|1               volumetric light: the map's lights in a thin haze (see fog_run), over
 //                            the options' check box; BL_FOG_DENSITY (default 0.0002 a world unit)
 //                            and BL_FOG_DIST (how far it is traced, default 2000)
@@ -230,7 +231,7 @@ static int deep_color;  // 16-bit back buffer, 10-bit window (BL_DEEP_COLOR, def
 // projection), 2 done for this frame.
 static int env_ao, env_ao_show, env_ssr, env_ssr_show, env_tonemap, env_hdr, env_fog, env_sss, env_sss_show;
 static float env_ao_radius, env_ao_strength, env_ao_thickness, env_ssr_strength, env_ssr_fresnel, env_ssr_blur,
-    env_tonemap_expand, env_hdr_peak, env_hdr_knee, env_hdr_headroom, env_fog_density, env_fog_dist, env_sss_width,
+    env_tonemap_expand, env_hdr_peak, env_hdr_headroom, env_fog_density, env_fog_dist, env_sss_width,
     env_sss_strength, env_sss_sheen, env_sss_through;
 static int view_state;
 static struct { float alpha, beta, p00, p11; } view_proj;
@@ -717,13 +718,16 @@ static id<MTLTexture> target_texture(struct obj *o)
                                            levels:NSMakeRange(level, 1) slices:NSMakeRange(slice, 1)];
         o->gpu_scale = owner->gpu_scale;
     } else {
-        // The device's own colour surfaces (the back buffer) keep 16 bits per channel
-        // with deep colour, so the game's many blended passes (lightmaps, fog, decals)
-        // do not band. The values still clamp to 0..1 like the 8-bit format they stand
-        // for; reads and copies to 8-bit surfaces convert (as_bgra8, d3d_render_stretch).
+        // The device's own colour surfaces (the back buffer) keep 16-bit floats with deep
+        // colour, so the game's many blended passes (lightmaps, fog, decals) do not band,
+        // and the world view keeps the light past white (its overbright lightmaps, glows
+        // added on glows) for the bloom and the tone map at the end of post_apply. What
+        // else is drawn there clamps to 0..1 like the 8-bit format it stands for (setup_draw,
+        // d3d_ps_params out_max); reads and copies to 8-bit surfaces convert (as_bgra8,
+        // d3d_render_stretch).
         MTLPixelFormat pf = target_format(o->format);
         if (deep_color && pf == MTLPixelFormatBGRA8Unorm && owner && owner->type == OBJ_DEVICE)
-            pf = MTLPixelFormatRGBA16Unorm;
+            pf = MTLPixelFormatRGBA16Float;
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
                                                                                      width:o->width * obj_scale(o)
                                                                                     height:o->height * obj_scale(o)
@@ -1420,7 +1424,6 @@ static void ensure_device(void)
     env_sss_eyes = !(getenv("BL_SSS_EYES") && !strcmp(getenv("BL_SSS_EYES"), "0"));
     env_tonemap_expand = getenv("BL_TONEMAP_EXPAND") ? (float)atof(getenv("BL_TONEMAP_EXPAND")) : 0.8f;
     env_hdr_peak = getenv("BL_HDR_PEAK") ? (float)atof(getenv("BL_HDR_PEAK")) : 4;
-    env_hdr_knee = getenv("BL_HDR_KNEE") ? (float)atof(getenv("BL_HDR_KNEE")) : 0.05f;
     env_hdr_headroom = getenv("BL_HDR_HEADROOM") ? (float)atof(getenv("BL_HDR_HEADROOM")) : 0;
     env_fog_density = getenv("BL_FOG_DENSITY") ? (float)atof(getenv("BL_FOG_DENSITY")) : 0.0002f;
     env_fog_dist = getenv("BL_FOG_DIST") ? (float)atof(getenv("BL_FOG_DIST")) : 2000;
@@ -1610,7 +1613,6 @@ static id<MTLTexture> surface_texture(id<MTLTexture> color)
 }
 
 static id<MTLTexture> hdr_world;
-static unsigned long hdr_world_frame;
 static int pause_seen, pause_frame;  // the pause menu painted this frame, the last
 
 static BLRender *pass(struct d3d_state *s)
@@ -1706,15 +1708,14 @@ static BLRender *pass(struct d3d_state *s)
         enc = stat_render(d, __func__);
     }
     if (world_end) {
-        // A copy of the finished world view, before the view model and HUD: what
-        // hdr_present may brighten, and what the pause menu shows behind it.
+        // A copy of the finished world view, before the view model and HUD: what the
+        // pause menu shows behind it.
         [enc endEncoding];
         id<MTLTexture> ct = target_texture(color);
         hdr_world = ao_texture(7, ct.pixelFormat, ct.width, ct.height);
         BLCompute *blit = stat_compute(__func__);
         [blit copyFromTexture:ct toTexture:hdr_world];
         [blit endEncoding];
-        hdr_world_frame = frames;
         d.colorAttachments[0].loadAction = MTLLoadActionLoad;
         d.depthAttachment.loadAction = d.stencilAttachment.loadAction = MTLLoadActionLoad;
         if (info) d.colorAttachments[1].loadAction = MTLLoadActionLoad;
@@ -1772,6 +1773,20 @@ static int full_screen(void)
 }
 
 static uint32_t game_window;
+
+// HDR: how far past normal white the screen goes now (BL_HDR_HEADROOM in its place), and
+// the brightest the tone map takes the world view (post_apply), in the game's colours
+// (sRGB carried on past 1): the headroom or BL_HDR_PEAK, whichever is less.
+static float hdr_headroom(void)
+{
+    return env_hdr_headroom > 0 ? env_hdr_headroom : layer ? bl_cocoa_edr_headroom() : 4;
+}
+
+static float hdr_peak(void)
+{
+    float l = fmaxf(fminf(hdr_headroom(), env_hdr_peak), 1);
+    return 1.055f * powf(l, 1 / 2.4f) - 0.055f;
+}
 
 // The window's pixels: sRGB, or with HDR (hdr_present) linear values, 1 at normal white
 // and above it up to the screen's headroom. Switched when the HDR box changes.
@@ -2753,14 +2768,15 @@ struct ssr_params {
     float fog, skin;         // add the volumetric light (fog_run); use the scattered skin (skin_run)
     float bloom, exposure;   // add the glow this much (bloom_run); scale by the eye's exposure (1; 2 show it)
     float ssil, ssil_show;   // add the bounced light this much (ssil_run); show it alone
-    float probes, pad;       // 1: the light probes light the characters (gi_frame), which then take none
+    float probes;            // 1: the light probes light the characters (gi_frame), which then take none
+    float peak;              // the brightest the tone map goes, in the game's colours (1; HDR: hdr_peak)
 };
 
 static NSString *const ssr_source =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
      "struct SP { float2 full, hsize; float p00, p11, strength, max_dist, show, fresnel, blur, tonemap, expand,\n"
-     "            fog, skin, bloom, exposure, ssil, ssil_show, probes, pad; };\n"
+     "            fog, skin, bloom, exposure, ssil, ssil_show, probes, peak; };\n"
      "struct V { float4 pos [[position]]; };\n"
      "vertex V ssr_vs(uint id [[vertex_id]]) {\n"
      "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
@@ -2913,11 +2929,11 @@ static NSString *const ssr_source =
      // with the original chroma faded out towards white, and the two are blended 40:60.
      "static float gt7_smooth(float x, float e0, float e1) { float t = saturate((x - e0) / (e1 - e0)); return t * t * (3.0 - 2.0 * t); }\n"
      "constant float GT7_PEAK = 2.5, GT7_ALPHA = 0.25, GT7_MID = 0.538, GT7_LIN = 0.444, GT7_TOE = 1.28;\n"
-     "static float gt7_curve(float x) {\n"
+     "static float gt7_curve(float x, float P) {\n"
      "    if (x < 0.0) return 0.0;\n"
      "    float k = (GT7_LIN - 1.0) / (GT7_ALPHA - 1.0);\n"
-     "    float ka = GT7_PEAK * GT7_LIN + GT7_PEAK * k, kb = -GT7_PEAK * k * exp(GT7_LIN / k), kc = -1.0 / (k * GT7_PEAK);\n"
-     "    if (x >= GT7_LIN * GT7_PEAK) return ka + kb * exp(x * kc);\n"
+     "    float ka = P * GT7_LIN + P * k, kb = -P * k * exp(GT7_LIN / k), kc = -1.0 / (k * P);\n"
+     "    if (x >= GT7_LIN * P) return ka + kb * exp(x * kc);\n"
      "    float wl = gt7_smooth(x, 0.0, GT7_MID);\n"
      "    return (1.0 - wl) * GT7_MID * pow(x / GT7_MID, GT7_TOE) + wl * x; }\n"
      "static float3 pq_encode(float3 l) {\n"
@@ -2945,7 +2961,7 @@ static NSString *const ssr_source =
      "    float3 c = float3(dot(lin, float3(0.6274, 0.3293, 0.0433)), dot(lin, float3(0.0691, 0.9195, 0.0114)),\n"
      "                      dot(lin, float3(0.0164, 0.0880, 0.8956))) * GT7_PEAK;\n"
      "    float3 ucs = to_ictcp(c);\n"
-     "    float3 skew = float3(gt7_curve(c.r), gt7_curve(c.g), gt7_curve(c.b));\n"
+     "    float3 skew = float3(gt7_curve(c.r, GT7_PEAK), gt7_curve(c.g, GT7_PEAK), gt7_curve(c.b, GT7_PEAK));\n"
      "    float3 su = to_ictcp(skew);\n"
      "    float target = to_ictcp(float3(GT7_PEAK)).x;\n"
      "    float chroma = 1.0 - gt7_smooth(ucs.x, 0.98 * target, 1.16 * target);\n"
@@ -2954,6 +2970,33 @@ static NSString *const ssr_source =
      "    o = float3(dot(o, float3(1.6605, -0.5876, -0.0728)), dot(o, float3(-0.1246, 1.1329, -0.0083)),\n"
      "               dot(o, float3(-0.0182, -0.1006, 1.1187)));\n"
      "    o = saturate(o);\n"
+     "    return select(1.055 * pow(o, 1.0 / 2.4) - 0.055, o * 12.92, o <= 0.0031308); }\n"
+     // HDR: GT7's whole tone map (as gt7 above: the toe, the curve on each channel, the
+     // chroma kept in ICtCp) at the screen's peak, GT7_PEAK times the headroom H. First the
+     // highlights the game rolled off into white are turned back into the light they would
+     // have been, as HDR mods for old games do (RenoDX): the game's colours taken as GT7's
+     // normal-screen output and its shoulder inverted (by the brightest channel, so hues
+     // stay). Game white comes out about 1.45 times white with a headroom of 2.67, and the
+     // toe deepens the darks. Values past white kept (not saturated) for the EDR screen.
+     "static float3 gt7_full(float3 srgb, float H) {\n"
+     "    float3 s = max(srgb, 0.0), lin = select(pow((s + 0.055) / 1.055, 2.4), s / 12.92, s <= 0.04045);\n"
+     "    float P = GT7_PEAK, Ph = GT7_PEAK * H, y = max(max(lin.r, lin.g), lin.b) * P;\n"
+     "    if (y > GT7_LIN * P) {\n"
+     "        float k = (GT7_LIN - 1.0) / (GT7_ALPHA - 1.0);\n"
+     "        float ka = P * (GT7_LIN + k), kb = -P * k * exp(GT7_LIN / k), kc = -1.0 / (k * P);\n"
+     "        lin *= (y < P ? log((y - ka) / kb) / kc : log((P - ka) / kb) / kc * y / P) / y;\n"
+     "    }\n"
+     "    float3 c = float3(dot(lin, float3(0.6274, 0.3293, 0.0433)), dot(lin, float3(0.0691, 0.9195, 0.0114)),\n"
+     "                      dot(lin, float3(0.0164, 0.0880, 0.8956))) * P;\n"
+     "    float3 ucs = to_ictcp(c);\n"
+     "    float3 skew = float3(gt7_curve(c.r, Ph), gt7_curve(c.g, Ph), gt7_curve(c.b, Ph));\n"
+     "    float3 su = to_ictcp(skew);\n"
+     "    float target = to_ictcp(float3(Ph)).x;\n"
+     "    float chroma = 1.0 - gt7_smooth(ucs.x, 0.98 * target, 1.16 * target);\n"
+     "    float3 scaled = from_ictcp(float3(su.x, ucs.y * chroma, ucs.z * chroma));\n"
+     "    float3 o = min(mix(skew, scaled, 0.6), Ph) / P;\n"
+     "    o = max(float3(dot(o, float3(1.6605, -0.5876, -0.0728)), dot(o, float3(-0.1246, 1.1329, -0.0083)),\n"
+     "                   dot(o, float3(-0.0182, -0.1006, 1.1187))), 0.0);\n"
      "    return select(1.055 * pow(o, 1.0 / 2.4) - 0.055, o * 12.92, o <= 0.0031308); }\n"
      // Khronos PBR Neutral (the reference version), on linear sRGB.
      "static float3 pbr_neutral(float3 srgb, float mode, float expand) {\n"
@@ -2971,33 +3014,15 @@ static NSString *const ssr_source =
      "    }\n"
      "    c = saturate(c);\n"
      "    return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308); }\n"
-     // HDR output: the picture in linear light, 1 at normal white. Where the HUD and view
-     // model left the world view alone, everything lit brighter than `knee` (luminance) is
-     // brightened, more the brighter it is (in proportion to how far it is from `knee`
-     // to white), white reaching `peak`; then the brightest channel is rolled off at the
-     // screen's headroom with GT7's shoulder (straight, then exponential towards the
-     // peak) and whitened a little near it. The HUD stays at normal white, below the lit
-     // world. `preview` writes the result divided by the headroom, in sRGB, for dumps.
-     "struct HP { float headroom, peak, knee, world, preview, pad0, pad1, pad2; };\n"
-     "fragment float4 hdr_present(V in [[stage_in]], texture2d<float> pic [[texture(0)]], texture2d<float> world [[texture(1)]],\n"
-     "                            constant HP &h [[buffer(0)]]) {\n"
-     "    uint2 p = uint2(in.pos.xy);\n"
-     "    float3 c = saturate(pic.read(p).rgb);\n"
-     "    float3 o = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);\n"
+     // HDR output: the picture in linear light, 1 at normal white (the sRGB curve carried on
+     // past 1). post_apply's tone map (gt7_full) took the world view's highlights past white
+     // up to the peak (hdr_peak); the HUD and view model stay within white. `preview` writes the
+     // result divided by the headroom, in sRGB, for dumps.
+     "struct HP { float headroom, preview, pad0, pad1; };\n"
+     "fragment float4 hdr_present(V in [[stage_in]], texture2d<float> pic [[texture(0)]], constant HP &h [[buffer(0)]]) {\n"
+     "    float3 c = max(pic.read(uint2(in.pos.xy)).rgb, 0.0);\n"
      "    float H = h.headroom;\n"
-     "    if (h.world > 0.0 && H > 1.001 && all(abs(world.read(p).rgb - c) < 1e-3)) {\n"
-     "        float Y = dot(o, float3(0.2126, 0.7152, 0.0722));\n"
-     "        if (Y > h.knee) {\n"
-     "            float u = saturate((Y - h.knee) / (1.0 - h.knee));\n"
-     "            o *= 1.0 + (h.peak - 1.0) * u;\n"
-     "            float m = max(max(o.r, o.g), o.b), x = m;\n"
-     "            float L = max(GT7_LIN, min(1.0 / H, 0.999)), k = (L - 1.0) / (GT7_ALPHA - 1.0);\n"
-     "            float ka = H * L + H * k, kb = -H * k * exp(L / k), kc = -1.0 / (k * H);\n"
-     "            float y = x < L * H ? x : min(ka + kb * exp(x * kc), H);\n"
-     "            o *= y / m;\n"
-     "            o = mix(o, float3(y), 0.4 * smoothstep(0.5, 1.0, y / H));\n"
-     "        }\n"
-     "    }\n"
+     "    float3 o = min(select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045), H);\n"
      "    if (h.preview > 0.0) {\n"
      "        o = saturate(o / H);\n"
      "        return float4(select(1.055 * pow(o, 1.0 / 2.4) - 0.055, o * 12.92, o <= 0.0031308), 1.0);\n"
@@ -3055,20 +3080,27 @@ static NSString *const ssr_source =
      "        float4 f = fogt.sample(ls, (float2(p) + 0.5) / a.full);\n"
      "        col = col * f.w + f.rgb;\n"
      "    }\n"
-     // The eye's exposure, then the glow (bloom section), and a soft shoulder so what they
-     // push past white rolls off instead of clipping (without tone mapping, which has its own).
+     // The eye's exposure, then the glow (bloom section).
      "    if (a.exposure > 0.0 || a.bloom > 0.0) {\n"
      "        constexpr sampler gs(filter::linear, address::clamp_to_edge);\n"
      "        if (a.exposure > 0.0) col *= eye[0];\n"
      "        if (a.bloom > 1.5) col = glow.sample(gs, (float2(p) + 0.5) / a.full).rgb;\n"
      "        else if (a.bloom > 0.0) col += a.bloom * glow.sample(gs, (float2(p) + 0.5) / a.full).rgb;\n"
-     "        float m = max(max(col.r, col.g), col.b), k = 0.75;\n"
-     "        if (a.tonemap == 0.0 && m > k) col *= (k + (1.0 - k) * (1.0 - exp(-(m - k) / (1.0 - k)))) / m;\n"
-     "        if (a.exposure > 1.5 && p.y < 12) col = float(p.x) < a.full.x * eye[0] * 0.5 ? float3(1.0, 0.8, 0.0) : float3(0.1);\n"
+     "    }\n"
+     // The tone map. On a normal screen (peak 1) a soft shoulder from 0.75 to white with
+     // the exposure or glow on, as it always has been (by the brightest channel, so the
+     // hue stays), and otherwise a clip at white as an 8-bit back buffer did. With HDR
+     // (peak, in the game's colours, above 1) GT7's whole tone map at the screen's (gt7_full).
+     "    if (a.tonemap == 0.0 && a.peak > 1.001) {\n"
+     "        col = gt7_full(col, pow((a.peak + 0.055) / 1.055, 2.4));\n"
+     "    } else if (a.tonemap == 0.0) {\n"
+     "        float k = a.exposure <= 0.0 && a.bloom <= 0.0 ? 1.0 : 0.75, m = max(max(col.r, col.g), col.b);\n"
+     "        if (m > k) col *= (k + (1.0 - k) * (1.0 - exp(-(m - k) / (1.0 - k)))) / m;\n"
      "    }\n"
      "    if (a.tonemap > 2.5) col = pbr_neutral(saturate(col), a.tonemap, a.expand);\n"
      "    else if (a.tonemap > 0.0) col = gt7(saturate(col), a.tonemap, a.expand);\n"
-     "    return float4(saturate(col), c.a); }\n";
+     "    if (a.exposure > 1.5 && p.y < 12) col = float(p.x) < a.full.x * eye[0] * 0.5 ? float3(1.0, 0.8, 0.0) : float3(0.1);\n"
+     "    return float4(clamp(col, 0.0, a.peak), c.a); }\n";
 
 // kind 0: trace (a second target for the ray's length and Fresnel factor); 1: filter;
 // 2: post_apply, in the game's pass with its depth attachment (`depth`); 4: the blend
@@ -3715,8 +3747,9 @@ static void skin_run(id<MTLTexture> color, id<MTLTexture> z, NSUInteger hw, NSUI
 // world units; the first step behind something drawn, at most that far
 // behind, is in shadow, fading with the step's distance. Only characters (marked in the
 // reflection info, d3d_shader_variant skin) and props (marked in the surfaces' colour,
-// d3d_shader_variant albedo 2: bottles on a bar, chairs on a floor) cast them, onto
-// anything; characters also take them from anything. The map's own shadows on itself are
+// d3d_shader_variant albedo 2: bottles on a bar, chairs on a floor) cast them onto
+// anything but themselves for props (each tagged, so a carved panel does not shade its own
+// relief all over); characters also take them from anything. The map's own shadows on itself are
 // baked into its lightmaps already. The result is filtered like the occlusion and
 // multiplied in at full resolution (contact_apply); BL_CONTACT_STRENGTH (0..1, default 0.5)
 // is the most it darkens, BL_CONTACT=show shows it alone.
@@ -3746,14 +3779,19 @@ static NSString *const contact_source =
      // A character's pixel: the reflection info's alpha is -1 or -2 there.
      "static bool person(constant CP &a, texture2d<float> info, int2 p) {\n"
      "    return info.read(uint2(min(p * 2, int2(a.full) - 1))).w < -0.5; }\n"
-     // A prop's pixel: the surfaces' colour's alpha is 0.5 there (d3d_shader_variant albedo 2).
+     // A prop's pixel: the surfaces' colour's alpha is its tag there, 0.26 to 0.73
+     // (d3d_shader_variant albedo 2).
      "static bool prop(constant CP &a, texture2d<float> alb, int2 p) {\n"
      "    float t = alb.read(uint2(min(p * 2, int2(a.full) - 1))).w;\n"
      "    return a.props > 0.5 && t > 0.25 && t < 0.75; }\n"
+     // A prop other than the one tagged `tag` (-1: none).
+     "static bool other_prop(constant CP &a, texture2d<float> alb, int2 p, float tag) {\n"
+     "    float t = alb.read(uint2(min(p * 2, int2(a.full) - 1))).w;\n"
+     "    return a.props > 0.5 && t > 0.25 && t < 0.75 && abs(t - tag) > 0.002; }\n"
      "static float ign(float2 p) { return fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715)))); }\n"
      // How much is in the way from O towards the light along bl, len units, in steps.
      "static float march(constant CP &a, texture2d<float> zt, texture2d<float> info, texture2d<float> alb, int2 p,\n"
-     "                   float3 O, float3 bl, float len, float w, float j, bool me, int steps) {\n"
+     "                   float3 O, float3 bl, float len, float w, float j, bool me, float tag, int steps) {\n"
      "    float bias = 0.3 + 0.004 * w, thick = max(a.length, 0.02 * w);\n"
      "    for (int i = 0; i < steps; i++) {\n"
      "        float t = (float(i) + j) / float(steps);\n"
@@ -3770,7 +3808,7 @@ static NSString *const contact_source =
      "        float zs = zt.read(uint2(qi)).x;\n"
      "        if (zs <= 0.0) continue;\n"
      "        float diff = Q.z - zs;\n"
-     "        if (diff > bias && diff < thick && (me || person(a, info, qi) || prop(a, alb, qi))) return 1.0 - t * t;\n"
+     "        if (diff > bias && diff < thick && (me || person(a, info, qi) || other_prop(a, alb, qi, tag))) return 1.0 - t * t;\n"
      "    }\n"
      "    return 0.0; }\n"
      "static float contact_at(int2 p, texture2d<float> zt, texture2d<float> info, texture2d<float> alb, constant CP &a,\n"
@@ -3811,12 +3849,14 @@ static NSString *const contact_source =
      "    float iw = info.read(uint2(min(p * 2, int2(a.full) - 1))).w;\n"
      "    if (iw < -1.3 && iw > -1.5) return 1.0;\n"
      "    bool me = person(a, info, p);\n"
+     // A prop takes none from itself: a carved panel would shade its own relief all over.
+     "    float tag = prop(a, alb, p) ? alb.read(uint2(min(p * 2, int2(a.full) - 1))).w : -1.0;\n"
      "    float3 O = P + N * (0.002 * w);\n"
      // pad: a frame number under TAA, so the grain moves and the scaler averages it out.
      "    float j = ign(float2(p) + a.pad * 5.588238);\n"
-     "    float occ = march(a, zt, info, alb, p, O, bl, min(a.length, length(bv) * 0.9), w, j, me, 16) * best;\n"
+     "    float occ = march(a, zt, info, alb, p, O, bl, min(a.length, length(bv) * 0.9), w, j, me, tag, 16) * best;\n"
      "    if (next * 6.0 >= total)\n"
-     "        occ += march(a, zt, info, alb, p, O, nl, min(a.length, length(nv) * 0.9), w, fract(j + 0.5), me, 8) * next;\n"
+     "        occ += march(a, zt, info, alb, p, O, nl, min(a.length, length(nv) * 0.9), w, fract(j + 0.5), me, tag, 8) * next;\n"
      "    return 1.0 - a.strength * occ / total; }\n"
      // A kernel (post_traces).
      "kernel void contact_main(texture2d<float> zt [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
@@ -4198,7 +4238,8 @@ static void taa_frame_end(void)
 
 // --- bloom and eye adaptation ---------------------------------------------------------
 //
-// Both work on the world view's own colours (post_run's copy, before the HUD), with no HDR:
+// Both work on the world view's own colours (post_run's copy, before the HUD; the bloom
+// with the light past white the back buffer holds, the eye within white):
 // - Bloom (BL_BLOOM, bloom_run): what is brighter than BL_BLOOM_THRESHOLD (by luminance,
 //   with a soft knee; each pixel weighted down by its brightness against single-pixel
 //   flicker) is halved in size six times and spread back up, each level adding the next
@@ -4282,7 +4323,8 @@ static NSString *const bloom_source =
      "fragment float bloom_lum(V in [[stage_in]], texture2d<float> src [[texture(0)]], constant BP &b [[buffer(0)]]) {\n"
      "    float2 uv = in.pos.xy / float2(64.0, 36.0), d = 0.25 / float2(64.0, 36.0);\n"
      "    float l = 0.0;\n"
-     "    for (int i = 0; i < 4; i++) l += luma(src.sample(ls, uv + d * float2(i & 1 ? 1.0 : -1.0, i & 2 ? 1.0 : -1.0)).rgb);\n"
+     // Within white, as the back buffer held it when the exposure was tuned.
+     "    for (int i = 0; i < 4; i++) l += luma(min(src.sample(ls, uv + d * float2(i & 1 ? 1.0 : -1.0, i & 2 ? 1.0 : -1.0)).rgb, 1.0));\n"
      "    return log(max(l * 0.25, 1e-3)); }\n"
      // One group: the weighted mean, the exposure it asks for, and a step towards it.
      "kernel void bloom_adapt(texture2d<float> lt [[texture(0)]], device float *eye [[buffer(1)]],\n"
@@ -4776,7 +4818,7 @@ static void post_run(struct d3d_state *s)
     struct ssr_params p = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, view_proj.p00,
                            view_proj.p11, reflect ? env_ssr_strength : 0, 2000,
                            (float)env_ssr_show, env_ssr_fresnel, env_ssr_blur, (float)env_tonemap, env_tonemap_expand,
-                           0, 0, 0, 0, 0, 0, 0, 0};
+                           0, 0, 0, 0, 0, 0, 0, env_hdr ? hdr_peak() : 1};
     post_ssr = post_aux = post_fog = post_skin = post_base;  // bound but unread without them
     if (reflect) {
         id<MTLTexture> raw = ao_texture(4, MTLPixelFormatRGBA16Float, hw, hh);
@@ -5468,6 +5510,23 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
     [e setFragmentBytes:pc length:sizeof pc atIndex:0];
     struct d3d_ps_params pp;
     memset(&pp, 0, sizeof pp);
+    // A prop's tag (d3d_shader_variant albedo 2), from its vertices' buffer and place in it:
+    // the contact shadows let a prop shade other props but not itself.
+    if (k->psv.albedo == 2 && s->stream[0]) {
+        uint64_t h = (s->stream[0]->serial * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)s->stream_offset[0] * 0xC2B2AE3D27D4EB4Full);
+        pp.tag = (float)(66 + (h >> 32) % 120) / 255.0f;
+    }
+    // The world view on the back buffer may pass white (its float format), unless its
+    // blending weighs by colour (SRCCOLOR, INVSRCCOLOR, DESTCOLOR, INVDESTCOLOR), which
+    // takes 0 to 1 as D3D9 gives it. The view model and HUD (after post_apply's tone map)
+    // stay within white.
+    pp.out_max = 1;
+    if (view_state == 1 && !menu_frame && s->render_target[0] == s->back_buffer &&
+        target_texture(s->back_buffer).pixelFormat == MTLPixelFormatRGBA16Float) {
+        int by_colour = 0;
+        for (int i = 1; i <= 2 && k->blend[0]; i++) by_colour |= k->blend[i] == 3 || k->blend[i] == 4 || k->blend[i] == 9 || k->blend[i] == 10;
+        if (!by_colour) pp.out_max = 64;
+    }
     memcpy(pp.i, s->ps_i, sizeof pp.i);
     memcpy(pp.b, s->ps_b, sizeof pp.b);
     for (int i = 0; i < ps->info.ndefis; i++)
@@ -7198,13 +7257,12 @@ static void count_presented(id<CAMetalDrawable> drawable)
     }];
 }
 
-// HDR output (BL_HDR): hdr_present from `pic` into `out`, brightening what is still the
-// world view (`world`, nil for none).
-static void hdr_draw(id<MTLTexture> pic, id<MTLTexture> world, id<MTLTexture> out, int preview)
+// HDR output (BL_HDR): hdr_present from `pic` into `out`.
+static void hdr_draw(id<MTLTexture> pic, id<MTLTexture> out, int preview)
 {
-    float headroom = env_hdr_headroom > 0 ? env_hdr_headroom : layer ? bl_cocoa_edr_headroom() : 4;
-    LOG_ONCE("[metal] HDR: headroom %g\n", headroom);
-    float hp[8] = {headroom, env_hdr_peak, env_hdr_knee, world ? 1.0f : 0.0f, (float)preview};
+    float headroom = hdr_headroom();
+    LOG_ONCE("[metal] HDR: headroom %g, peak %g\n", headroom, fminf(headroom, env_hdr_peak));
+    float hp[4] = {headroom, (float)preview};
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.colorAttachments[0].texture = out;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -7212,19 +7270,18 @@ static void hdr_draw(id<MTLTexture> pic, id<MTLTexture> world, id<MTLTexture> ou
     BLRender *e = stat_render(rp, __func__);
     [e setRenderPipelineState:ssr_pipeline(3, out.pixelFormat, MTLPixelFormatInvalid)];
     [e setFragmentTexture:pic atIndex:0];
-    [e setFragmentTexture:world ? world : pic atIndex:1];
     [e setFragmentBytes:hp length:sizeof hp atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
 }
 
 // The drawable is 10-bit with deep colour: a blit needs equal formats, a draw converts.
-static void copy_to_drawable(id<MTLTexture> t, id<MTLTexture> world, id<CAMetalDrawable> drawable)
+static void copy_to_drawable(id<MTLTexture> t, id<CAMetalDrawable> drawable)
 {
     end_pass();
     mtl4_untracked(drawable.texture);
     if (drawable.texture.pixelFormat == MTLPixelFormatRGBA16Float) {
-        hdr_draw(t, world, drawable.texture, 0);
+        hdr_draw(t, drawable.texture, 0);
     } else if (t.pixelFormat == drawable.texture.pixelFormat) {
         BLCompute *blit = stat_compute(__func__);
         [blit copyFromTexture:t toTexture:drawable.texture];
@@ -7448,10 +7505,6 @@ void d3d_render_present(struct d3d_state *s)
     struct obj *bb = s->back_buffer;
     id<MTLTexture> back = bb ? target_texture(bb) : nil;
     if (back && frame_squeeze < 1) menu_bars(back, frame_squeeze);
-    id<MTLTexture> world = hdr_world_frame + 1 == frames && hdr_world && back && hdr_world.width == back.width &&
-                                   hdr_world.height == back.height
-                               ? hdr_world
-                               : nil;
     static float shown_squeeze = 1;
     if (frame_squeeze != shown_squeeze) {
         shown_squeeze = frame_squeeze;
@@ -7470,7 +7523,7 @@ void d3d_render_present(struct d3d_state *s)
         write_png(read_target(back), back.width, back.height, path);
         if (env_hdr) {
             id<MTLTexture> pv = ao_texture(8, MTLPixelFormatBGRA8Unorm, back.width, back.height);
-            hdr_draw(back, world, pv, 1);
+            hdr_draw(back, pv, 1);
             snprintf(path, sizeof path, "%s/frame_%lu_hdr.png", dir, frames);
             write_png(read_target(pv), back.width, back.height, path);
         }
@@ -7497,7 +7550,7 @@ void d3d_render_present(struct d3d_state *s)
             layer_format();
             id<CAMetalDrawable> drawable = [layer nextDrawable];
             if (drawable && drawable.texture.width == back.width && drawable.texture.height == back.height) {
-                copy_to_drawable(back, world, drawable);
+                copy_to_drawable(back, drawable);
                 present(drawable);
             }
             next_frame();
@@ -7643,7 +7696,7 @@ void d3d_render_present_pixels(const void *pixels, uint32_t w, uint32_t h, int b
         layer_format();
         id<CAMetalDrawable> drawable = [layer nextDrawable];
         if (drawable && drawable.texture.width == sw && drawable.texture.height == sh) {
-            copy_to_drawable(screen, nil, drawable);
+            copy_to_drawable(screen, drawable);
             present(drawable);
         }
         next_frame();

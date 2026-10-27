@@ -3069,6 +3069,100 @@ brightness was matched to them) and worse on characters (their normal maps, deta
 shading lost, edges stepped), so it is gone: third_party/RTGL1, rt_path, rtgl_msl.py and the
 mix. (What it left for a successor went with Wicked Engine's RT, above.)
 
+## 2026-10-27: Props' contact shadows no longer fall on themselves
+
+Reported: bloom seemed gone and the look less moody after 2ed0c27. Compared frame 1400
+of sm_asylum_1 from f18f9bd and 2ed0c27, same data folders and every effect forced the
+same way by the environment (the registry had changed mid-test: Reflections, BouncedLight,
+EyeAdaptation, SkinScattering and GlobalIllumination off, RayTracedGI on). The frames
+match (mean brightness 0.112 vs 0.111) except the carved green panel above the bar,
+15% darker: props now cast contact shadows (albedo 2), and the panel, part of the bar's
+model, shaded itself all over (contact shadows off, the occlusion matches the old build,
+0.951 vs 0.949). It is the brightest thing in the room, so the bloom from it dropped too
+(the frame's top 1% from 0.592 to 0.568).
+
+A first fix (props take none from props) also took away the bottles' shadows on the
+shelves and things' on tables, which the user noticed. Now each prop draw is tagged:
+
+- d3d_ps_params.tag (BLPSParams `tag`, in place of a pad): for albedo 2, 66 to 185 over 255
+  from a hash of the draw's vertex buffer serial and stream offset (setup_draw); the
+  shader writes it as the surfaces' colour's alpha in place of 0.5.
+- contact_source: a prop's pixel takes contact shadows from characters and from props
+  with another tag (other_prop), not from its own.
+- Tried and dropped: letting a prop shade itself from its parts farther than 4 or 10
+  units; the panel's shading and the stools' own come from the same distances.
+
+### Verified
+- Same frame, same settings: the panel 0.359 (old 0.356, before the fix 0.303), the top 1%
+  0.597 (old 0.592); the rest within 1-5% of the old build. Contact shadows alone: the
+  bottles still shade the shelves; the stools no longer shade their own legs and seats
+  all over (3.6% of the view shaded before, 1.6% now).
+
+### Not verified
+- The stools and other props look lighter than in 2ed0c27: not yet looked at in the window.
+- Two meshes of one model (a stool's seat and leg) have different tags and still shade
+  each other; tag clashes (1 in 120) leave a pair of props unshaded by each other.
+- Earlier A/B mistakes, for the record: a copy of the old build without build/textures,
+  hires, hair and the other data folders, and runs after the registry changed, both gave
+  false differences (the floor's reflections).
+
+## 2026-10-27: Real HDR: light past white kept, one tone map
+
+The HDR option (2026-10-25) was not HDR: the back buffer (RGBA16Unorm with deep colour)
+clipped everything at white, and `hdr_present` then guessed, brightening whatever was
+above a luminance knee towards `BL_HDR_PEAK`. The bloom only saw light clipped to white.
+All in `runtime/d3d9/metal_render.m` unless named.
+
+- **Back buffer in floats.** The device's own colour surfaces are RGBA16Float with deep
+  colour, so the world view keeps the light past white the game's shaders give (its
+  overbright lightmaps, glows added on glows). Each pixel shader's colour output is
+  clamped as an 8-bit target would (0 to 1, alpha always), except up to
+  `d3d_ps_params.out_max` (64) for the world view's draws on the back buffer whose
+  blending does not weigh by colour (SRCCOLOR, INVSRCCOLOR, DESTCOLOR, INVDESTCOLOR):
+  `setup_draw`, `d3d9_shader.c`. The view model and HUD, drawn after the effects, stay
+  within white. Fixed-function draws already saturate each stage.
+- **One tone map, at the end of `post_apply`** (before the view model and HUD), by the
+  brightest channel so hues stay. On a normal screen it is the same shoulder as before
+  (from 0.75 to white, with the eye adaptation or bloom on; a clip at white otherwise),
+  now fed the real values, so the brightest highlights roll off instead of clipping.
+  With HDR it leaves everything up to white as the game drew it and rolls the rest off
+  towards the peak: the screen's headroom or `BL_HDR_PEAK` (default 4, times white),
+  whichever is less, in the game's colours (sRGB carried on past 1; `hdr_peak`).
+- **`hdr_present` only decodes** (sRGB past 1 to linear, capped at the headroom). The
+  knee, the luminance guess and the HUD-pixel test against the world copy are gone, with
+  `BL_HDR_KNEE`. `hdr_world` stays for the pause menu's background.
+- **Kept within white on purpose:** the eye adaptation's metering (`bloom_lum`) and the
+  bounced light's colour (`ssil_color`), both tuned on the clipped colours, so the
+  exposure and the darks and mid-tones stay as approved. The bloom and the reflections
+  see the real values.
+
+Verified: the runtime builds and links (private copy of 2ed0c27 with the contact-shadow
+fix); the post, bloom and bounced-light shader sources compile with `xcrun metal`, from
+both that copy and the main tree. A window run on the M4 Pro (frames 300, 400 and 500
+dumped with `BL_HDR_HEADROOM=4`; the screen's own headroom was 2.67) ran cleanly, but
+HDR looked no different on or off: only 0.11% of the asylum club's picture is past
+1.02x white (0.02% past 1.3x, at most 2.5x), bits of the green neon strips. The game
+draws almost nothing above white.
+
+- **GT7's tone map for HDR** (`gt7_hdr`, in place of the shoulder above). A first try,
+  the glows (additive draws) multiplied by the peak, raised the part past white only
+  from 0.054% to 0.11% and was taken out (`out_gain` gone). Now the game's picture is
+  taken as GT7's normal-screen output (peak 2.5) and inverted back to the light it would
+  have been, then put through the same curve at the screen's peak (2.5 times the
+  headroom), as HDR mods do for old games (RenoDX). Below where the curve bends (0.444 of
+  white, linear) nothing changes, so the darks and mid-tones stay as approved; above it
+  highlights spread out past white: 0.6 goes to 0.62, 0.8 to 0.93, white to 1.45, 1.5 to
+  1.98 (headroom 2.67). By the brightest channel. The normal-screen path is unchanged.
+- **Then GT7's whole tone map** (`gt7_full`, replacing that highlights-only `gt7_hdr`):
+  in the club almost nothing is above the bend, so the user saw no change. Now, after
+  the same highlight inversion, the full GT7 map runs at the screen's peak: the toe on
+  the darks, the curve on each channel, the chroma kept in ICtCp (`gt7_curve` takes the
+  peak). With HDR only, by the user's choice; the normal screen is unchanged.
+
+Not verified: GT7 HDR in game (builds, links and the post shader compiles only), how
+much brighter the bloom is now, and draws that use DESTCOLOR factors on light past white
+(they now see it). The baked lightmaps still stop at the game's 2x overbright.
+
 ## 2026-10-27: Bounced light, ReShade-RTGI style
 
 The screen-space bounced light (BL_SSIL) reworked towards ReShade's RTGI, which cannot
