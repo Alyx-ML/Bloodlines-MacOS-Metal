@@ -1,0 +1,5 @@
+loc_2010D650,engine_HideGameUI
+loc_2003C190,engine_PauseStateOrig
+loc_20139C80,engine_MixerGetOutputData
+loc_20137970,engine_SourceSampleRate
+loc_201383E0,engine_ChannelSamplePos

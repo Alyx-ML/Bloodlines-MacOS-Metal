@@ -1,0 +1,2 @@
+loc_1022C50F,5,;call loc_10001226 ; subtitle-pause-fix: CPropRadio::Activate's CBaseEntity::Activate also restarts the station's record (bl_vampire_RadioActivate, runtime/bl_subtitle.c)|PUSH loc_10566458|PUSH loc_1070B228|call bl_vampire_RadioActivate $
+loc_1022C807,5,;call loc_10002874 ; subtitle-pause-fix: the radio's SetFakeSilence keeps the broadcast going while it is off (bl_vampire_RadioSilence)|PUSH loc_10566458|PUSH loc_1070B228|call bl_vampire_RadioSilence $

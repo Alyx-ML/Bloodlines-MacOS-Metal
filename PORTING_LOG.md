@@ -2547,6 +2547,38 @@ Not verified: the look in the game.
 
 The user supplied 2048×2048 pictures for `materials/stone/bar` (the ram-head frieze above the bar; the file was named `bar_h.png` but is a colour picture) and `materials/stone/doorb` (the stone doorway with wooden doors). Their layouts match the originals (luminance correlation 0.96 and 0.999). They went in as `<name>-replace.png`, replacing the PBRify upscales (removed, since tex_pack refuses two upscales of one texture). The bump and roughness maps were remade from each picture at the game texture's size (128 and 512, read as a tile), and the height maps from the pictures with tools/tex_height.py (27 s). tex_pack wrote both at 2048×2048 BC7. Not yet checked in the game.
 
+## 2026-10-26: Console Pause Fix ported
+
+`Bin/loader/console-pause-fix.vtm` (1.1.0) hooks two engine routines and two GameUI routines, after checking eight byte patterns; all match our modules. Opening the console sends "setpause"; closing it with X or ~ only hid the dialog, so the game stayed paused with no input.
+
+- engine 0x2010DC10 `Con_ShowConsole`: remembers whether the console was already open, whether the game menu was open, the level name and the engine time, then calls the original. Afterwards it hides the console's Minimize button and the Minimize entry of its title menu.
+- engine 0x2001A570 `IVEngineClient::ClientCmd`: while the console opens, a "setpause" is dropped when the console was already open or the game was already paused by something else (that pause stays its owner's), and otherwise marks the pause as the console's. Going back to the menu does not pause again. Inside the game menu's hide, "unpause" is dropped when the console is open over an older pause.
+- GameUI 0x10022070 vgui `Frame::SetVisible`: when the console hides on the same level with no load in between, the console's own pause is undone (a pause count at 0x20B4378C goes down by one, or "unpause"), and the game goes back to the menu it came from (`IGameUI::ActivateGameUI`) or to the game (0x2010D650).
+- GameUI 0x100059D0, the game menu's hide: records the state that rule needs.
+
+Redone as instruction replacements whose natives are in `runtime/bl_console.c`. Each replaces the first instruction of its routine and opens the rest as a global proc, which the native calls as the original. Rebuilt engine and GameUI.
+
+Not verified in the game.
+
+
+## 2026-10-26: Subtitle Pause Fix ported
+
+`Bin/loader/subtitle-pause-fix.vtm` (1.3.0) checks nine byte patterns in engine.dll, vampire.dll and mssmp3.asi (all match our modules), copies a small code block into memory and hooks four calls.
+
+Engine:
+- 0x201188B0: the caption timing read the sound device's time. It now reads the sentence channel's start time plus the samples it has played (wrapped around the loop for a radio station), or, with no usable channel, a clock that is Plat_FloatTime less the time spent paused.
+- 0x2002D130: reading the pause state also moves that clock.
+
+Radio (vampire):
+- 0x1022C50F, `CPropRadio::Activate` (also when a saved location loads): the station's record starts again at the current time.
+- 0x1022C807, the radio's `SetFakeSilence`: going silent remembers the stream's position. Coming back decodes the MP3 stream forward (the mixer's GetOutputData, 4096 samples at a time) to where the broadcast would be now. When that cannot be worked out, the radio stays silent, as in the plugin.
+- A station's loop length comes from its file: the plugin reads the MP3 through the engine's file system and counts its MPEG-1 Layer III frames.
+
+Redone in `runtime/bl_subtitle.c` from the plugin's code and the copied block. The plugin compares vtables and function pointers with module offsets; here those are the labels and aliases of the same objects. Its byte pattern checks are not repeated, because the port only runs the pinned modules. Rebuilt engine, vampire, mssmp3 and vaudio_miles.
+
+Not verified in the game. Most of it only matters with sound on.
+
+
 ## 2026-10-26: Audit fixes (cache keys and the medium findings)
 
 From the runtime audit of this date.

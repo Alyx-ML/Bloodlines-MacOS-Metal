@@ -1,0 +1,2 @@
+loc_100A0BC0,vampire_EntityActivate
+loc_100A8FC0,vampire_SetFakeSilence

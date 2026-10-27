@@ -11,3 +11,4 @@ loc_1000EBA0,GameUI_CommandCombo_Reset
 loc_1000F7E0,GameUI_CvarToggle_Reset
 loc_10025280,GameUI_PropertyPage_ctor
 loc_10023730,GameUI_Label_ctor
+loc_100220E0,GameUI_Frame_SetMinimizeButtonVisible

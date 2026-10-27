@@ -27,3 +27,11 @@ funcv bl_x87_fldenv $, addr
 funcv bl_x87_fnsave $, addr
 funcv bl_x87_frstor $, addr
 funcv bl_mmx $, op, operands, arg
+funcv bl_engine_ShowConsole $
+funcv bl_engine_ClientCmd $
+funcv bl_GameUI_FrameVisible $
+funcv bl_GameUI_HideUI $
+funcv bl_engine_SentenceTime $
+funcv bl_engine_PauseState $
+funcv bl_vampire_RadioActivate $
+funcv bl_vampire_RadioSilence $
