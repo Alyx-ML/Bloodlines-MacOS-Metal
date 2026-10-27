@@ -176,6 +176,17 @@ uint32_t bl_guest_size(uint32_t addr)
     return *(uint32_t *)((uint8_t *)bl_g2h(addr) - HDR + 8);
 }
 
+int bl_guest_heap_has(uint32_t addr, uint32_t len)
+{
+    uint8_t *p = bl_g2h(addr), *e = p + len;
+    if (!addr || e < p) return 0;
+    for (int i = 0; i <= cur_arena && i < narenas; i++) {
+        uint8_t *end = i == cur_arena ? heap_bump : arenas[i].end;
+        if (p >= arenas[i].base && e <= end) return 1;
+    }
+    return 0;
+}
+
 static uint32_t bl_guest_realloc_unlocked(uint32_t addr, uint32_t size)
 {
     if (!addr) return bl_guest_malloc_unlocked(size);

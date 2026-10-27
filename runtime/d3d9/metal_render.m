@@ -7012,6 +7012,37 @@ void bl_metal_backdrop(int style, int world, const int (*glows)[4], int n)
     pause_backdrop(target_texture(s->back_buffer));
 }
 
+#define HUD_IMAGES 2
+void bl_metal_hud_image(int slot, const void *bgra, uint32_t w, uint32_t h, int x, int y, int sw, int sh,
+                        unsigned long version)
+{
+    struct d3d_state *s = pause_state;
+    if (slot < 0 || slot >= HUD_IMAGES || !w || !h || sw <= 0 || sh <= 0) return;
+    if (!s || !s->back_buffer || s->render_target[0] != s->back_buffer) return;
+    id<MTLTexture> t = target_texture(s->back_buffer);
+    double kx = (double)t.width / sw, ky = (double)t.height / sh;
+    long x0 = lround(x * kx), y0 = lround(y * ky), x1 = lround((x + (double)w) * kx), y1 = lround((y + (double)h) * ky);
+    if (x0 < 0 || y0 < 0 || x1 > (long)t.width || y1 > (long)t.height || x1 <= x0 || y1 <= y0) return;
+    static id<MTLTexture> ring[HUD_IMAGES][FRAMES_IN_FLIGHT];
+    static unsigned long uploaded[HUD_IMAGES][FRAMES_IN_FLIGHT];
+    id<MTLTexture> img = ring[slot][frame_slot];
+    if (!img || img.width != w || img.height != h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                     width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        img = ring[slot][frame_slot] = [mtl newTextureWithDescriptor:td];
+        uploaded[slot][frame_slot] = 0;
+    }
+    if (uploaded[slot][frame_slot] != version) {
+        [img replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bgra bytesPerRow:w * 4];
+        uploaded[slot][frame_slot] = version;
+    }
+    flush_clears(s);
+    end_pass();
+    uint32_t sr[4] = {0, 0, w, h}, dr[4] = {(uint32_t)x0, (uint32_t)y0, (uint32_t)x1, (uint32_t)y1};
+    stretch_draw_ex(img, sr, t, dr, 1, 1);
+}
+
 static void over(float *p, float r, float g, float b, float a)
 {
     if (a <= 0) return;

@@ -26,6 +26,8 @@ uint32_t bl_guest_calloc(uint32_t count, uint32_t size);
 void bl_guest_free(uint32_t addr);
 uint32_t bl_guest_realloc(uint32_t addr, uint32_t size);
 uint32_t bl_guest_size(uint32_t addr);  // size requested at allocation
+// Whether [addr, addr + len) lies in the part of the guest heap handed out so far.
+int bl_guest_heap_has(uint32_t addr, uint32_t len);
 
 // Guest string helpers.
 uint32_t bl_guest_strdup(const char *s);

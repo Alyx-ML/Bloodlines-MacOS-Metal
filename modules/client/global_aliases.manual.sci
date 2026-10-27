@@ -8,3 +8,5 @@ loc_101A9890,client_PanelSetPos
 loc_101A98F0,client_PanelSetSize
 loc_10066AF0,client_MenuSmoke
 loc_10059B70,client_ImageDraw
+loc_100549F0,client_DialogPick
+loc_100F11D0,client_HudSprite

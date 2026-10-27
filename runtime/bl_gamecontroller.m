@@ -15,8 +15,10 @@
 //   d-pad           up R (reload), down Tab (secondary attack), left L (quest log),
 //                   right C (character sheet)
 //   Menu            Escape                  Options         K (hotkeys)
-// In menus and dialogue (cursor shown): either stick moves the cursor, A clicks,
-// B is Escape, the d-pad gives the arrow keys and Menu is Escape.
+// In dialogue, while answers are up (bl_dialog.c): the d-pad or left stick steps through
+// them (the up and down arrows), A picks one (Enter), Menu is Escape; nothing else.
+// In menus (cursor shown): either stick moves the cursor, A clicks, B is Escape, the
+// d-pad gives the arrow keys and Menu is Escape.
 // BL_PAD_LOOK sets the look speed in mouse counts a second at full tilt (default 1400).
 #import <Carbon/Carbon.h>  // kVK_* key codes
 #import <Foundation/Foundation.h>
@@ -28,6 +30,8 @@
 #include <time.h>
 
 #include "bl_cocoa.h"
+
+int bl_dialog_active(void);
 
 static os_unfair_lock raw_lock = OS_UNFAIR_LOCK_INIT;
 static double raw_dx, raw_dy;
@@ -82,12 +86,12 @@ static void drain_raw(int captured)
 
 enum out {
     O_W, O_A, O_S, O_D, O_SPACE, O_CTRL, O_E, O_F, O_SHIFT, O_Z, O_R, O_TAB, O_L, O_C, O_ESC, O_K,
-    O_UP, O_DOWN, O_LEFT, O_RIGHT, O_LMB, O_RMB, O_COUNT
+    O_UP, O_DOWN, O_LEFT, O_RIGHT, O_ENTER, O_LMB, O_RMB, O_COUNT
 };
 static const uint16_t out_key[O_COUNT] = {
     kVK_ANSI_W, kVK_ANSI_A, kVK_ANSI_S, kVK_ANSI_D, kVK_Space, kVK_Control, kVK_ANSI_E, kVK_ANSI_F,
     kVK_Shift, kVK_ANSI_Z, kVK_ANSI_R, kVK_Tab, kVK_ANSI_L, kVK_ANSI_C, kVK_Escape, kVK_ANSI_K,
-    kVK_UpArrow, kVK_DownArrow, kVK_LeftArrow, kVK_RightArrow,
+    kVK_UpArrow, kVK_DownArrow, kVK_LeftArrow, kVK_RightArrow, kVK_Return,
 };
 static int held[O_COUNT];
 
@@ -134,7 +138,12 @@ void bl_gc_poll(int captured)
     if (p) {
         float lx = p.leftThumbstick.xAxis.value, ly = p.leftThumbstick.yAxis.value;
         float rx = p.rightThumbstick.xAxis.value, ry = p.rightThumbstick.yAxis.value;
-        if (captured) {
+        int dialog = bl_dialog_active();
+        if (dialog) {
+            want[O_UP] = p.dpad.up.pressed || ly > 0.5f, want[O_DOWN] = p.dpad.down.pressed || ly < -0.5f;
+            want[O_ENTER] = p.buttonA.pressed, want[O_ESC] = p.buttonMenu.pressed;
+            rx = ry = 0;
+        } else if (captured) {
             want[O_W] = ly > 0.5f, want[O_S] = ly < -0.5f, want[O_A] = lx < -0.5f, want[O_D] = lx > 0.5f;
             want[O_SPACE] = p.buttonA.pressed, want[O_CTRL] = p.buttonB.pressed;
             want[O_E] = p.buttonX.pressed, want[O_F] = p.buttonY.pressed;
@@ -161,8 +170,8 @@ void bl_gc_poll(int captured)
         bl_cocoa_motion(dx, dy);
         // The shoulders step through the inventory, once per press.
         static int lb, rb;
-        if (captured && p.leftShoulder.pressed && !lb) bl_cocoa_wheel(120);
-        if (captured && p.rightShoulder.pressed && !rb) bl_cocoa_wheel(-120);
+        if (captured && !dialog && p.leftShoulder.pressed && !lb) bl_cocoa_wheel(120);
+        if (captured && !dialog && p.rightShoulder.pressed && !rb) bl_cocoa_wheel(-120);
         lb = p.leftShoulder.pressed, rb = p.rightShoulder.pressed;
     }
     // Releases first, so switching between play and menus never leaves a key down.

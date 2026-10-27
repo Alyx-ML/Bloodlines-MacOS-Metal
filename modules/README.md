@@ -136,6 +136,26 @@ Console Pause Fix 1.1.0 (Unofficial Patch's loader plugin), with `runtime/bl_con
   game's paint. `global_aliases.manual.sci` also names the surface getter `0x101AC8D0` and
   the panel's SetPos and SetSize (`0x101A9890`, `0x101A98F0`). The font is
   `assets/fonts/Cinzel.ttf` (OFL).
+- `instruction_replacements.manual.sci`: the gothic dialogue screen (`runtime/bl_dialog.c`).
+  `CHudDialog::Paint`, once it has decided to draw (`0x100535A7`), calls `bl_dialog_Paint`,
+  which draws the character's line and the answers over a dark fade, then runs
+  `ComputeSizes` (`0x100530F0`) and leaves at `0x10053758`, past the game's frame, box and
+  text. `ComputeSizes`' SetPos and SetSize calls (`0x100531D8`, `0x100531ED`) get the screen's
+  origin and size from `bl_dialog_Pos` and `bl_dialog_Size`, so nothing is clipped to the old
+  box. `CHudDialog::Key_Event` (`0x10055265`, after its first instruction) asks
+  `bl_dialog_Key`, which picks the answer under the mouse on a click
+  (`global_aliases.manual.sci`: `0x100549F0` `client_DialogPick`, `CHudDialog::Pick`) and
+  returns "handled" instead of the game's show-or-hide of the line.
+- `instruction_replacements.manual.sci`: the gothic HUD (`runtime/bl_hud.c`). Four paints
+  draw in the new style (the vials as images the renderer puts on screen,
+  `bl_metal_hud_image`) once they have their fades, then leave past the game's art:
+  `CHealthAnkh::Paint` at `0x10051498` (`bl_hud_Health`, the left vial and the ammo),
+  `CBloodBar::Paint` at `0x1004CD04` (skips the frame) and `0x1004CF2B` (`bl_hud_Blood`, the
+  right vial, once the game has eased the shown blood), `CAmmoCounter::Paint`
+  at `0x1004BF6A` (`bl_hud_Discipline`, the discipline's symbol; this class draws the
+  discipline, not the ammo), and `CTargeted::Paint` at `0x1006401C` (`bl_hud_Ammo` notes the
+  held weapon's ammo, then the crosshair is drawn as before). `global_aliases.manual.sci`
+  names the HUD script's sprite lookup `0x100F11D0` (`client_HudSprite`).
 
 ## vampire
 vtmb-tweaks (c6, github.com/c6-dev/vtmb-tweaks), Unofficial Patch's loader plugin, redone

@@ -55,6 +55,14 @@ funcv bl_menu_ButtonPaint $
 funcv bl_menu_Background $
 funcv bl_menu_Smoke $
 funcv bl_menu_Logo $
+funcv bl_dialog_Paint $
+funcv bl_dialog_Pos $
+funcv bl_dialog_Size $
+funcv bl_dialog_Key $
+funcv bl_hud_Health $
+funcv bl_hud_Blood $
+funcv bl_hud_Discipline $
+funcv bl_hud_Ammo $
 funcv bl_engine_SentenceTime $
 funcv bl_engine_PauseState $
 funcv bl_vampire_RadioActivate $

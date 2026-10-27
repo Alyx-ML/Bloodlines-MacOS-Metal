@@ -49,6 +49,12 @@ void gothic_flush(void *cpu, uint32_t s);
 // behind each of `n` boxes, drawn now over everything so far. Its frames stay full width.
 void bl_metal_backdrop(int style, int world, const int (*glows)[4], int n);
 
+// An image of the HUD's (bl_hud.c), `slot` 0 or 1: w x h pixels of premultiplied BGRA,
+// drawn now on the back buffer at x, y of the sw x sh screen, as the game's HUD is.
+// `version` (from 1) changes when the pixels do.
+void bl_metal_hud_image(int slot, const void *bgra, uint32_t w, uint32_t h, int x, int y, int sw, int sh,
+                        unsigned long version);
+
 // Whether a level is loaded, from the client's menu (bl_menu.c).
 int bl_menu_in_level(void *cpu);
 

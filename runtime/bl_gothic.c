@@ -65,7 +65,9 @@ void gothic_screen(void *cpu, uint32_t s, int *w, int *h)
 // Each face's ascent + descent per em, set when the fonts are registered.
 static double cell_per_em[2] = { 1.35, 1.25 };
 static const char *const face_file[2] = { "Cinzel.ttf", "Cormorant.ttf" };
-static const char *const face_name[2] = { "Cinzel", "CormorantGaramond-Medium" };
+// Family names: the game's font maker (bl_gdi.c make_font) takes Arial for any name that
+// isn't the family Core Text finds.
+static const char *const face_name[2] = { "Cinzel", "Cormorant Garamond" };
 
 static void register_fonts(void)
 {

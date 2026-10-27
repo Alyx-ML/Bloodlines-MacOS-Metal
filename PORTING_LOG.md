@@ -2783,6 +2783,38 @@ Not verified in the game. The runtime builds and `boot` links.
   Cancel and OK, under the key list's column headers and under the Enhanced tab's
   headings are gone. The title's divider with the diamond stays.
 
+## 2026-10-27: Gothic dialogue screen
+
+- The dialogue screen matches the approved minimal mockup: over a dark fade at the bottom,
+  the character's line in Cormorant Garamond and under it the answers, numbered in small
+  gold Cinzel figures. Social skill and discipline answers (Persuasion, Intimidation,
+  Seduction, Dominate, Dementation, from the answer's flags) carry their name in spaced
+  gold capitals. The game's frame, box and coloured fonts are gone.
+- One answer is always bright, with the blood drop and the red-to-gold underline: the
+  first of each new set, the one the mouse moves onto, or the one the up and down arrows
+  step to. A click on it, Enter or its number key picks it. The game had no mouse picking;
+  its left click showed or hid the line, and now does nothing. After a pick, the chosen
+  answer stays shown while the character replies.
+- Gamepad: while answers are up, the d-pad or left stick steps through them, A picks,
+  Menu is Escape, and the other buttons do nothing (they used to send play keys, as the
+  mouse stays captured in dialogue).
+- The character's line always shows. The game hides it at the start of each conversation
+  (its "show history" flag, cleared on reset and set by a server message), which is why
+  the first build showed only the answers.
+- Fix: the body font asked Core Text for "CormorantGaramond-Medium", a PostScript name;
+  the game's font maker (`bl_gdi.c`) compares family names and fell back to Arial. It
+  now asks for the family, "Cormorant Garamond". This also fixes the options screen's
+  body text, which was Arial too.
+- Scrolling back through the history shows older lines, the player's in muted gold.
+- No speaker name: the game doesn't know it on screen. The user chose to leave it out
+  rather than add a dialogue-file lookup and a name table for about 300 dialogue files.
+- New `runtime/bl_dialog.c` and four client hooks (see `modules/README.md`). The client
+  module takes about 110 s to rebuild.
+
+### Not verified
+- Not seen in game yet: the fixed font, the line, long lines, the history scroll, the
+  click, the arrows and Enter, and the gamepad.
+
 ## 2026-10-27: Metal 4, stage 2 (the rebake and the light probes); overlapping passes tried
 
 The lighting rebake (lm_bake.m) and the light probes (gi_probes.m), the last Metal 3 code,
@@ -2813,3 +2845,41 @@ are full-screen render passes, whose pixel work the GPU takes one pass after ano
 however they are fenced; a saving would need them as compute passes.
 
 Not verified: a window run, an M1.
+
+## 2026-10-27: Gothic HUD
+
+- Health and blood are two plain glass vials low on the screen's edges (pale blue left,
+  blood red right), each liquid shaded as a cylinder with a soft glow, a highlight down
+  the glass and a bright surface line. No frames, caps, rings or labels. The game's
+  values and fades drive them: health from `CHealthAnkh` (0 to 100), blood from `CBloodBar`
+  (full at 15 points, eased a tenth of a point a frame as before).
+- The selected discipline shows as the game's own symbol for it (the HUD script's
+  `discipline_unsel_<n>` sprite) with its baked-in name cut off, beside the blood vial.
+- The held weapon's ammo shows beside the health vial in Cormorant figures, the clip large
+  and the reserve small; melee weapons and items show nothing. The game's weapon icon and
+  its two rings at the bottom corners are gone. The crosshair is unchanged.
+- An earlier finding was wrong: `CAmmoCounter` draws the discipline icon and name, and
+  `CTargeted` draws the weapon icon, the ammo and the crosshair.
+- New `runtime/bl_hud.c` and five client hooks (see `modules/README.md`).
+- The first build crashed on level load: `bl_hud_Blood` eased the shown blood itself and
+  called the player's `0x1008EB70` from the native to pick the pool. Now the game's own
+  paint eases it (its frame skipped) and the vial is drawn after, from `+0x1d8`.
+- The first vials, drawn through vgui as one-pixel columns of flat colour, came out as
+  flat bars with no glow or glass. They are now images drawn in software as the mockup's
+  were (the same shading, an analytic blur for the glow and drop shadow), redrawn only when
+  the fill or fade changes, and put on the back buffer by the renderer
+  (`bl_metal_hud_image` in `d3d9/metal_render.m`).
+- A run crashed in `bl_hud_Discipline` on entering `sm_asylum_1`: the player global
+  (`0x104a0d50`) held a garbage, unaligned value outside the guest heap. The HUD now reads
+  the player and the held weapon only when they are aligned and inside the part of the
+  guest heap handed out so far (`bl_guest_heap_has`, new in `bl_vm.c`).
+- The health vial was pale silver and neither vial said what it was. Health is now a cold
+  blue, as in the reference, and each vial has a small symbol over it in its own colour, an
+  ankh for health and a drop for blood. No words.
+- Left as they were: the area icon (top left), the use and talk icons, the info bar and
+  other notices, the compass.
+
+### Not verified
+- Not seen in game yet: the vials' look and fill, the discipline symbol's crop (44 of its
+  64 texel rows), the ammo numbers and their position, unusable powers (the game tinted
+  them; the symbol isn't dimmed yet).
