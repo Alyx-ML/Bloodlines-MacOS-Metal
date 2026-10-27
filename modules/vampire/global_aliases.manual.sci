@@ -1,2 +1,15 @@
+loc_100100B4,vampire_GetWeapon
+loc_1032D0C0,vampire_WeaponDrop
+loc_10007E19,vampire_GetActiveWeapon
+loc_100138D6,vampire_SwitchToNextBestWeapon
+loc_100151B8,vampire_OwnsThisType
+loc_10200CA0,vampire_StatGetBase
+loc_102008E0,vampire_StatSetBase
+loc_10337860,vampire_GetVHistory
+loc_10337980,vampire_SetVHistory
+loc_10206AA0,vampire_ChangeHistory
+loc_10227A30,vampire_WarformAdd
+loc_101193B0,vampire_LocalPlayer
+loc_10351131,vampire_WarformChanged
 loc_100A0BC0,vampire_EntityActivate
 loc_100A8FC0,vampire_SetFakeSilence

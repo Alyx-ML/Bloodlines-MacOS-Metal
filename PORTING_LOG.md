@@ -2547,6 +2547,107 @@ Not verified: the look in the game.
 
 The user supplied 2048×2048 pictures for `materials/stone/bar` (the ram-head frieze above the bar; the file was named `bar_h.png` but is a colour picture) and `materials/stone/doorb` (the stone doorway with wooden doors). Their layouts match the originals (luminance correlation 0.96 and 0.999). They went in as `<name>-replace.png`, replacing the PBRify upscales (removed, since tex_pack refuses two upscales of one texture). The bump and roughness maps were remade from each picture at the game texture's size (128 and 512, read as a tile), and the height maps from the pictures with tools/tex_height.py (27 s). tex_pack wrote both at 2048×2048 BC7. Not yet checked in the game.
 
+## 2026-10-26: larger interface fonts at high resolutions
+
+Almost all of the game's text is drawn from prebuilt bitmap fonts (`materials/fonts/*.fnt`, one per face, size and weight). Sizes without one fall back to GDI, which here is Core Text with a stand-in face. The client turns a scheme font name such as `Dlg_Base` into `Dlg_Base_<size>` at 0x1018C870 (81 callers, all passing the result to the scheme's GetFont). It uses a table of 640, 800, 1024, 1280 and 1600, and takes the largest size `s` with `s <= width` and `s*3/4 <= height`.
+
+Unofficial Patch's `trackerscheme.res` also has 1920, 2400 and 2880 sets, and the patch ships bitmap fonts for them in `Unofficial_Patch/materials/fonts` (checked: every font in the 1920 set has one, except Marlett 16, which the port draws as shapes, and the 100-pixel Times New Roman headline). Its loader adds those sizes to the table. The port doesn't run the loader, so the game stopped at 1600.
+
+- `bl_client_FontName` (`runtime/bl_client.c`) replaces the routine, with the same rule and the three larger sizes. The client was re-translated (1 min 47 s).
+- Which set is used: 1920x1080 still gets 1280 (the 1920 set needs 1440 rows); 2560x1440 gets 1920; 2880x1800 gets 2400; 3600x2250 gets 2880.
+- At 1920x1080 on a Retina screen, the whole 1080-row image is magnified by the window, which softens text. Choosing a resolution near the screen's own pixel size gives sharp text in the right size.
+
+Not verified: any run since the change. The user checks it in the window.
+
+## 2026-10-26: Hor+ field of view on wide screens
+
+Until now a wide screen showed the 4:3 picture with its top and bottom cut off (metal_render.m scales the projection's y by viewport aspect over 4:3, see "widescreen correction"). Unofficial Patch's widescreen plugin (`Bin/loader/widescreen_fix.vtm`, read with llvm-objdump, never run) instead patches the engine's projection aspect (the 4:3 constant at engine 0x2007A440, in the routine that calls the material system's PerspectiveX), turns off a client multiply, and raises `default_fov` and `viewmodel_fov`.
+
+What the code does:
+- The engine's projection aspect is fixed at 4/3, or 16/9 when Troika's hidden `r_anamorphic` is on.
+- With `r_anamorphic` on, `CViewRender::Render` (client 0x10191FD7) also multiplies the view's field of view (view setup +0x38) by 4/3. It then takes tan(fov/2) of it and of the hands' field of view (+0x3c) for the rest of the frame. Every camera passes through here: the player's, dialogue and cutscene cameras, and zooms.
+
+Change: the `je` at 0x10191FD5 that skips that multiply is replaced (`modules/client/instruction_replacements.manual.sci`) by a call to `bl_client_HorPlus` (`runtime/bl_client.c`). On screens wider than 4:3 it sets each field of view to `2·atan(tan(fov/2)·(aspect/(4/3)))`, so 90 becomes 106.3 at 16:9 and 100.4 at 16:10. The projection stays 4:3 and the renderer still crops it to the screen's shape, so the visible height is the 4:3 view's and the sides gain. The game builds its culling frustum from the widened field of view, so nothing at the edges is culled away. `r_anamorphic` itself is no longer used.
+
+- `BL_FOV=<degrees>` sets the player's usual 4:3 field of view (50 to 130). Only a view at exactly the game's 90 changes, so zooms and dialogue cameras keep theirs.
+- `BL_WIDESCREEN=stretch` turns this off, along with the projection correction.
+
+Client re-translated. Not verified in the game: the user checks it in the window. Things to look at: the edges of the screen for missing objects, the first-person hands and weapons, dialogue framing, sniper zoom, and the 3D sky.
+
+## 2026-10-26: Unofficial Patch loader plugins, audit
+
+The port runs none of `Bin/loader/*.vtm` (Windows DLLs that `Loader.exe` injects). Read from their own notes and settings, without running them. Most say they need Unofficial Patch 11.5 or later game modules, and they find their hook sites by address or byte pattern. The port runs the 11.1 modules (see "Unofficial Patch 12.0"), so none of them would apply as they are. Each fix has to be redone against the 11.1 code.
+
+Gameplay fixes, in a suggested order:
+1. `vtmb-tweaks` (c6, open source: github.com/c6-dev/vtmb-tweaks): corpses stay until the level changes, NPCs drop every weapon they used, non-solid `c_ragdoll_prop` ragdolls (cutscene bugs), stackable weapons, no bullet tracers. Not needed here: doors at high frame rates (the port caps at 60) and Alt+F4.
+2. `griffith-frenzy-werewolf-fix`: the werewolf's movement during Frenzy on sp_observatory_2. Its map files are part of the 12.0 content the port uses; the code part is missing.
+3. `history-stat-reset-fix`: character creation stats reset when changing gender or History.
+4. `protean-improved`: Warform Frenzy with Protean 5 without duplicate controllers or bonuses, and the Protean filter's brightness after loading.
+5. `subtitle-pause-fix` (radio captions and streams), `console-pause-fix`, `cutscene-subtitle-background-fix`.
+6. `model-loader-fix` (JillCrungus, open source): a model loading memory leak.
+7. `bugs_fix` and the 12.0 loader's "Internal Hooks": coronas, lights through walls, claw stats, paths, the too-many-histories crash, forced shadow rebuilds. Whether the 11.1 modules already contain any of these is not checked yet.
+
+Interface: `uhd-list-fix` / `UHDDropdownListFontFix` set drop-down row heights for the 1920 to 2880 font sets. These are now in use at high resolutions (see "larger interface fonts"), so drop-down lists there may cut letters off until this is done.
+
+## 2026-10-26: vtmb-tweaks ported
+
+The plugin's source (github.com/c6-dev/vtmb-tweaks, GPL-2.0) patches vampire.dll and client.dll at fixed offsets from their base. Each site was checked in our 11.1 modules with llvm-objdump, and every one holds the instruction the plugin expects (for example the `jne` at vampire 0x1032C402, the `shr ecx,2; and ecx,1` at 0x10154E90, the 6-byte `je` at client 0x1004099A, replaced together with its `test` at 0x10040998 because the pipeline fuses the pair). They are redone as instruction replacements (`modules/vampire`, `modules/client`), with native helpers in `runtime/bl_vampire.c`. The settings are the patch's own `vtmb-tweaks.ini`, fixed on:
+- corpses stay until the level changes (rats still fade);
+- NPCs drop every weapon they held;
+- `c_ragdoll_prop` ragdolls are non-solid (cutscene bugs);
+- no bullet tracers;
+- stackable weapons: the patch's items mark knives, katanas, the fire axe, drugs and others `is_stackable`;
+- zooming out restores the field of view the fov command set.
+
+Not ported: the high frame rate door fix (the port runs at 60), doors staying open (off in the patch), Alt+F4.
+
+Two pipeline notes. A replaced `call` loses its return label, because SRW no longer sees the call, so the corpse replacement continues at `<site>_after`. A jump target reached only from a replaced jump would be dropped, so the tracer target is named in `global_aliases.manual.sci`.
+
+Not verified in the game: the user checks it in the window.
+
+## 2026-10-26: Griffith Park werewolf frenzy fix ported
+
+`Bin/loader/griffith-frenzy-werewolf-fix.vtm` (1.2.1) is closed source, so it was read from its disassembly and never run. Its notes: frenzy is possible in the library and Griffith Park through its two maps, which are already part of the 12.0 content the port loads. During frenzy the player's body stays put and a player-owned FrenzyShadow moves instead, and the werewolf on sp_observatory_2 stood on and collided with the body.
+
+The plugin checks the vampire.dll and engine.dll time stamps and sizes and four byte patterns; all match our 11.1 modules. It then:
+- hooks `mov eax,[ebx+0x6F0]` at vampire 0x1016C5BE (the player's think, ebp the player) to track the player (frenzying when +0x146C > 0), the shadow (handle at +0x1DB0, vtable 0x104B2184) and the entity named `werewolf` (vtable 0x104CF4D4), only on sp_observatory_2;
+- replaces the engine trace's `TraceRay` in its vtable: for traces from eight vampire call sites whose filter passes the werewolf, with a solid mask (0x200400B, with or without 0x20000), while the shadow is within 160 units (2D), it wraps the filter so the player's body is skipped and the shadow is hit;
+- replaces the werewolf's `SetGroundEntity` (vtable +0x340, `CBaseEntity::SetGroundEntity` by its profiler name) so the body is never its ground when called from 0x1026E843.
+
+Redone in `runtime/bl_vampire.c` with instruction replacements at the same places, hooking the call sites instead of the vtables. The map name comes from vampire's own gpGlobals->mapname (gpGlobals at 0x1070B228, +0x24, as the node graph loader reads it) instead of the engine routine at engine+0x1B800, so the engine is not rebuilt. The wrapping filter's ShouldHitEntity is a hand-written llasm entry, `runtime/llasm/vampire.llasm`, given to the engine as a guest function pointer.
+
+Not verified in the game: the user checks it in the window (frenzy near the werewolf in Griffith Park).
+
+## 2026-10-26: History stat reset fix ported
+
+`Bin/loader/history-stat-reset-fix.vtm` (1.5.2, closed source) was read from its disassembly. It finds its sites by byte pattern at fixed offsets; all five patterns match our vampire.dll and both of its client.dll patterns match too. It writes small stubs at run time, so their bytes were decoded from the code that writes them:
+- after character creation's `SetVHistory(history)` (vampire 0x100D6DD3, a console command the creation screen runs) and `SetVHistory(-1)` (0x100D6DE6), it calls a hook and then sets the History again;
+- the hook saves stat 0x22 of the character's base stat list (the first list of type 0x23), runs the History change routine (0x10206AA0, which takes the old History's stat changes away and applies the new one) for the character's current History, puts stat 0x22 back and refreshes the client's character sheet (client 0x1017D930 on the panel at global 0x105FB14C, +0xEDC, when +0x274 is set);
+- the change routine normally does nothing when the History is unchanged (`cmp ebx, ebp; je` at 0x10206AD1); for the character being reset it goes ahead once.
+
+Redone with instruction replacements and `runtime/bl_vampire.c`. The client part needs the address of a client global from vampire's native code, so a small `client_HistoryUI` proc returning it is added inside the client replacement at 0x101713E0.
+
+Not verified in the game: on the character creation screen, change gender or History (also after Auto-Spend Points) and the stats and points left should reset each time.
+
+## 2026-10-26: Protean Improved ported
+
+`Bin/loader/protean-improved.vtm` (1.2.2 Core, closed source) has two parts, both on by default (its ini is not shipped). It checks seven byte patterns in vampire.dll and one in client.dll, plus an address operand in each; all match our 11.1 modules. It copies a 0x800-byte code block with a fix-up table into memory and jumps there from six places; the block was relocated and disassembled to read it.
+
+Warform Frenzy (vampire.dll): Protean 5 (Warform, flag +0x1EDC) and a frenzy (+0x146C > 0) together.
+- 0x1016C558, the player's think: the Warform flag reads as 0 during a frenzy.
+- 0x1033E9BE: the Protean command does not end a frenzy.
+- 0x101F9177, a case of the discipline switch that starts the Warform: during a frenzy the FrenzyShadow is used instead of a new controller. The flag is cleared, the stat block +0x23D4 is applied to the player and the shadow (vtable +0x1A4), +0x1C68 is set to the current time, and the player is added to the warform list (0x10227A30 on 0x10750CB4).
+- 0x103510D7: a frenzy counts as the Warform state the code compares against.
+- The starts of 0x101E56E0 and 0x101E5B30: an argument that is the FrenzyShadow's owner (+0x9C) during a Warform frenzy becomes the local player (0x101193B0).
+- 0x1033ED75: a `je` becomes a `jmp`.
+
+Filter Load Fix (client.dll): at 0x1019DA7D the Protean filter was not set again when its level was unchanged, so after loading a save it kept the wrong brightness. Now it is skipped only when the filter's material is already in that state.
+
+Redone as instruction replacements with natives in `runtime/bl_vampire.c` and `runtime/bl_client.c`. Natives that choose a branch push their answer on the guest stack and the replacement pops it, so registers stay as the plugin's pushad/popad left them.
+
+Not verified in the game.
+
+
 ## 2026-10-26: Console Pause Fix ported
 
 `Bin/loader/console-pause-fix.vtm` (1.1.0) hooks two engine routines and two GameUI routines, after checking eight byte patterns; all match our modules. Opening the console sends "setpause"; closing it with X or ~ only hid the dialog, so the game stayed paused with no input.

@@ -67,7 +67,82 @@ Console Pause Fix 1.1.0 (Unofficial Patch's loader plugin), with `runtime/bl_con
   one fails; here that uses up the guest heap, so it returns 11.1's fixed answer
   for both versions.
 
+## client
+- `0x1018C870` the scheme font name for the screen size (128 bytes), replaced by
+  `bl_client_FontName` (`runtime/bl_client.c`, `runtime/llasm/client.llasm`): the same
+  rule as the game (the largest size whose 4:3 area fits the screen), with Unofficial
+  Patch's 1920, 2400 and 2880 font sets added to the game's 640 to 1600.
+- `global_aliases.manual.sci` names the screen width and height getters at `0x100CD100`
+  and `0x100CD0F0` (`client_ScreenWide`, `client_ScreenTall`).
+- `instruction_replacements.manual.sci`: in `CViewRender::Render`, the `je` at
+  `0x10191FD5` that skips the hidden `r_anamorphic`'s "field of view times 4/3" now
+  calls `bl_client_HorPlus` (`runtime/bl_client.c`) and goes on at `0x10191FE3`. It widens
+  the view's and the first-person hands' fields of view (view setup +0x38, +0x3c) for
+  Hor+ on screens wider than 4:3.
+- `instruction_replacements.manual.sci`: for history-stat-reset-fix, `0x101713E0` also
+  holds `client_HistoryUI`, which returns the address of the global at `0x105FB14C` (the
+  character sheet), and `global_aliases.manual.sci` names its refresh `0x1017D930`
+  (`client_HistoryRefresh`); `runtime/bl_vampire.c` calls both.
+- `instruction_replacements.manual.sci`: protean-improved's Filter Load Fix, the
+  `cmp edi, eax; je` at `0x1019DA7D` that skips setting the Protean filter when its level
+  is unchanged, asks `bl_client_FilterSame` (`runtime/bl_client.c`) first.
+- `instruction_replacements.manual.sci`: vtmb-tweaks' bNoTracers, the `test eax, eax; je` at
+  `0x10040998` that skips drawing a bullet tracer always jumps
+  (`global_aliases.manual.sci` keeps its target `0x10040A4F` as code).
+
 ## vampire
+vtmb-tweaks (c6, github.com/c6-dev/vtmb-tweaks), Unofficial Patch's loader plugin, redone
+as `instruction_replacements.manual.sci` at the plugin's own hook sites, which are the
+same in the 11.1 module. The native parts are in `runtime/bl_vampire.c`;
+`global_aliases.manual.sci` names the routines they call.
+- bNoCorpseDespawn: `0x1032C402` never starts the corpse fade; `0x10265D72` fades out on
+  death only a `CNPC_VRat`.
+- bNPCsDropAllWeapons: `0x1032BA84` drops every weapon an NPC holds.
+- bNonSolidRagdolls: `0x10154E93` puts `c_ragdoll_prop` ragdolls in the debris group.
+- bStackableWeapons: `0x1032D142` (drop one of a stack), `0x1017788C` (switch weapons only
+  when none is active), `0x1017724E` (an owned stackable weapon can be picked up again).
+- The field of view fix: `0x100D2DC1` remembers the value the fov command sets, and
+  zooming out (`0x10239E01`) restores it.
+Not ported: bFixDoorsAtHighFPS (the port caps at 60 frames a second), bNoDoorAutoClose
+(off in the patch) and bEnableAltF4.
+
+The Unofficial Patch's griffith-frenzy-werewolf-fix (closed source, read from its
+disassembly, never run) is redone the same way, in `runtime/bl_vampire.c`:
+- `0x1016C5BE` in the player's think finds the frenzying player, their FrenzyShadow and
+  the entity named `werewolf`, on sp_observatory_2 only (gpGlobals->mapname). The
+  replacement pushes the module addresses the native part reads (g_pEntityList,
+  gpGlobals, the shadow's, werewolf's and two trace filters' vtables).
+- The `push` before `IEngineTrace::TraceRay` at the werewolf's eight movement traces
+  (`0x1026AD63`, `0x1026EB35`, `0x102A9AEB`, `0x102E362C`, `0x102E38A3`, `0x103CBB55`,
+  `0x103CBC4E`, `0x103CBD2F`) wraps a filter that passes the werewolf, for solid masks
+  within 160 units of the shadow, in one whose ShouldHitEntity
+  (`bl_vampire_WolfShouldHit`, `runtime/llasm/vampire.llasm`) skips the player's body and
+  hits the shadow.
+- The `push` before `SetGroundEntity` at `0x1026E840` passes NULL for the player's body.
+The plugin patched the trace's and the werewolf's vtables; here the call sites are hooked.
+
+history-stat-reset-fix (closed source, read from its disassembly): character creation
+sets the History with `SetVHistory` and never takes the old one's stat changes back.
+- `0x100D6DD8` and `0x100D6DEB`, the `pop edi` after `SetVHistory(history)` and
+  `SetVHistory(-1)`: `bl_vampire_HistoryReset` / `HistoryResetNone` put the character
+  through the History change routine (`0x10206AA0`, `vampire_ChangeHistory`) again,
+  keeping stat 0x22 of its base stat list, refresh the client's character sheet and set
+  the History again. The replacement pushes the History list (`0x1074F028`).
+- `0x10206AD1`, the routine's "already has this History" `cmp; je`: goes ahead once for
+  the character being reset (`bl_vampire_HistorySame`).
+`global_aliases.manual.sci` names the stat list's `GetBase`/`SetBase`, `GetVHistory`,
+`SetVHistory` and the change routine.
+
+protean-improved's Warform Frenzy (closed source, read from its disassembly and the code
+block it copies in) is redone at its six sites and its one byte patch, in
+`runtime/bl_vampire.c`: `0x1016C558` (the Warform flag reads as off in a frenzy),
+`0x1033E9BE` (the Protean command does not end a frenzy), `0x101F9177` (Protean 5 in a
+frenzy uses the FrenzyShadow; `vampire_WarformAdd` is `0x10227A30`), `0x103510D7` (with its
+`jne`, whose target `0x10351131` is named `vampire_WarformChanged`), the starts of
+`0x101E56E0` and `0x101E5B30` (the shadow's owner becomes the local player,
+`vampire_LocalPlayer` `0x101193B0`), and `0x1033ED73` (the `je` the plugin turns into a
+`jmp`). The natives put their decisions on the guest stack, which the replacement pops,
+so no register changes.
 - Subtitle Pause Fix (see engine): the `CBaseEntity::Activate` call at `0x1022C50F` in
   `CPropRadio::Activate` becomes `bl_vampire_RadioActivate`, and the
   `CBaseEntity::SetFakeSilence` call at `0x1022C807` (the radio's switch) becomes

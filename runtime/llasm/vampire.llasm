@@ -1,0 +1,11 @@
+;; Entry points for native replacements of vampire routines (runtime/bl_vampire.c).
+include llasm.llinc
+include asm-calls.llinc
+
+funcv bl_vampire_WolfShouldHit_c $
+
+;; The Griffith Park fix's trace filter: ShouldHitEntity(entity, contents), thiscall.
+proc bl_vampire_WolfShouldHit public
+        call bl_vampire_WolfShouldHit_c $
+        Call_Asm_Return 2
+endp

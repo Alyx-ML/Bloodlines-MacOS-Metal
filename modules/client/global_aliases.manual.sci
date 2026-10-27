@@ -1,0 +1,4 @@
+loc_100CD100,client_ScreenWide
+loc_100CD0F0,client_ScreenTall
+loc_10040A4F,client_TracerSkip
+loc_1017D930,client_HistoryRefresh

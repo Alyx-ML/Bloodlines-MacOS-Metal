@@ -1,0 +1,10 @@
+;; Entry points for native replacements of client routines (runtime/bl_client.c).
+include llasm.llinc
+include asm-calls.llinc
+
+funcv bl_client_FontName_c $
+
+proc bl_client_FontName public
+        call bl_client_FontName_c $
+        Call_Asm_Return 0
+endp

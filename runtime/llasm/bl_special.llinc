@@ -27,6 +27,25 @@ funcv bl_x87_fldenv $, addr
 funcv bl_x87_fnsave $, addr
 funcv bl_x87_frstor $, addr
 funcv bl_mmx $, op, operands, arg
+funcv bl_client_HorPlus $
+funcv bl_vampire_DropAllWeapons $
+funcv bl_vampire_ShouldDropActive $
+funcv bl_vampire_SwitchToNextBest $
+funcv bl_vampire_OwnsThisType $
+funcv bl_vampire_SetFov $
+funcv bl_vampire_ZoomOutFov $
+funcv bl_vampire_WolfWatch $
+funcv bl_vampire_WolfTrace $
+funcv bl_vampire_WolfGround $
+funcv bl_vampire_HistoryReset $
+funcv bl_vampire_HistoryResetNone $
+funcv bl_vampire_HistorySame $
+funcv bl_vampire_WarformFlag $
+funcv bl_vampire_FrenzyKeep $
+funcv bl_vampire_WarformShadow $
+funcv bl_vampire_WarformSame $
+funcv bl_vampire_WarformTarget $
+funcv bl_client_FilterSame $
 funcv bl_engine_ShowConsole $
 funcv bl_engine_ClientCmd $
 funcv bl_GameUI_FrameVisible $
