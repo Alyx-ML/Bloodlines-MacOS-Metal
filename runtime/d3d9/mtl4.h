@@ -68,3 +68,17 @@ destinationBytesPerImage:(NSUInteger)image;
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t;
 - (void)endEncoding;
 @end
+
+// Work off the frame (the lighting rebake, the light probes) on its own Metal 4 queue:
+// what it keeps stays resident while the job lives, one argument table serves every
+// stage, and each command buffer is committed and waited for.
+__attribute__((objc_direct_members))
+@interface BLJob : NSObject
+- (instancetype)initWithDevice:(id<MTLDevice>)device;
+@property (readonly, nonatomic) id<MTL4ArgumentTable> table;
+- (void)keep:(id<MTLAllocation>)r;
+// A command buffer, begun.
+- (id<MTL4CommandBuffer>)begin;
+// Ends it, commits and waits for the GPU; the error it failed with, or nil.
+- (NSError *)run;
+@end

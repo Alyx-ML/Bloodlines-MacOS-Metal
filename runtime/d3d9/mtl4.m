@@ -341,3 +341,63 @@ destinationBytesPerImage:(NSUInteger)image
 }
 
 @end
+
+// --- work off the frame ------------------------------------------------------------------
+
+@implementation BLJob {
+    id<MTL4CommandQueue> _queue;
+    id<MTL4CommandBuffer> _buf;
+    id<MTL4CommandAllocator> _alloc;
+    id<MTLResidencySet> _set;
+    int _dirty;
+}
+
+- (instancetype)initWithDevice:(id<MTLDevice>)device
+{
+    self = [super init];
+    _queue = [device newMTL4CommandQueue];
+    _buf = [device newCommandBuffer];
+    _alloc = [device newCommandAllocator];
+    NSError *error = nil;
+    MTL4ArgumentTableDescriptor *d = [MTL4ArgumentTableDescriptor new];
+    d.maxBufferBindCount = 8;
+    d.maxTextureBindCount = 4;
+    d.initializeBindings = YES;
+    _table = [device newArgumentTableWithDescriptor:d error:&error];
+    _set = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new] error:&error];
+    if (!_queue || !_table || !_set) return nil;
+    [_queue addResidencySet:_set];
+    return self;
+}
+
+- (void)keep:(id<MTLAllocation>)r
+{
+    [_set addAllocation:r];
+    _dirty = 1;
+}
+
+- (id<MTL4CommandBuffer>)begin
+{
+    [_alloc reset];
+    [_buf beginCommandBufferWithAllocator:_alloc];
+    return _buf;
+}
+
+- (NSError *)run
+{
+    [_buf endCommandBuffer];
+    if (_dirty) [_set commit], _dirty = 0;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    __block NSError *error = nil;
+    MTL4CommitOptions *options = [MTL4CommitOptions new];
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+      error = f.error;
+      dispatch_semaphore_signal(done);
+    }];
+    id<MTL4CommandBuffer> list[1] = {_buf};
+    [_queue commit:list count:1 options:options];
+    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    return error;
+}
+
+@end

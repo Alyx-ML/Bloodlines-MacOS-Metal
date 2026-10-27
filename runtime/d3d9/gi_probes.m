@@ -11,6 +11,7 @@
 #include <time.h>
 
 #import "lm_bake.h"
+#import "mtl4.h"
 
 #define GI_RES 16          // each view, texels across
 #define GI_BATCH 341       // probes per draw: 6 layers each, up to 2048 layers
@@ -349,11 +350,23 @@ struct bl_gi *bl_gi_capture(id<MTLDevice> dev, const struct bl_bsp_world *w, cha
     cd.pixelFormat = MTLPixelFormatDepth32Float, cd.usage = MTLTextureUsageRenderTarget;
     id<MTLTexture> depth = [dev newTextureWithDescriptor:cd];
     id<MTLBuffer> ob = [dev newBufferWithLength:sizeof(struct po) * (size_t)np options:MTLResourceStorageModeShared];
-    id<MTLCommandQueue> q = [dev newCommandQueue];
+    // Each batch's first probe (the vertex shader's) and the reduce's parameters, free again
+    // once the batch before has been waited for.
+    id<MTLBuffer> kb = [dev newBufferWithLength:32 options:MTLResourceStorageModeShared];
+    BLJob *job = [[BLJob alloc] initWithDevice:dev];
+    if (!job) {
+        snprintf(err, (size_t)errlen, "no Metal 4 queue");
+        free(g->slot), free(g);
+        return NULL;
+    }
+    for (id<MTLAllocation> r in @[ pb, lb, lm, vb, ib, cap, depth, ob, kb ]) [job keep:r];
+    id<MTL4ArgumentTable> at = job.table;
     for (int first = 0; first < np; first += GI_BATCH) {
         uint32_t count = (uint32_t)(np - first < GI_BATCH ? np - first : GI_BATCH), f32 = (uint32_t)first;
-        id<MTLCommandBuffer> cb = [q commandBuffer];
-        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        uint32_t *k4 = kb.contents;
+        k4[0] = f32, k4[1] = count, k4[2] = (uint32_t)nl, k4[3] = GI_RES, k4[4] = f32;
+        id<MTL4CommandBuffer> cb = [job begin];
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
         rp.colorAttachments[0].texture = cap;
         rp.colorAttachments[0].loadAction = MTLLoadActionClear;
         // Nothing drawn: no light from there, and nothing in the way of the map's lights (the
@@ -365,31 +378,33 @@ struct bl_gi *bl_gi_capture(id<MTLDevice> dev, const struct bl_bsp_world *w, cha
         rp.depthAttachment.clearDepth = 1;
         rp.depthAttachment.storeAction = MTLStoreActionDontCare;
         rp.renderTargetArrayLength = count * 6;
-        id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+        id<MTL4RenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
         [e setRenderPipelineState:pso];
         [e setDepthStencilState:dss];
         [e setCullMode:MTLCullModeNone];
-        [e setVertexBuffer:vb offset:0 atIndex:0];
-        [e setVertexBuffer:pb offset:0 atIndex:1];
-        [e setVertexBytes:&f32 length:4 atIndex:2];
-        [e setFragmentTexture:lm atIndex:0];
+        [at setAddress:vb.gpuAddress atIndex:0];
+        [at setAddress:pb.gpuAddress atIndex:1];
+        [at setAddress:kb.gpuAddress + 16 atIndex:2];
+        [at setTexture:lm.gpuResourceID atIndex:0];
+        [e setArgumentTable:at atStages:MTLRenderStageVertex | MTLRenderStageFragment];
         [e drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:(NSUInteger)ki indexType:MTLIndexTypeUInt32
-                     indexBuffer:ib indexBufferOffset:0 instanceCount:count * 6];
+                     indexBuffer:ib.gpuAddress indexBufferLength:ib.length instanceCount:count * 6];
         [e endEncoding];
-        id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-        uint32_t k4[4] = {f32, count, (uint32_t)nl, GI_RES};
+        id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        // The views drawn before they are read.
+        [ce barrierAfterQueueStages:MTLStageFragment beforeStages:MTLStageDispatch visibilityOptions:MTL4VisibilityOptionDevice];
         [ce setComputePipelineState:cps];
-        [ce setTexture:cap atIndex:0];
-        [ce setBuffer:pb offset:0 atIndex:0];
-        [ce setBuffer:lb offset:0 atIndex:1];
-        [ce setBytes:k4 length:sizeof k4 atIndex:2];
-        [ce setBuffer:ob offset:sizeof(struct po) * (size_t)first atIndex:3];
+        [at setTexture:cap.gpuResourceID atIndex:0];
+        [at setAddress:pb.gpuAddress atIndex:0];
+        [at setAddress:lb.gpuAddress atIndex:1];
+        [at setAddress:kb.gpuAddress atIndex:2];
+        [at setAddress:ob.gpuAddress + sizeof(struct po) * (size_t)first atIndex:3];
+        [ce setArgumentTable:at];
         [ce dispatchThreads:MTLSizeMake(count, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         [ce endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
-        if (cb.error) {
-            snprintf(err, (size_t)errlen, "probe capture: %s", cb.error.localizedDescription.UTF8String);
+        NSError *failed = [job run];
+        if (failed) {
+            snprintf(err, (size_t)errlen, "probe capture: %s", failed.localizedDescription.UTF8String);
             free(g->slot), free(g);
             return NULL;
         }

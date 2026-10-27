@@ -10,6 +10,8 @@
 #include <string.h>
 #include <time.h>
 
+#import "mtl4.h"
+
 static NSString *const bake_source =
     @"#include <metal_stdlib>\n"
      "#include <metal_raytracing>\n"
@@ -357,22 +359,27 @@ struct bl_bake *bl_bake_map(id<MTLDevice> dev, const struct bl_bsp_world *w, int
         for (int k = 0; k < 3; k++) idx[3 * nt + k] = (uint32_t)(w->nverts + 3 * i + k);
         tri_face[nt] = (uint32_t)w->nfaces;
     }
-    MTLAccelerationStructureTriangleGeometryDescriptor *geo = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
-    geo.vertexBuffer = vb, geo.vertexStride = 12, geo.vertexFormat = MTLAttributeFormatFloat3;
-    geo.indexBuffer = ib, geo.indexType = MTLIndexTypeUInt32, geo.triangleCount = (NSUInteger)nt;
-    geo.opaque = YES;
-    MTLPrimitiveAccelerationStructureDescriptor *ad = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+    MTL4AccelerationStructureTriangleGeometryDescriptor *geo = [MTL4AccelerationStructureTriangleGeometryDescriptor new];
+    geo.vertexBuffer = (MTL4BufferRange){vb.gpuAddress, vb.length}, geo.vertexStride = 12;
+    geo.vertexFormat = MTLAttributeFormatFloat3;
+    geo.indexBuffer = (MTL4BufferRange){ib.gpuAddress, ib.length}, geo.indexType = MTLIndexTypeUInt32;
+    geo.triangleCount = (NSUInteger)nt, geo.opaque = YES;
+    MTL4PrimitiveAccelerationStructureDescriptor *ad = [MTL4PrimitiveAccelerationStructureDescriptor new];
     ad.geometryDescriptors = @[ geo ];
     MTLAccelerationStructureSizes sz = [dev accelerationStructureSizesWithDescriptor:ad];
     id<MTLAccelerationStructure> accel = [dev newAccelerationStructureWithSize:sz.accelerationStructureSize];
     id<MTLBuffer> scratch = [dev newBufferWithLength:sz.buildScratchBufferSize options:MTLResourceStorageModePrivate];
-    id<MTLCommandQueue> q = [dev newCommandQueue];
-    id<MTLCommandBuffer> cb = [q commandBuffer];
-    id<MTLAccelerationStructureCommandEncoder> ae = [cb accelerationStructureCommandEncoder];
-    [ae buildAccelerationStructure:accel descriptor:ad scratchBuffer:scratch scratchBufferOffset:0];
+    BLJob *job = [[BLJob alloc] initWithDevice:dev];
+    if (!job) {
+        snprintf(err, (size_t)errlen, "no Metal 4 queue");
+        bl_bake_free(b);
+        return NULL;
+    }
+    for (id<MTLAllocation> r in @[ luxb, vb, ib, tfb, accel, scratch ]) [job keep:r];
+    id<MTL4ComputeCommandEncoder> ae = [[job begin] computeCommandEncoder];
+    [ae buildAccelerationStructure:accel descriptor:ad scratchBuffer:(MTL4BufferRange){scratch.gpuAddress, scratch.length}];
     [ae endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
+    NSError *built = [job run];
     // The lights, style 0 only (the others switch or flicker).
     id<MTLBuffer> lb = [dev newBufferWithLength:sizeof(struct glight) * ((size_t)w->nlights + 1) options:MTLResourceStorageModeShared];
     struct glight *gl = lb.contents;
@@ -403,35 +410,39 @@ struct bl_bake *bl_bake_map(id<MTLDevice> dev, const struct bl_bsp_world *w, int
     id<MTLBuffer> direct = [dev newBufferWithLength:lbytes options:MTLResourceStorageModeShared];
     id<MTLBuffer> gather = [dev newBufferWithLength:lbytes options:MTLResourceStorageModeShared];
     id<MTLBuffer> prev = [dev newBufferWithLength:16 * ((size_t)total + 1) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> params = [dev newBufferWithLength:sizeof(struct gparams) options:MTLResourceStorageModeShared];
+    for (id<MTLAllocation> r in @[ lb, fb, direct, gather, prev, params ]) [job keep:r];
+    id<MTL4ArgumentTable> at = job.table;
+    [at setAddress:luxb.gpuAddress atIndex:0];
+    [at setAddress:fb.gpuAddress atIndex:1];
+    [at setAddress:lb.gpuAddress atIndex:2];
+    [at setAddress:tfb.gpuAddress atIndex:3];
+    [at setResource:accel.gpuResourceID atBufferIndex:4];
+    [at setAddress:params.gpuAddress atIndex:5];
+    [at setAddress:prev.gpuAddress atIndex:7];
     // 512 bounce rays per luxel; 16 shadow rays per light, over a ball 6 units across.
     struct gparams gp = {0, 0, (uint32_t)nl, (uint32_t)scale, 512, 64, 0.25f, 0, 0, 16, 3.0f, 0};
     gp.noshadow = getenv("BL_BAKE_NOSHADOW") != NULL;  // debugging: direct light without shadows
     if (getenv("BL_BAKE_RAYS")) gp.rays = (uint32_t)atoi(getenv("BL_BAKE_RAYS"));  // debugging
     int blur = getenv("BL_BAKE_BLUR") ? atoi(getenv("BL_BAKE_BLUR")) : scale / 2;  // debugging
-    // A pass in pieces, each its own command buffer, so none runs long.
+    // A pass in pieces, each its own command buffer, so none runs long. Each piece's
+    // parameters go in `params`, free again once the piece before has been waited for.
+    __block NSError *failed = built;
     void (^run)(id<MTLComputePipelineState>, id<MTLBuffer>, uint32_t) = ^(id<MTLComputePipelineState> p, id<MTLBuffer> out,
                                                                           uint32_t pass) {
         const uint32_t piece = 32768;
-        for (uint32_t first = 0; first < (uint32_t)total; first += piece) {
-            struct gparams g = gp;
-            g.first = first, g.count = (uint32_t)total - first < piece ? (uint32_t)total - first : piece;
-            g.seed = pass;  // a different random pattern each bounce
-            id<MTLCommandBuffer> c = [q commandBuffer];
-            id<MTLComputeCommandEncoder> e = [c computeCommandEncoder];
+        [at setAddress:out.gpuAddress atIndex:6];
+        for (uint32_t first = 0; first < (uint32_t)total && !failed; first += piece) {
+            struct gparams *g = params.contents;
+            *g = gp;
+            g->first = first, g->count = (uint32_t)total - first < piece ? (uint32_t)total - first : piece;
+            g->seed = pass;  // a different random pattern each bounce
+            id<MTL4ComputeCommandEncoder> e = [[job begin] computeCommandEncoder];
             [e setComputePipelineState:p];
-            [e setBuffer:luxb offset:0 atIndex:0];
-            [e setBuffer:fb offset:0 atIndex:1];
-            [e setBuffer:lb offset:0 atIndex:2];
-            [e setBuffer:tfb offset:0 atIndex:3];
-            [e setAccelerationStructure:accel atBufferIndex:4];
-            [e setBytes:&g length:sizeof g atIndex:5];
-            [e setBuffer:out offset:0 atIndex:6];
-            [e setBuffer:prev offset:0 atIndex:7];
-            [e useResource:accel usage:MTLResourceUsageRead];
-            [e dispatchThreads:MTLSizeMake(g.count, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [e setArgumentTable:at];
+            [e dispatchThreads:MTLSizeMake(g->count, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             [e endEncoding];
-            [c commit];
-            [c waitUntilCompleted];
+            failed = [job run];
         }
     };
     run(pd, direct, 0);
@@ -475,6 +486,11 @@ struct bl_bake *bl_bake_map(id<MTLDevice> dev, const struct bl_bsp_world *w, int
         }
     }
     free(tmp);
+    if (failed) {
+        snprintf(err, (size_t)errlen, "bake: %s", failed.localizedDescription.UTF8String);
+        bl_bake_free(b);
+        return NULL;
+    }
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     b->seconds = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;

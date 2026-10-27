@@ -2782,3 +2782,34 @@ Not verified in the game. The runtime builds and `boot` links.
 - The user asked to remove the yellow divider lines: the hairlines under the tabs, above
   Cancel and OK, under the key list's column headers and under the Enhanced tab's
   headings are gone. The title's divider with the diamond stays.
+
+## 2026-10-27: Metal 4, stage 2 (the rebake and the light probes); overlapping passes tried
+
+The lighting rebake (lm_bake.m) and the light probes (gi_probes.m), the last Metal 3 code,
+now run on Metal 4. Each works through a `BLJob` (runtime/d3d9/mtl4.{h,m}): its own
+MTL4CommandQueue, allocator and command buffer, one residency set holding everything the
+job uses, and one argument table for every stage; each command buffer is committed and
+waited for (commit feedback, which also gives the GPU's error).
+- Rebake: the occluders' acceleration structure is built from MTL4 descriptors (buffer
+  ranges) on a compute encoder and bound with `setResource:atBufferIndex:`; each piece's
+  parameters go in a small buffer (no `setBytes` in Metal 4), free again once the piece
+  before has been waited for.
+- Probes: the capture draws into an MTL4RenderPassDescriptor, and the reduce waits for it
+  with a barrier (fragment to dispatch) in the same command buffer.
+- Verified with tests/bake_view and tests/gi_view (old code against new, same map files,
+  M4 Pro): sm_asylum_1's rebake pictures identical byte for byte and its probes' numbers
+  identical; sm_hub_1's probes identical over 69 batches, its rebake identical but for 5
+  pixels of one picture, 1 level of 255 apart. Times about the same (asylum probes 0.17 s
+  to 0.05 s). The game's headless asylum run captured the probes on Metal 4 (0.06 s) with
+  no GPU errors. The in-game rebake was not run ("Rebaked Lighting" is off in the
+  settings used).
+
+Tried and taken out: the effects after the world view (occlusion, contact shadows,
+reflections, haze, skin, bounced light, bloom, eye adaptation) as passes running side by
+side, each with its own fence, joined before the pass that applies them. Two headless
+asylum runs, 1500 frames, BL_GPU_STATS=1: 13.3 to 13.5 ms a frame side by side, 13.2 to
+14.3 ms in order, no difference beyond the runs' own spread. Nearly all of these effects
+are full-screen render passes, whose pixel work the GPU takes one pass after another
+however they are fenced; a saving would need them as compute passes.
+
+Not verified: a window run, an M1.
