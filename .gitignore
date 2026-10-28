@@ -18,3 +18,6 @@ build/
 *.ips
 .DS_Store
 .claude/
+# Python bytecode caches.
+__pycache__/
+*.pyc

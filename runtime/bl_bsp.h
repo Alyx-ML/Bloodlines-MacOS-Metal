@@ -98,6 +98,9 @@ struct bl_bsp_world {
 };
 // The map at host_path; NULL with err filled when it cannot be read.
 struct bl_bsp_world *bl_bsp_world_load(const char *host_path, char *err, int errlen);
+// The same without the static props (their models are many files to read), for uses
+// that need only the faces and their lighting.
+struct bl_bsp_world *bl_bsp_world_load_no_props(const char *host_path, char *err, int errlen);
 void bl_bsp_world_free(struct bl_bsp_world *w);
 // 1 where p is in the map's open space: a leaf that is not solid and belongs to a cluster
 // (outside the map, leaves have none).

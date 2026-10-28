@@ -14,6 +14,7 @@ the pointers and the addresses they are stored to.
 
 usage: table_init_pointers.py <module.ll>   (rewritten in place)
 """
+import os
 import re
 import sys
 
@@ -76,8 +77,11 @@ def main():
         "tail:",
     ] + tail + ["}"]
     lines[start:end + 1] = out
-    with open(path, "w") as f:
+    # Write a temporary file, then rename: an interrupted run leaves the .ll intact.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
         f.write("\n".join(lines))
+    os.replace(tmp, path)
     print(f"initialize_pointers: {n} pointers as a table")
     return 0
 

@@ -71,6 +71,14 @@ def mesh_file(v, vt, vn, faces, orig):
     return b"".join(out), len(verts), len(tris)
 
 
+def write_file(path, data):
+    """Write to a temporary file, then rename: an interrupted run never leaves half a file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w" if isinstance(data, str) else "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--game", default=os.path.abspath(os.path.join(HERE, "..", "..")))
@@ -106,12 +114,10 @@ def main():
                     data, nv, nt = mesh_file(v, vt, vn, groups[me["material"]], orig)
                     name = f"{rel}/{k}.msh".replace(os.sep, "/")
                     os.makedirs(os.path.join(out, rel), exist_ok=True)
-                    with open(os.path.join(out, name), "wb") as f:
-                        f.write(data)
+                    write_file(os.path.join(out, name), data)
                     lines.append(f"{key} {len(me['tris'])} {name}\n")
                     print(f"{model} mesh {k} ({me['material']}): {len(me['tris'])} triangles -> {nt}")
-                with open(os.path.join(out, rel, "keys"), "w") as f:
-                    f.write("".join(lines))
+                write_file(os.path.join(out, rel, "keys"), "".join(lines))
             except mdl_extract.Refused as e:
                 print(f"refused {model}: {e}", file=sys.stderr)
                 refused += 1
@@ -119,8 +125,7 @@ def main():
     for d, _, files in os.walk(out):
         if "keys" in files:
             lines.append(open(os.path.join(d, "keys")).read())
-    with open(os.path.join(out, "index.txt"), "w") as f:
-        f.write("".join(lines))
+    write_file(os.path.join(out, "index.txt"), "".join(lines))
     print(f"{sum(x.count(chr(10)) for x in lines)} meshes listed in {os.path.join(out, 'index.txt')}, {refused} refused")
     return 1 if refused else 0
 

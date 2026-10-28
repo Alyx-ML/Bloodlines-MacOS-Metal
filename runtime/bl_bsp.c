@@ -113,10 +113,14 @@ static struct map *load(const char *path)
     return m;
 }
 
+// The quest compass (bl_compass.c) learns the map too, where it is linked in.
+__attribute__((weak)) void bl_compass_note_map(const char *host_path);
+
 void bl_bsp_note_open(const char *host_path)
 {
     size_t n = strlen(host_path);
     if (n < 4 || strcasecmp(host_path + n - 4, ".bsp") || !strcasestr(host_path, "/maps/")) return;
+    if (bl_compass_note_map) bl_compass_note_map(host_path);
     pthread_mutex_lock(&lock);
     int same = map && !strcmp(map->path, host_path);
     pthread_mutex_unlock(&lock);
@@ -264,7 +268,19 @@ int bl_bsp_lights(const float cam[3], struct bl_light *out, int max)
 // plus its direction times its distance. The lightmap is laid over the grid: across (s)
 // from corner 0 to corner 3, down (t) from corner 0 to corner 1, size + 1 luxels each way.
 
+static struct bl_bsp_world *world_load(const char *path, int props, char *err, int errlen);
+
 struct bl_bsp_world *bl_bsp_world_load(const char *path, char *err, int errlen)
+{
+    return world_load(path, 1, err, errlen);
+}
+
+struct bl_bsp_world *bl_bsp_world_load_no_props(const char *path, char *err, int errlen)
+{
+    return world_load(path, 0, err, errlen);
+}
+
+static struct bl_bsp_world *world_load(const char *path, int props, char *err, int errlen)
 {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -438,7 +454,8 @@ struct bl_bsp_world *bl_bsp_world_load(const char *path, char *err, int errlen)
     w->nsamples = len[8] / 4;
     w->lighting = malloc((size_t)len[8] + 4);
     memcpy(w->lighting, lump[8], (size_t)len[8]);
-    w->props = bl_props_load(path, d, size, w->props_err, sizeof w->props_err);
+    if (props) w->props = bl_props_load(path, d, size, w->props_err, sizeof w->props_err);
+    else snprintf(w->props_err, sizeof w->props_err, "not read (not needed)");
     w->nplanes = nplanes, w->nnodes = len[5] / 32, w->nleaves = len[10] / 32;
     w->planes = calloc((size_t)w->nplanes + 1, sizeof *w->planes);
     w->nodes = calloc((size_t)w->nnodes + 1, sizeof *w->nodes);

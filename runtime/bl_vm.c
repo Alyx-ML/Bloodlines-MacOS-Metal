@@ -126,6 +126,36 @@ static unsigned size_class(uint32_t size)
 static pthread_mutex_t heap_lock = PTHREAD_MUTEX_INITIALIZER;
 static void bl_guest_free_unlocked(uint32_t addr);
 
+// Hands len spare bytes at p (16-byte aligned) to the free lists, as the largest
+// blocks that fit.
+static void carve(uint8_t *p, uint64_t len)
+{
+    for (unsigned c = NCLASSES; c-- > 4 * MIN_SHIFT + 1;) {
+        if (class_len(c) % 16) continue;
+        while (len >= class_len(c)) {
+            *(uint32_t *)p = c;
+            *(uint32_t *)(p + 4) = free_lists[c];
+            free_lists[c] = bl_h2g(p);
+            p += class_len(c), len -= class_len(c);
+        }
+    }
+}
+
+// Once the heap is used up, a freed block of a bigger class is split: its front
+// serves this request and the rest goes back to the free lists. Long sessions
+// otherwise run out while plenty of freed memory sits in the wrong classes.
+static uint8_t *split_bigger(unsigned s)
+{
+    for (unsigned c = s + 1; c < NCLASSES; c++) {
+        if (!free_lists[c]) continue;
+        uint8_t *block = bl_g2h(free_lists[c]);
+        free_lists[c] = *(uint32_t *)(block + 4);
+        carve(block + class_len(s), class_len(c) - class_len(s));
+        return block;
+    }
+    return 0;
+}
+
 static uint32_t bl_guest_malloc_unlocked(uint32_t size)
 {
     unsigned s = size_class(size);
@@ -143,16 +173,19 @@ static uint32_t bl_guest_malloc_unlocked(uint32_t size)
         uint64_t len = class_len(s);
         while ((uint64_t)(arenas[cur_arena].end - heap_bump) < len) {
             if (cur_arena + 1 >= narenas) {
-                if (getenv("BL_HEAP_TRACE"))
-                    fprintf(stderr, "[heap] full asking %u: arena %d of %d, bump %p, end %p, base %p\n", size, cur_arena, narenas,
-                            (void *)heap_bump, (void *)arenas[cur_arena].end, (void *)arenas[cur_arena].base);
+                block = split_bigger(s);
+                if (block) goto found;
+                fprintf(stderr, "[heap] full asking %u: arena %d of %d, bump %p, end %p, base %p\n", size, cur_arena, narenas,
+                        (void *)heap_bump, (void *)arenas[cur_arena].end, (void *)arenas[cur_arena].base);
                 return 0;
             }
+            carve(heap_bump, arenas[cur_arena].end - heap_bump);  // the end of this range stays usable
             heap_bump = arenas[++cur_arena].base;
         }
         block = heap_bump;
         heap_bump += len;
     }
+found:;
     static uint32_t class_count[NCLASSES];
     if (++class_count[s] % (class_len(s) >= 4096 ? 1000 : 20000) == 0 && getenv("BL_HEAP_TRACE"))
         fprintf(stderr, "[heap] %u blocks of %u bytes (last asked %u)\n", class_count[s], (unsigned)class_len(s), size);
@@ -174,6 +207,12 @@ uint32_t bl_guest_calloc(uint32_t count, uint32_t size)
 uint32_t bl_guest_size(uint32_t addr)
 {
     return *(uint32_t *)((uint8_t *)bl_g2h(addr) - HDR + 8);
+}
+
+int bl_guest_fits(uint32_t addr, uint32_t size)
+{
+    const uint8_t *block = (const uint8_t *)bl_g2h(addr) - HDR;
+    return size + (uint64_t)HDR <= class_len(*(const uint32_t *)block);
 }
 
 int bl_guest_heap_has(uint32_t addr, uint32_t len)
@@ -243,12 +282,18 @@ _Thread_local void *bl_thread_cpu;
 
 #define STACK_GUARD 0x10000u  // a multiple of the host page size
 
+// The CPU state, and the guest heap block its stack and guard were carved from.
+struct cpu_alloc {
+    _cpu cpu;
+    uint32_t stack_block;
+};
+
 void *bl_cpu_new(uint32_t stack_size)
 {
     // The x87 helpers return pointers into the CPU state as 32-bit guest values
     // (x87_fstp_double gives &ST0), so it has to live inside the guest window.
-    uint32_t gcpu = bl_guest_malloc(sizeof(_cpu));
-    _cpu *cpu = gcpu ? memset(bl_g2h(gcpu), 0, sizeof(_cpu)) : NULL;
+    uint32_t gcpu = bl_guest_malloc(sizeof(struct cpu_alloc));
+    _cpu *cpu = gcpu ? memset(bl_g2h(gcpu), 0, sizeof(struct cpu_alloc)) : NULL;
     // An inaccessible guard below the stack turns an overflow into a fault instead of
     // silent writes into whatever lies below (for the first block, the executable's data).
     uint32_t block = bl_guest_malloc(stack_size + 2 * STACK_GUARD);
@@ -256,6 +301,7 @@ void *bl_cpu_new(uint32_t stack_size)
     uint32_t guard = (block + STACK_GUARD - 1) & ~(STACK_GUARD - 1);
     if (mprotect(bl_g2h(guard), STACK_GUARD, PROT_NONE)) bl_fatal("could not protect a guest stack guard");
     uint32_t stack = guard + STACK_GUARD;
+    ((struct cpu_alloc *)cpu)->stack_block = block;
     cpu->stack_bottom = bl_g2h(stack);
     cpu->stack_top = (uint8_t *)cpu->stack_bottom + stack_size;
     cpu->_pointer_offset = bl_ptrofs;
@@ -264,6 +310,16 @@ void *bl_cpu_new(uint32_t stack_size)
     eflags = 0x0202;
     if (!bl_thread_cpu) bl_thread_cpu = cpu;
     return cpu;
+}
+
+void bl_cpu_free(void *vcpu)
+{
+    _cpu *cpu = vcpu;
+    uint32_t guard = bl_h2g(cpu->stack_bottom) - STACK_GUARD;
+    if (mprotect(bl_g2h(guard), STACK_GUARD, PROT_READ | PROT_WRITE)) bl_fatal("could not unprotect a guest stack guard");
+    bl_guest_free(((struct cpu_alloc *)cpu)->stack_block);
+    if (bl_thread_cpu == cpu) bl_thread_cpu = NULL;
+    bl_guest_free(bl_h2g(cpu));
 }
 
 uint32_t bl_call_cdecl(void *vcpu, void (*entry)(void *), int nargs, const uint32_t *args)

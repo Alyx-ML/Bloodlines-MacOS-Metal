@@ -5,7 +5,11 @@ set -e
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 . "$HERE/tools/build_lock.sh"  # one build at a time in build/
 OUT="$HERE/build/runtime"
-LLVM=/opt/homebrew/opt/llvm/bin
+LLVM="${LLVM:-/opt/homebrew/opt/llvm/bin}"  # set LLVM to use another LLVM install
+if [ ! -x "$LLVM/opt" ]; then
+    echo "error: no LLVM opt at $LLVM/opt (install Homebrew llvm, or set LLVM to its bin folder)" >&2
+    exit 1
+fi
 ARM64_DL='e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32'
 SUPPORT="$HERE/third_party/SR/SR/llasm-support"
 mkdir -p "$OUT/obj"
@@ -15,7 +19,13 @@ rm -f obj/*.o libbl_runtime.a
 python3 -I "$HERE/tools/gen_imports.py" "$HERE/runtime/imports.def" imports.llasm imports_names.h
 python3 -I "$HERE/tools/gen_com.py" "$HERE/runtime/d3d9/com.def" com.llasm com_gen.c com_gen.h
 # The quest compass's Python (bl_compass.c): its quest tables, then the code that reads them.
-python3 -I -c 'import sys, json; print("static const char compass_py[] = %s;" % json.dumps("".join(open(f).read() + "\n" for f in sys.argv[1:])))' \
+# json.dumps makes a valid C string only from printable ASCII, tabs and newlines (its
+# \uXXXX escapes are not C), so any other character in these files stops the build.
+python3 -I -c 'import sys, json
+src = "".join(open(f, encoding="utf-8").read() + "\n" for f in sys.argv[1:])
+if any(not (" " <= c <= "~" or c in "\t\n\r") for c in src):
+    sys.exit("error: the compass Python files must be plain ASCII text (json.dumps cannot make a C string of the rest)")
+print("static const char compass_py[] = %s;" % json.dumps(src))' \
     "$HERE"/runtime/compass_quests_*.py "$HERE/runtime/compass.py" > compass_py.h
 
 # Relative include path: the project path contains spaces.

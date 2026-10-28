@@ -503,7 +503,7 @@ uint32_t bl_IDirect3DQuery9_GetData_c(uint32_t self, uint32_t data, uint32_t siz
 {
     (void)flags;
     struct obj *q = obj_of(self);
-    (void)q;
+    if (q->query_type == D3DQUERYTYPE_OCCLUSION) D3D_NOT_DONE("occlusion query (counts 1 pixel)");
     if (data && size >= 4) G32(data) = 1;  // event: TRUE; occlusion: 1 pixel
     return D3D_OK;
 }
@@ -515,5 +515,5 @@ uint32_t d3d_create_state_block(uint32_t out)
 }
 
 uint32_t bl_IDirect3DStateBlock9_GetDevice_c(uint32_t self, uint32_t out) { return bl_IDirect3DResource9_GetDevice_c(self, out); }
-uint32_t bl_IDirect3DStateBlock9_Capture_c(uint32_t self) { (void)self; return D3D_OK; }
-uint32_t bl_IDirect3DStateBlock9_Apply_c(uint32_t self) { (void)self; return D3D_OK; }
+uint32_t bl_IDirect3DStateBlock9_Capture_c(uint32_t self) { (void)self; D3D_NOT_DONE("IDirect3DStateBlock9::Capture"); return D3D_OK; }
+uint32_t bl_IDirect3DStateBlock9_Apply_c(uint32_t self) { (void)self; D3D_NOT_DONE("IDirect3DStateBlock9::Apply"); return D3D_OK; }

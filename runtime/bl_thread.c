@@ -3,6 +3,7 @@
 // and the Interlocked functions map to pthreads and atomics.
 #include <errno.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,9 +105,13 @@ uint32_t bl_k32_InterlockedExchange_c(uint32_t p, uint32_t v)
 
 // --- waitable objects ----------------------------------------------------------
 
+// Every waitable's state is guarded by one lock, and every change that can satisfy a
+// wait broadcasts one condition: a wait on several objects (and WaitAll, which takes
+// them all at once) then sleeps until something changes, never polling.
+static pthread_mutex_t wait_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t wait_cond = PTHREAD_COND_INITIALIZER;
+
 struct waitable {
-    pthread_mutex_t m;
-    pthread_cond_t c;
     int signaled, manual;
     int sem_count, sem_max;  // semaphores: signaled while sem_count > 0
     int is_sem;
@@ -116,14 +121,13 @@ struct waitable {
     // threads only
     pthread_t thread;
     int started;
-    uint32_t start, param, stack_size, exit_code;
+    uint32_t start, param, stack_size, exit_code, id;
+    jmp_buf exit_jb;  // ExitThread jumps back to thread_main through this
 };
 
 static struct waitable *waitable_new(int manual, int signaled)
 {
     struct waitable *w = calloc(1, sizeof *w);
-    pthread_mutex_init(&w->m, NULL);
-    pthread_cond_init(&w->c, NULL);
     w->manual = manual;
     w->signaled = signaled;
     return w;
@@ -131,10 +135,10 @@ static struct waitable *waitable_new(int manual, int signaled)
 
 static void waitable_signal(struct waitable *w)
 {
-    pthread_mutex_lock(&w->m);
+    pthread_mutex_lock(&wait_lock);
     w->signaled = 1;
-    pthread_cond_broadcast(&w->c);
-    pthread_mutex_unlock(&w->m);
+    pthread_cond_broadcast(&wait_cond);
+    pthread_mutex_unlock(&wait_lock);
 }
 
 static uint64_t self_id(void)
@@ -144,39 +148,70 @@ static uint64_t self_id(void)
     return tid;
 }
 
-static uint32_t waitable_wait(struct waitable *w, uint32_t ms)
+// Under wait_lock: whether a wait on w would succeed now, and taking it.
+static int waitable_ready(const struct waitable *w, uint64_t me)
+{
+    return w->signaled || (w->is_mutex && w->owner == me);  // its owner takes it again
+}
+
+static void waitable_take(struct waitable *w, uint64_t me)
+{
+    if (w->is_mutex && w->owner == me)
+        w->depth++;
+    else if (w->is_mutex)
+        w->owner = me, w->depth = 1, w->signaled = 0;
+    else if (w->is_sem)
+        w->signaled = --w->sem_count > 0;
+    else if (!w->manual)
+        w->signaled = 0;
+}
+
+// Waits for one of ws (all of them when `all`) for up to ms milliseconds; the index
+// of the object taken (0 for all), or WAIT_TIMEOUT.
+static uint32_t wait_objects(uint32_t n, struct waitable *const *ws, int all, uint32_t ms)
 {
     struct timespec until;
-    if (ms != INFINITE) {
+    if (ms != INFINITE && ms != 0) {
         clock_gettime(CLOCK_REALTIME, &until);
         until.tv_sec += ms / 1000;
         until.tv_nsec += (long)(ms % 1000) * 1000000;
         if (until.tv_nsec >= 1000000000) until.tv_sec++, until.tv_nsec -= 1000000000;
     }
-    pthread_mutex_lock(&w->m);
-    if (w->is_mutex && w->owner == self_id()) {  // taken again by its owner, as on Windows
-        w->depth++;
-        pthread_mutex_unlock(&w->m);
-        return WAIT_OBJECT_0;
-    }
-    int timed_out = 0;
-    while (!w->signaled && !timed_out) {
-        if (ms == INFINITE)
-            pthread_cond_wait(&w->c, &w->m);
-        else
-            timed_out = pthread_cond_timedwait(&w->c, &w->m, &until) == ETIMEDOUT;
-    }
+    uint64_t me = self_id();
     uint32_t r = WAIT_TIMEOUT;
-    if (w->signaled) {
-        if (w->is_sem)
-            w->signaled = --w->sem_count > 0;
-        else if (!w->manual)
-            w->signaled = 0;
-        if (w->is_mutex) w->owner = self_id(), w->depth = 1;
-        r = WAIT_OBJECT_0;
+    int timed_out = 0;
+    pthread_mutex_lock(&wait_lock);
+    for (;;) {
+        if (all) {
+            uint32_t ready = 0;
+            while (ready < n && waitable_ready(ws[ready], me)) ready++;
+            if (ready == n) {
+                for (uint32_t i = 0; i < n; i++) waitable_take(ws[i], me);
+                r = WAIT_OBJECT_0;
+                break;
+            }
+        } else {
+            uint32_t i = 0;
+            while (i < n && !waitable_ready(ws[i], me)) i++;
+            if (i < n) {
+                waitable_take(ws[i], me);
+                r = WAIT_OBJECT_0 + i;
+                break;
+            }
+        }
+        if (ms == 0 || timed_out) break;  // checked once more after the deadline
+        if (ms == INFINITE)
+            pthread_cond_wait(&wait_cond, &wait_lock);
+        else
+            timed_out = pthread_cond_timedwait(&wait_cond, &wait_lock, &until) == ETIMEDOUT;
     }
-    pthread_mutex_unlock(&w->m);
+    pthread_mutex_unlock(&wait_lock);
     return r;
+}
+
+static uint32_t waitable_wait(struct waitable *w, uint32_t ms)
+{
+    return wait_objects(1, &w, 0, ms);
 }
 
 // Named events, mutexes and semaphores: creating one with a name already in use opens
@@ -249,10 +284,13 @@ static struct waitable *waitable_of(uint32_t h)
 uint32_t bl_k32_ResetEvent_c(uint32_t h)
 {
     struct waitable *w = bl_handle_get(h, BL_H_EVENT);
-    if (!w) return 0;
-    pthread_mutex_lock(&w->m);
+    if (!w) {
+        bl_set_last_error(BL_ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    pthread_mutex_lock(&wait_lock);
     w->signaled = 0;
-    pthread_mutex_unlock(&w->m);
+    pthread_mutex_unlock(&wait_lock);
     return 1;
 }
 
@@ -282,17 +320,17 @@ uint32_t bl_k32_ReleaseMutex_c(uint32_t h)
         bl_set_last_error(BL_ERROR_INVALID_HANDLE);
         return 0;
     }
-    pthread_mutex_lock(&w->m);
+    pthread_mutex_lock(&wait_lock);
     if (w->owner != self_id()) {
-        pthread_mutex_unlock(&w->m);
+        pthread_mutex_unlock(&wait_lock);
         bl_set_last_error(288);  // ERROR_NOT_OWNER
         return 0;
     }
     if (--w->depth == 0) {
         w->owner = 0, w->signaled = 1;
-        pthread_cond_broadcast(&w->c);
+        pthread_cond_broadcast(&wait_cond);
     }
-    pthread_mutex_unlock(&w->m);
+    pthread_mutex_unlock(&wait_lock);
     return 1;
 }
 
@@ -309,46 +347,64 @@ static struct waitable *make_semaphore(void *arg)
 uint32_t bl_k32_CreateSemaphoreA_c(uint32_t sec, uint32_t initial, uint32_t max, uint32_t name)
 {
     (void)sec;
+    // The counts are LONGs: the maximum must be positive and the initial count in 0..max.
+    if ((int32_t)max <= 0 || (int32_t)initial < 0 || (int32_t)initial > (int32_t)max) {
+        bl_set_last_error(BL_ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     uint32_t a[2] = {initial, max};
     return create_named(name, KIND_SEMAPHORE, make_semaphore, a);
 }
 
+// Fails without touching *prev when the count would pass the maximum, as on Windows.
 uint32_t bl_k32_ReleaseSemaphore_c(uint32_t h, uint32_t n, uint32_t prev)
 {
     struct waitable *w = bl_handle_get(h, BL_H_EVENT);
-    if (!w || !w->is_sem) return 0;
-    pthread_mutex_lock(&w->m);
-    if (prev) U32(prev) = (uint32_t)w->sem_count;
-    if (w->sem_count + (int)n > w->sem_max) {
-        pthread_mutex_unlock(&w->m);
+    if (!w || !w->is_sem) {
+        bl_set_last_error(BL_ERROR_INVALID_HANDLE);
         return 0;
     }
-    w->sem_count += (int)n;
-    w->signaled = w->sem_count > 0;
-    pthread_cond_broadcast(&w->c);
-    pthread_mutex_unlock(&w->m);
+    if ((int32_t)n <= 0) {
+        bl_set_last_error(BL_ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    pthread_mutex_lock(&wait_lock);
+    if ((int64_t)w->sem_count + (int32_t)n > w->sem_max) {
+        pthread_mutex_unlock(&wait_lock);
+        bl_set_last_error(298);  // ERROR_TOO_MANY_POSTS
+        return 0;
+    }
+    if (prev) U32(prev) = (uint32_t)w->sem_count;
+    w->sem_count += (int32_t)n;
+    w->signaled = 1;
+    pthread_cond_broadcast(&wait_cond);
+    pthread_mutex_unlock(&wait_lock);
     return 1;
 }
 
-// Polls: good enough for the few places that wait on several objects.
+#define MAXIMUM_WAIT_OBJECTS 64
+
 uint32_t bl_k32_WaitForMultipleObjects_c(uint32_t n, uint32_t handles, uint32_t all, uint32_t ms)
 {
-    uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    for (;;) {
-        uint32_t ready = 0;
-        for (uint32_t i = 0; i < n; i++) {
-            struct waitable *w = waitable_of(U32(handles + 4 * i));
-            if (!w) return 0xffffffffu;
-            if (!all && waitable_wait(w, 0) == WAIT_OBJECT_0) return WAIT_OBJECT_0 + i;
-            if (all) ready += w->signaled || (w->is_mutex && w->owner == self_id());
-        }
-        if (all && ready == n) {
-            for (uint32_t i = 0; i < n; i++) waitable_wait(waitable_of(U32(handles + 4 * i)), 0);
-            return WAIT_OBJECT_0;
-        }
-        if (ms != INFINITE && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - start >= (uint64_t)ms * 1000000) return WAIT_TIMEOUT;
-        usleep(1000);
+    if (n == 0 || n > MAXIMUM_WAIT_OBJECTS) {
+        bl_set_last_error(BL_ERROR_INVALID_PARAMETER);
+        return 0xffffffffu;  // WAIT_FAILED
     }
+    struct waitable *ws[MAXIMUM_WAIT_OBJECTS];
+    for (uint32_t i = 0; i < n; i++) {
+        ws[i] = waitable_of(U32(handles + 4 * i));
+        if (!ws[i]) {
+            bl_set_last_error(BL_ERROR_INVALID_HANDLE);
+            return 0xffffffffu;
+        }
+        // Waiting for all of one object twice is refused, as on Windows.
+        for (uint32_t k = 0; all && k < i; k++)
+            if (ws[k] == ws[i]) {
+                bl_set_last_error(BL_ERROR_INVALID_PARAMETER);
+                return 0xffffffffu;
+            }
+    }
+    return wait_objects(n, ws, all != 0, ms);
 }
 
 uint32_t bl_k32_SetThreadPriority_c(uint32_t h, uint32_t prio)
@@ -382,33 +438,61 @@ uint32_t bl_k32_WaitForSingleObject_c(uint32_t h, uint32_t ms)
 
 uint32_t bl_k32_Sleep_c(uint32_t ms)
 {
-    if (ms == 0)
+    if (ms == 0) {
         sched_yield();
-    else
-        usleep(ms * 1000u);
+        return 0;
+    }
+    if (ms == INFINITE)
+        for (;;) pause();  // forever, as on Windows
+    struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000 };
+    while (nanosleep(&ts, &ts) && errno == EINTR) {}
     return 0;
 }
 
 // --- threads ---------------------------------------------------------------------
 
-static void *thread_main(void *arg)
+// Thread ids: multiples of 4 like Windows', from one counter, so each thread has its
+// own while it runs. CreateThread gives the new thread its id; other host threads (the
+// main one, Cocoa's) get one when they first ask.
+static uint32_t next_thread_id;
+static _Thread_local uint32_t thread_id;
+
+static uint32_t new_thread_id(void)
 {
-    struct waitable *t = arg;
-    void *cpu = bl_cpu_new(t->stack_size);
-    uint32_t param = t->param;
-    uint32_t code = bl_call_guest(cpu, t->start, BL_STDCALL, 0, 1, &param);
-    t->exit_code = code;
-    t->manual = 1;  // a finished thread stays signaled
-    waitable_signal(t);
-    return NULL;
+    uint32_t id;
+    do id = __atomic_add_fetch(&next_thread_id, 4, __ATOMIC_RELAXED);
+    while (!id);
+    return id;
 }
+
+uint32_t bl_k32_GetCurrentThreadId_c(void)
+{
+    if (!thread_id) thread_id = new_thread_id();
+    return thread_id;
+}
+
+void bl_crash_thread_init(void);
+void bl_crash_thread_done(void);
+void bl_thread_tib_free(void);
 
 static _Thread_local struct waitable *current_thread;
 
-static void *thread_trampoline(void *arg)
+static void *thread_main(void *arg)
 {
-    current_thread = arg;
-    return thread_main(arg);
+    struct waitable *t = arg;
+    current_thread = t;
+    thread_id = t->id;
+    bl_crash_thread_init();
+    void *cpu = bl_cpu_new(t->stack_size);
+    uint32_t param = t->param;
+    if (!_setjmp(t->exit_jb)) t->exit_code = bl_call_guest(cpu, t->start, BL_STDCALL, 0, 1, &param);
+    // Returned, or ExitThread jumped here: the host is off the guest stack, so the
+    // thread's TIB, CPU state and stack go back to the guest heap.
+    bl_thread_tib_free();
+    bl_cpu_free(cpu);
+    bl_crash_thread_done();
+    waitable_signal(t);  // a finished thread stays signaled (manual)
+    return NULL;
 }
 
 static void thread_start(struct waitable *t)
@@ -418,7 +502,7 @@ static void thread_start(struct waitable *t)
     pthread_attr_setstacksize(&a, 8u << 20);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     t->started = 1;
-    if (pthread_create(&t->thread, &a, thread_trampoline, t)) bl_fatal("pthread_create failed");
+    if (pthread_create(&t->thread, &a, thread_main, t)) bl_fatal("pthread_create failed");
     pthread_attr_destroy(&a);
 }
 
@@ -429,6 +513,7 @@ uint32_t bl_k32_CreateThread_c(uint32_t sec, uint32_t stack, uint32_t start, uin
     struct waitable *t = waitable_new(1, 0);
     t->start = start;
     t->param = param;
+    t->id = new_thread_id();
     // dwStackSize is the initial commit unless STACK_SIZE_PARAM_IS_A_RESERVATION; the
     // reserve is then the executable's default, 1 MB.
     uint32_t size = (stack + 0xffffu) & ~0xffffu;
@@ -436,7 +521,7 @@ uint32_t bl_k32_CreateThread_c(uint32_t sec, uint32_t stack, uint32_t start, uin
     t->stack_size = size;
     if (getenv("BL_THREAD_TRACE")) fprintf(stderr, "[thread] start 0x%x stack %u (asked %u)\n", start, size, stack);
     uint32_t h = bl_handle_new(BL_H_THREAD, t);
-    if (tid) U32(tid) = h;  // thread ids only need to be unique
+    if (tid) U32(tid) = t->id;  // what GetCurrentThreadId returns in the new thread
     if (!(flags & 4)) thread_start(t);  // not CREATE_SUSPENDED
     return h;
 }
@@ -450,13 +535,14 @@ uint32_t bl_k32_ResumeThread_c(uint32_t h)
     return 1;  // previous suspend count
 }
 
+// Unwinds to thread_main, which frees the thread's guest memory: this call runs on the
+// guest stack it frees.
 uint32_t bl_k32_ExitThread_c(uint32_t code)
 {
     struct waitable *t = current_thread;
     if (!t) bl_fatal("ExitThread on the main thread");
     t->exit_code = code;
-    waitable_signal(t);
-    pthread_exit(NULL);
+    _longjmp(t->exit_jb, 1);
 }
 
 int bl_sync_close(uint32_t h)

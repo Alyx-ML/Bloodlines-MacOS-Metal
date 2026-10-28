@@ -54,6 +54,22 @@ uint32_t bl_errno_to_win32(int err)
     }
 }
 
+// errno of a call on host path `host`: ENOENT is ERROR_PATH_NOT_FOUND when the folder
+// that would hold it is missing, as on Windows, and ERROR_FILE_NOT_FOUND otherwise.
+static uint32_t path_error(const char *host, int err)
+{
+    if (err != ENOENT) return bl_errno_to_win32(err);
+    char dir[1024];
+    snprintf(dir, sizeof dir, "%s", host);
+    size_t n = strlen(dir);
+    while (n > 1 && dir[n - 1] == '/') dir[--n] = 0;  // "a/b/" names b
+    char *slash = strrchr(dir, '/');
+    if (!slash) return BL_ERROR_FILE_NOT_FOUND;  // in the current folder
+    slash[slash == dir] = 0;  // keep "/" for a file at the root
+    struct stat st;
+    return stat(dir, &st) == 0 && S_ISDIR(st.st_mode) ? BL_ERROR_FILE_NOT_FOUND : BL_ERROR_PATH_NOT_FOUND;
+}
+
 #define MAX_HANDLES 4096
 static struct { enum bl_handle_type type; void *obj; } handles[MAX_HANDLES];
 static pthread_mutex_t handle_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -311,7 +327,7 @@ uint32_t bl_k32_GetFileType_c(uint32_t h)
 uint32_t bl_k32_CreateFileA_c(uint32_t name, uint32_t access, uint32_t share, uint32_t sec, uint32_t disposition,
                               uint32_t flags, uint32_t tmpl)
 {
-    (void)share, (void)sec, (void)flags, (void)tmpl;
+    (void)share, (void)sec, (void)tmpl;
     char host[1024];
     if (!bl_path_to_host(G(name), host, sizeof host)) {
         bl_set_last_error(BL_ERROR_PATH_NOT_FOUND);
@@ -329,10 +345,18 @@ uint32_t bl_k32_CreateFileA_c(uint32_t name, uint32_t access, uint32_t share, ui
     }
     struct stat st;
     int existed = stat(host, &st) == 0;
-    if (existed && S_ISDIR(st.st_mode)) oflags = O_RDONLY;  // FILE_FLAG_BACKUP_SEMANTICS
+    if (existed && S_ISDIR(st.st_mode)) {
+        // Windows opens a folder only with FILE_FLAG_BACKUP_SEMANTICS; the file system
+        // tries "sound\" as a file and must be refused, as on Windows.
+        if (!(flags & 0x02000000u)) {
+            bl_set_last_error(BL_ERROR_ACCESS_DENIED);
+            return BL_INVALID_HANDLE;
+        }
+        oflags = O_RDONLY;
+    }
     int fd = open(host, oflags | O_CLOEXEC, 0644);
     if (fd < 0) {
-        bl_set_last_error(bl_errno_to_win32(errno));
+        bl_set_last_error(path_error(host, errno));
         return BL_INVALID_HANDLE;
     }
     if (!wr) bl_bsp_note_open(host);  // a map: its lights, for the volumetric lighting
@@ -510,7 +534,7 @@ uint32_t bl_k32_CreateDirectoryA_c(uint32_t name, uint32_t sec)
     char host[1024];
     if (!bl_path_to_host(G(name), host, sizeof host)) return 0;
     if (mkdir(host, 0755) == 0) return 1;
-    bl_set_last_error(errno == EEXIST ? BL_ERROR_ALREADY_EXISTS : bl_errno_to_win32(errno));
+    bl_set_last_error(errno == EEXIST ? BL_ERROR_ALREADY_EXISTS : path_error(host, errno));
     return 0;
 }
 
@@ -639,10 +663,18 @@ uint32_t bl_k32_HeapFree_c(uint32_t heap, uint32_t flags, uint32_t p)
 uint32_t bl_k32_HeapReAlloc_c(uint32_t heap, uint32_t flags, uint32_t p, uint32_t size)
 {
     (void)heap;
+    // In place only: a block too small for the new size fails and stays where it is.
+    if ((flags & HEAP_REALLOC_IN_PLACE_ONLY) && (!p || !bl_guest_fits(p, size))) {
+        bl_set_last_error(BL_ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
     uint32_t old = bl_guest_size(p);
     uint32_t n = bl_guest_realloc(p, size);  // stays in place whenever the block fits
-    if ((flags & HEAP_REALLOC_IN_PLACE_ONLY) && n != p) bl_fatal("HeapReAlloc in place moved a block");
-    if (n && (flags & HEAP_ZERO_MEMORY) && size > old) memset((char *)G(n) + old, 0, size - old);
+    if (!n) {
+        bl_set_last_error(BL_ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    if ((flags & HEAP_ZERO_MEMORY) && size > old) memset((char *)G(n) + old, 0, size - old);
     return n;
 }
 
@@ -669,7 +701,8 @@ static uint32_t virtual_alloc(uint32_t addr, uint32_t size, uint32_t type, uint3
         return 0;
     }
     (void)type;
-    uint32_t len = (size + 0xffffu) & ~0xffffu;
+    uint32_t len = (size + 0xffffu) & ~0xffffu;  // size <= 0xffff0000: does not wrap
+    if ((uint64_t)len + 0x10000u > UINT32_MAX) { bl_set_last_error(BL_ERROR_NOT_ENOUGH_MEMORY); return 0; }
     uint32_t block = bl_guest_malloc(len + 0x10000u);
     if (!block) { bl_set_last_error(BL_ERROR_NOT_ENOUGH_MEMORY); return 0; }
     uint32_t base = (block + 0xffffu) & ~0xffffu;
@@ -698,6 +731,10 @@ static uint32_t virtual_free(uint32_t addr, uint32_t size, uint32_t type)
 
 uint32_t bl_k32_VirtualAlloc_c(uint32_t addr, uint32_t size, uint32_t type, uint32_t protect)
 {
+    if (size == 0 || size > 0xffff0000u) {  // nothing, or so big the page rounding wraps
+        bl_set_last_error(BL_ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     pthread_mutex_lock(&region_lock);
     uint32_t r = virtual_alloc(addr, size, type, protect);
     pthread_mutex_unlock(&region_lock);
@@ -718,39 +755,59 @@ uint32_t bl_k32_IsBadWritePtr_c(uint32_t p, uint32_t n)
     return p == 0;
 }
 
-// TLS slots, per host thread.
+// TLS slots, per host thread. Each allocation of a slot bumps its generation; a value
+// stored under an older one reads as 0, so a reused index starts at 0 in every thread,
+// as on Windows.
 #define TLS_SLOTS 64
 static uint8_t tls_used[TLS_SLOTS];
-static _Thread_local uint32_t tls_values[TLS_SLOTS];
+static uint32_t tls_gen[TLS_SLOTS];
+static pthread_mutex_t tls_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local struct { uint32_t gen, value; } tls_values[TLS_SLOTS];
 
 uint32_t bl_k32_TlsAlloc_c(void)
 {
+    pthread_mutex_lock(&tls_lock);
     for (uint32_t i = 0; i < TLS_SLOTS; i++)
         if (!tls_used[i]) {
             tls_used[i] = 1;
-            tls_values[i] = 0;
+            __atomic_add_fetch(&tls_gen[i], 1, __ATOMIC_RELEASE);
+            pthread_mutex_unlock(&tls_lock);
             return i;
         }
+    pthread_mutex_unlock(&tls_lock);
+    bl_set_last_error(259);  // ERROR_NO_MORE_ITEMS
     return 0xffffffffu;  // TLS_OUT_OF_INDEXES
 }
 
 uint32_t bl_k32_TlsFree_c(uint32_t i)
 {
-    if (i >= TLS_SLOTS) return 0;
-    tls_used[i] = 0;
-    return 1;
+    pthread_mutex_lock(&tls_lock);
+    int ok = i < TLS_SLOTS && tls_used[i];
+    if (ok) tls_used[i] = 0;
+    pthread_mutex_unlock(&tls_lock);
+    if (!ok) bl_set_last_error(BL_ERROR_INVALID_PARAMETER);
+    return ok;
 }
 
 uint32_t bl_k32_TlsGetValue_c(uint32_t i)
 {
+    if (i >= TLS_SLOTS) {
+        bl_set_last_error(BL_ERROR_INVALID_PARAMETER);
+        return 0;
+    }
     bl_set_last_error(0);
-    return i < TLS_SLOTS ? tls_values[i] : 0;
+    uint32_t gen = __atomic_load_n(&tls_gen[i], __ATOMIC_ACQUIRE);
+    return tls_values[i].gen == gen ? tls_values[i].value : 0;
 }
 
 uint32_t bl_k32_TlsSetValue_c(uint32_t i, uint32_t v)
 {
-    if (i >= TLS_SLOTS) return 0;
-    tls_values[i] = v;
+    if (i >= TLS_SLOTS) {
+        bl_set_last_error(BL_ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    tls_values[i].gen = __atomic_load_n(&tls_gen[i], __ATOMIC_ACQUIRE);
+    tls_values[i].value = v;
     return 1;
 }
 
@@ -760,12 +817,7 @@ uint32_t bl_k32_GetCurrentProcess_c(void) { return 0xffffffffu; }
 uint32_t bl_k32_GetCurrentThread_c(void) { return 0xfffffffeu; }
 uint32_t bl_k32_GetCurrentProcessId_c(void) { return (uint32_t)getpid(); }
 
-uint32_t bl_k32_GetCurrentThreadId_c(void)
-{
-    uint64_t tid;
-    pthread_threadid_np(NULL, &tid);
-    return (uint32_t)tid;
-}
+// GetCurrentThreadId is in bl_thread.c, with the ids CreateThread hands out.
 
 uint32_t bl_k32_ExitProcess_c(uint32_t code)
 {

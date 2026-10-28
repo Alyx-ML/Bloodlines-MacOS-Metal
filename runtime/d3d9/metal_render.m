@@ -7745,7 +7745,7 @@ void d3d_render_stretch(struct obj *src, uint32_t src_rect, struct obj *dst, uin
 
 void d3d_render_color_fill(struct obj *surf, uint32_t rect, uint32_t color)
 {
-    (void)rect;
+    if (rect) D3D_NOT_DONE("ColorFill of part of a surface (the whole of it is filled)");
     if (!surf) return;
     ensure_device();
     // Whole-surface fills only, as a clear of the next pass on it.

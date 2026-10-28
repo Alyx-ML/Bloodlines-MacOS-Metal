@@ -285,7 +285,7 @@ uint32_t bl_IDirect3DDevice9_GetRenderTargetData_c(DEV, uint32_t rt, uint32_t ds
     return D3D_OK;
 }
 
-uint32_t bl_IDirect3DDevice9_GetFrontBufferData_c(DEV, uint32_t chain, uint32_t dst) { UNUSED, (void)chain, (void)dst; return D3D_OK; }
+uint32_t bl_IDirect3DDevice9_GetFrontBufferData_c(DEV, uint32_t chain, uint32_t dst) { UNUSED, (void)chain, (void)dst; D3D_NOT_DONE("GetFrontBufferData"); return D3D_OK; }
 
 uint32_t bl_IDirect3DDevice9_StretchRect_c(DEV, uint32_t src, uint32_t srect, uint32_t dst, uint32_t drect, uint32_t filter)
 {
@@ -445,7 +445,7 @@ uint32_t bl_IDirect3DDevice9_GetRenderState_c(DEV, uint32_t s, uint32_t v)
 }
 
 uint32_t bl_IDirect3DDevice9_CreateStateBlock_c(DEV, uint32_t type, uint32_t out) { UNUSED, (void)type; return d3d_create_state_block(out); }
-uint32_t bl_IDirect3DDevice9_BeginStateBlock_c(DEV) { UNUSED; return D3D_OK; }
+uint32_t bl_IDirect3DDevice9_BeginStateBlock_c(DEV) { UNUSED; D3D_NOT_DONE("BeginStateBlock (records nothing)"); return D3D_OK; }
 uint32_t bl_IDirect3DDevice9_EndStateBlock_c(DEV, uint32_t out) { UNUSED; return d3d_create_state_block(out); }
 uint32_t bl_IDirect3DDevice9_SetClipStatus_c(DEV, uint32_t cs) { UNUSED, (void)cs; return D3D_OK; }
 
@@ -558,6 +558,7 @@ uint32_t bl_IDirect3DDevice9_ProcessVertices_c(DEV, uint32_t src, uint32_t dst, 
                                               uint32_t flags)
 {
     UNUSED, (void)src, (void)dst, (void)n, (void)buf, (void)decl, (void)flags;
+    D3D_NOT_DONE("ProcessVertices");
     return D3D_OK;
 }
 
@@ -581,7 +582,7 @@ uint32_t bl_IDirect3DDevice9_GetVertexShader_c(DEV, uint32_t out) { UNUSED; give
 // Shader constants: float4 / int4 registers (16 bytes), bools (4 bytes).
 static uint32_t consts(void *bank, uint32_t nregs, uint32_t regsize, uint32_t start, uint32_t data, uint32_t count, int set)
 {
-    if (start + count > nregs) return D3DERR_INVALIDCALL;
+    if (start > nregs || count > nregs - start) return D3DERR_INVALIDCALL;  // no wrap past 4 GB
     char *b = (char *)bank + start * regsize;
     if (set) memcpy(b, bl_g2h(data), count * regsize);
     else memcpy(bl_g2h(data), b, count * regsize);
@@ -628,8 +629,8 @@ uint32_t bl_IDirect3DDevice9_SetPixelShaderConstantI_c(DEV, uint32_t s, uint32_t
 uint32_t bl_IDirect3DDevice9_GetPixelShaderConstantI_c(DEV, uint32_t s, uint32_t d, uint32_t n) { UNUSED; return consts(st.ps_i, 16, 16, s, d, n, 0); }
 uint32_t bl_IDirect3DDevice9_SetPixelShaderConstantB_c(DEV, uint32_t s, uint32_t d, uint32_t n) { UNUSED; return consts(st.ps_b, 16, 4, s, d, n, 1); }
 uint32_t bl_IDirect3DDevice9_GetPixelShaderConstantB_c(DEV, uint32_t s, uint32_t d, uint32_t n) { UNUSED; return consts(st.ps_b, 16, 4, s, d, n, 0); }
-uint32_t bl_IDirect3DDevice9_DrawRectPatch_c(DEV, uint32_t h, uint32_t s, uint32_t i) { UNUSED, (void)h, (void)s, (void)i; return D3D_OK; }
-uint32_t bl_IDirect3DDevice9_DrawTriPatch_c(DEV, uint32_t h, uint32_t s, uint32_t i) { UNUSED, (void)h, (void)s, (void)i; return D3D_OK; }
+uint32_t bl_IDirect3DDevice9_DrawRectPatch_c(DEV, uint32_t h, uint32_t s, uint32_t i) { UNUSED, (void)h, (void)s, (void)i; D3D_NOT_DONE("DrawRectPatch"); return D3D_OK; }
+uint32_t bl_IDirect3DDevice9_DrawTriPatch_c(DEV, uint32_t h, uint32_t s, uint32_t i) { UNUSED, (void)h, (void)s, (void)i; D3D_NOT_DONE("DrawTriPatch"); return D3D_OK; }
 uint32_t bl_IDirect3DDevice9_DeletePatch_c(DEV, uint32_t h) { UNUSED, (void)h; return D3D_OK; }
 uint32_t bl_IDirect3DDevice9_CreateQuery_c(DEV, uint32_t type, uint32_t out) { UNUSED; return d3d_create_query(type, out); }
 
@@ -641,7 +642,7 @@ uint32_t bl_IDirect3DSwapChain9_Present_c(uint32_t self, uint32_t src, uint32_t 
     return bl_IDirect3DDevice9_Present_c(self, src, dst, window, dirty);
 }
 
-uint32_t bl_IDirect3DSwapChain9_GetFrontBufferData_c(uint32_t self, uint32_t dst) { (void)self, (void)dst; return D3D_OK; }
+uint32_t bl_IDirect3DSwapChain9_GetFrontBufferData_c(uint32_t self, uint32_t dst) { (void)self, (void)dst; D3D_NOT_DONE("IDirect3DSwapChain9::GetFrontBufferData"); return D3D_OK; }
 uint32_t bl_IDirect3DSwapChain9_GetBackBuffer_c(uint32_t self, uint32_t i, uint32_t type, uint32_t out) { return bl_IDirect3DDevice9_GetBackBuffer_c(self, 0, i, type, out); }
 uint32_t bl_IDirect3DSwapChain9_GetRasterStatus_c(uint32_t self, uint32_t rs) { return bl_IDirect3DDevice9_GetRasterStatus_c(self, 0, rs); }
 uint32_t bl_IDirect3DSwapChain9_GetDisplayMode_c(uint32_t self, uint32_t mode) { return bl_IDirect3DDevice9_GetDisplayMode_c(self, 0, mode); }

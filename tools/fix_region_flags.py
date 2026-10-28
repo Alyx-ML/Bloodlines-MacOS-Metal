@@ -31,7 +31,7 @@ import subprocess
 import sys
 
 # Homebrew LLVM's objdump: no xcrun, so it works inside the sandbox too.
-OBJDUMP = "/opt/homebrew/opt/llvm/bin/llvm-objdump"
+OBJDUMP = os.path.join(os.environ.get("LLVM", "/opt/homebrew/opt/llvm/bin"), "llvm-objdump")
 
 REGION_RE = re.compile(r"unknown flags on start of region - \d+ - \d+ \(0x([0-9a-f]+)\) - 0x([0-9a-f]+)")
 MIXING_RE = re.compile(r"mixing flags and instruction flags - \d+ - \d+ \(0x([0-9a-f]+)\)")

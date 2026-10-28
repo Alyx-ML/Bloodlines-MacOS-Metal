@@ -1369,7 +1369,7 @@ the Visual options (`bl_vgui.c`: "HDR", "Volumetric Light", "Skin Scattering").
   Khronos PBR Neutral on the world view in `post_apply`, with `BL_TONEMAP_EXPAND`. Off by
   default and not in the options: kept for comparison only.
 - **HDR.** On a screen with extended dynamic range, `hdr_present` lifts bright parts above
-  normal white by luminance: above a knee (`BL_HDR_KNEE`, default 0.05) the colour is
+  normal white by luminance: above a knee (`BL_HDR_KNEE` (removed later), default 0.05) the colour is
   scaled up towards `BL_HDR_PEAK` (default 4) times white, with a soft shoulder, capped by
   the screen's headroom at the time (`bl_cocoa_edr_headroom`). Checked with a
   ScreenCaptureKit HDR capture of a window run: pixels above white reach the screen

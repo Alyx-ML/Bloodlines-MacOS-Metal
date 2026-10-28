@@ -794,13 +794,20 @@ const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, uint64_t key, uint3
                 memcpy(m->keep, p, 16), p += 16;
                 if (d.length > need)
                     m->nbase = nb, m->base = memcpy(malloc((size_t)nb * 12 + 1), p + 4, (size_t)nb * 12);
-                if (nv) {
+                int bad = 0;  // a corner past the vertices: the tool's output is wrong
+                for (uint32_t i = 0; i < ni; i++) bad |= m->idx[i] >= nv;
+                if (bad) fprintf(stderr, "[detail] %s: a hair triangle's corner is past its %u vertices; not used\n", path, nv);
+                if (nv && !bad) {
                     snprintf(u, path + sizeof path - u, "_hair.png");
                     m->tex = load_rgba(dev, path);
                     char base[1600];
                     snprintf(base, sizeof base, "%.*s.png", (int)(u - path), path);
                     if (m->tex) m->base_color = hair_base_color(dev, base, path);
-                    if (!m->tex) free(m), m = NULL;
+                }
+                if (bad || (nv && !m->tex)) {  // no strips at all keeps only `keep`: that is used
+                    m->tex = nil, m->base_color = nil;
+                    free((void *)m->verts), free((void *)m->idx), free((void *)m->anchors), free((void *)m->base);
+                    free(m), m = NULL;
                 }
             }
         }

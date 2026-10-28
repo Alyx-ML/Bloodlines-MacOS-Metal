@@ -92,6 +92,8 @@ SANTA_MONICA = {
     },
     "Slashterpiece": {  # Slashterpiece
         1: ("sm_gallery_1", "painting_0"),          # slash the paintings
+        # 3 and 4 (someone else broke in after the player refused) leave nothing to do:
+        # the quest ends at Therese's, so they get no marker.
     },
     "Diner": {  # Bad Blood
         1: ("sm_diner_1", "trigger_attack"),        # meet Jeanette at the diner

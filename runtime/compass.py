@@ -15,6 +15,7 @@ _blc_out = ""
 
 def _blc_tick(cur):
     global _blc_out
+    _blc_out = ""  # nothing, rather than the last map's, if anything below fails
     out = []
     try:
         pc = __main__.FindPlayer()
@@ -39,8 +40,11 @@ def _blc_tick(cur):
             except:
                 e = None
             if e is not None:
-                o = e.GetOrigin()
-                pos = "%f %f %f" % (o[0], o[1], o[2])
+                try:
+                    o = e.GetOrigin()
+                    pos = "%f %f %f" % (o[0], o[1], o[2])
+                except:
+                    pos = ""
         else:
             pos = "%f %f %f" % place[1]
         main = 0

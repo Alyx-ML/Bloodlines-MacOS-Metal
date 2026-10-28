@@ -25,7 +25,7 @@ import sys
 import tempfile
 
 # Homebrew LLVM's objdump: no xcrun, so it works inside the sandbox too.
-OBJDUMP = "/opt/homebrew/opt/llvm/bin/llvm-objdump"
+OBJDUMP = os.path.join(os.environ.get("LLVM", "/opt/homebrew/opt/llvm/bin"), "llvm-objdump")
 
 SIGFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "crt", "signatures.txt")
 LINE_RE = re.compile(r"^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*(\S+)?\s*(.*)$")

@@ -47,6 +47,7 @@ static char quests[4096];  // _blc_out as last read
 struct ent {
     char name[64];  // targetname, lower case
     char dest[64];  // a trigger_changelevel's map, lower case; "" for others
+    int to;         // that map's number in maps[], -1 none (link_maps)
     float pos[3];
 };
 struct mapinfo {
@@ -56,6 +57,13 @@ struct mapinfo {
 };
 static struct mapinfo *maps;
 static int nmaps, cur = -1;
+// Per map: the first step from `cur` on the shortest way there (-2 not worked out yet,
+// -1 none), so the search runs once per map change, not every frame.
+static int *first_step;
+// The game's Python is set up again after a load: the compass's tables are given to it
+// a few times per map at most (their own errors would otherwise repeat for ever).
+static int given;
+static int map_changed;  // set by bl_compass_note_map; the 2-second wait starts over
 
 static void lower(char *s)
 {
@@ -99,6 +107,12 @@ static void read_map(const char *path, const char *name)
     uint8_t hdr[8 + 64 * 16];
     if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr || memcmp(hdr, "VBSP", 4)) return (void)fclose(f);
     int eo = rd32(hdr + 8), el = rd32(hdr + 12), mo = rd32(hdr + 8 + 14 * 16), ml = rd32(hdr + 12 + 14 * 16);
+    long size = fseek(f, 0, SEEK_END) ? -1 : ftell(f);
+    // a damaged or odd map: its lumps must lie inside the file (as bl_bsp.c's load)
+    if (size < 0 || eo < 0 || el < 0 || mo < 0 || ml < 0 || (long)eo + el > size || (long)mo + ml > size) {
+        fprintf(stderr, "[compass] %s: its lumps don't fit the file; left out\n", path);
+        return (void)fclose(f);
+    }
     char *ents = malloc((size_t)el + 1);
     uint8_t *models = malloc((size_t)ml + 1);
     int ok = ents && models && !fseek(f, eo, SEEK_SET) && fread(ents, 1, (size_t)el, f) == (size_t)el &&
@@ -123,7 +137,7 @@ static void read_map(const char *path, const char *name)
         // a brush entity: the middle of its model, which stands at its origin
         if (value(open + 1, close, "model", model, sizeof model) && model[0] == '*') {
             int k = atoi(model + 1);
-            if (k > 0 && (k + 1) * 48 <= ml)
+            if (k > 0 && k < ml / 48)
                 for (int a = 0; a < 3; a++) {
                     float lo, hi;
                     memcpy(&lo, models + 48 * k + 4 * a, 4), memcpy(&hi, models + 48 * k + 12 + 4 * a, 4);
@@ -178,6 +192,10 @@ void bl_compass_note_map(const char *host_path)
         for (int i = 0; i < nmaps; i++)
             for (int j = 0; j < maps[i].n; j++) links += maps[i].e[j].dest[0] != 0;
         fprintf(stderr, "[compass] %d maps, %d level changes between them\n", nmaps, links);
+        for (int i = 0; i < nmaps; i++)
+            for (int j = 0; j < maps[i].n; j++) maps[i].e[j].to = maps[i].e[j].dest[0] ? find_map(maps[i].e[j].dest) : -1;
+        free(first_step);
+        first_step = malloc(sizeof *first_step * (size_t)(nmaps + 1));
     }
     char name[64];
     snprintf(name, sizeof name, "%s", slash + 1);
@@ -186,6 +204,8 @@ void bl_compass_note_map(const char *host_path)
     lower(name);
     cur = find_map(name);
     quests[0] = 0, nmarks = 0;  // the last map's, until the game's Python is asked again
+    for (int i = 0; i < nmaps; i++) first_step[i] = -2;
+    given = 0, map_changed = 1;
 }
 
 static const struct ent *named(int map, const char *name)
@@ -197,43 +217,46 @@ static const struct ent *named(int map, const char *name)
 }
 
 // Two versions of one place (sm_hub_1, sm_hub_2: the street at different points of the
-// story): the same name but for the number at the end.
+// story): hub maps with the same name but for the number at the end. Only hubs: other
+// numbered maps are different places (ch_temple_1 and ch_temple_4 are separate floors).
 static int same_place(const char *a, const char *b)
 {
     size_t la = strlen(a), lb = strlen(b);
     while (la && isdigit((unsigned char)a[la - 1])) la--;
     while (lb && isdigit((unsigned char)b[lb - 1])) lb--;
-    return la == lb && !strncmp(a, b, la);
+    return la == lb && la > 5 && !strncmp(a + la - 5, "_hub_", 5) && !strncmp(a, b, la);
 }
 
 // The level change on map `from` that starts the shortest way to map `to` (nearest
 // the camera of those that do), or NULL.
 static const struct ent *way(int from, int to, const float cam[3])
 {
-    if (from < 0 || to < 0) return NULL;
-    int *prev = malloc(sizeof *prev * (size_t)nmaps), *queue = malloc(sizeof *queue * (size_t)nmaps), qh = 0, qt = 0;
-    for (int i = 0; i < nmaps; i++) prev[i] = -2;
-    prev[from] = -1, queue[qt++] = from;
-    while (qh < qt && prev[to] == -2) {
-        int m = queue[qh++];
-        for (int j = 0; j < maps[m].n; j++) {
-            int d = maps[m].e[j].dest[0] ? find_map(maps[m].e[j].dest) : -1;
-            if (d >= 0 && prev[d] == -2) prev[d] = m, queue[qt++] = d;
+    if (from < 0 || to < 0 || to == from) return NULL;
+    if (from == cur && first_step[to] == -2) {
+        int *prev = malloc(sizeof *prev * (size_t)nmaps), *queue = malloc(sizeof *queue * (size_t)nmaps), qh = 0, qt = 0;
+        for (int i = 0; i < nmaps; i++) prev[i] = -2;
+        prev[from] = -1, queue[qt++] = from;
+        while (qh < qt && prev[to] == -2) {
+            int m = queue[qh++];
+            for (int j = 0; j < maps[m].n; j++) {
+                int d = maps[m].e[j].to;
+                if (d >= 0 && prev[d] == -2) prev[d] = m, queue[qt++] = d;
+            }
         }
+        int step = prev[to] == -2 ? -1 : to;
+        while (step >= 0 && prev[step] != from) step = prev[step];
+        first_step[to] = step;
+        free(prev), free(queue);
     }
+    int step = from == cur ? first_step[to] : -1;
     const struct ent *best = NULL;
-    if (prev[to] != -2 && to != from) {
-        int step = to;
-        while (prev[step] != from) step = prev[step];
-        float bd = INFINITY;
-        for (int j = 0; j < maps[from].n; j++) {
-            const struct ent *e = &maps[from].e[j];
-            if (!e->dest[0] || find_map(e->dest) != step) continue;
-            float d = hypotf(hypotf(e->pos[0] - cam[0], e->pos[1] - cam[1]), e->pos[2] - cam[2]);
-            if (d < bd) bd = d, best = e;
-        }
+    float bd = INFINITY;
+    for (int j = 0; step >= 0 && j < maps[from].n; j++) {
+        const struct ent *e = &maps[from].e[j];
+        if (e->to != step) continue;
+        float d = hypotf(hypotf(e->pos[0] - cam[0], e->pos[1] - cam[1]), e->pos[2] - cam[2]);
+        if (d < bd) bd = d, best = e;
     }
-    free(prev), free(queue);
     return best;
 }
 
@@ -266,7 +289,7 @@ static void ask_python(void)
     static uint32_t main_name, out_name;
     if (!main_name) main_name = bl_guest_strdup("__main__"), out_name = bl_guest_strdup("_blc_out");
     char call[160];
-    snprintf(call, sizeof call, "try:\n    _blc_tick('%s')\nexcept NameError:\n    _blc_out = '?'\n", maps[cur].name);
+    snprintf(call, sizeof call, "try:\n    _blc_tick('%s')\nexcept NameError:\n    _blc_out = '?'\nexcept:\n    _blc_out = ''\n", maps[cur].name);
     py_run(cpu, call);
     uint32_t mod = py(cpu, vampire_python21_PyImport__AddModule, 1, &main_name);
     uint32_t a[2] = {mod, out_name};
@@ -280,9 +303,8 @@ static void ask_python(void)
     snprintf(quests, sizeof quests, "%s", text ? (const char *)bl_g2h(text) : "");
     if (!text) py(cpu, vampire_python21_PyErr__Clear, 0, NULL);
     (*(int32_t *)bl_g2h(s))--;  // GetAttrString's reference (__main__ keeps its own)
-    static int given;
     if (!strcmp(quests, "?") && given < 3) {  // __main__ is new (the game started or loaded): give it the compass
-        given++;  // a few times at most: its own errors would otherwise repeat for ever
+        given++;
         py_run(cpu, compass_py);
         fprintf(stderr, "[compass] quest tables given to the game's Python\n");
         quests[0] = 0;
@@ -416,10 +438,11 @@ int bl_compass_draw(uint32_t w, uint32_t h, const float rows[3][4], void *bgra)
     if (cur < 0) return 0;
     // The game's Python is only asked once play has gone on steadily for a while: during a
     // level change or a load the player's entity is not ready, and asking it then crashed.
-    // Any gap in the strip being drawn (a loading screen, a menu, dialogue) starts it over.
+    // Any gap in the strip being drawn (a loading screen, a menu, dialogue) starts it over,
+    // and so does a new map, however quickly it loaded.
     static double last, steady, asked;
     double now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-9;
-    if (now - last > 0.25) steady = now;
+    if (now - last > 0.25 || map_changed) steady = now, map_changed = 0;
     last = now;
     if (now - steady > 2 && now - asked > 0.25) asked = now, ask_python();  // four times a second
     float cam[3];

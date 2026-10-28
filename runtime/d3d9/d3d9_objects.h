@@ -2,8 +2,14 @@
 // (vtable, index into the host object table); its state lives in a host `struct obj`.
 #pragma once
 #include <stdint.h>
+#include <stdio.h>
 
 #include "bl_vm.h"
+
+// A call answered D3D_OK that does nothing here (the game has not been seen to need it):
+// said once, the first time, so a log shows when it does.
+#define D3D_NOT_DONE(what) \
+    do { static int once_; if (!once_++) fprintf(stderr, "[d3d9] %s: not done here, answered OK\n", what); } while (0)
 
 #define D3D_OK 0u
 #define S_FALSE 1u

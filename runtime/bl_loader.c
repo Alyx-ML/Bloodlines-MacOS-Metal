@@ -1,5 +1,6 @@
 // Module registry for the recompiled DLLs linked into this executable, the Win32
 // loader imports on top of it, and the per-thread TIB the FS segment points at.
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -142,20 +143,32 @@ uint32_t bl_k32_GetModuleFileNameA_c(uint32_t h, uint32_t buf, uint32_t size)
 // --- FS segment: thread information block ------------------------------------
 
 static _Thread_local uint32_t tib;
+static uint32_t peb;  // one per process, as on Windows
+static pthread_once_t peb_once = PTHREAD_ONCE_INIT;
+
+static void peb_new(void) { peb = bl_guest_calloc(1, 0x400); }
 
 static uint32_t thread_tib(void)
 {
     if (tib) return tib;
     _cpu *cpu = bl_thread_cpu;
+    pthread_once(&peb_once, peb_new);
     tib = bl_guest_calloc(1, 0x1000);
     U32(tib + 0x00) = 0xffffffffu;  // end of the SEH chain
     if (cpu) {
         U32(tib + 0x04) = bl_h2g(cpu->stack_top);
         U32(tib + 0x08) = bl_h2g(cpu->stack_bottom);
     }
-    U32(tib + 0x18) = tib;                        // self
-    U32(tib + 0x30) = bl_guest_calloc(1, 0x400);  // PEB
+    U32(tib + 0x18) = tib;  // self
+    U32(tib + 0x30) = peb;
     return tib;
+}
+
+// A CreateThread thread's TIB goes back to the guest heap when the thread ends.
+void bl_thread_tib_free(void)
+{
+    bl_guest_free(tib);
+    tib = 0;
 }
 
 uint32_t X86_ReadFsDword(uint32_t addr)

@@ -22,7 +22,7 @@ import subprocess
 import sys
 
 # Homebrew LLVM's objdump: no xcrun, so it works inside the sandbox too.
-OBJDUMP = "/opt/homebrew/opt/llvm/bin/llvm-objdump"
+OBJDUMP = os.path.join(os.environ.get("LLVM", "/opt/homebrew/opt/llvm/bin"), "llvm-objdump")
 
 LINE_RE = re.compile(r"^\s*([0-9a-f]+):\s+(\S+)")
 PADDING = {"int3", "nop"}

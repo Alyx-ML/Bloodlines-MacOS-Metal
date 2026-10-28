@@ -10,7 +10,11 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"  # absolute: the script changes directory
 NAME="$2"
 OUT="$HERE/build/$NAME"
-LLVM=/opt/homebrew/opt/llvm/bin
+LLVM="${LLVM:-/opt/homebrew/opt/llvm/bin}"  # set LLVM to use another LLVM install
+if [ ! -x "$LLVM/opt" ]; then
+    echo "error: no LLVM opt at $LLVM/opt (install Homebrew llvm, or set LLVM to its bin folder)" >&2
+    exit 1
+fi
 ARM64_DL='e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32'
 
 # Only the pinned game files are supported (native/modules/hashes.txt).
@@ -72,7 +76,8 @@ rm -f "$NAME".part*
 python3 -I "$HERE/tools/table_init_pointers.py" "$NAME.ll"
 # Keep a local symbol per translated proc (loc_<original VA>) so crash reports and
 # traces name the original code; private symbols leave the object entirely.
-sed -i '' 's/^define private fastcc void @loc_/define internal fastcc void @loc_/' "$NAME.ll"
+sed 's/^define private fastcc void @loc_/define internal fastcc void @loc_/' "$NAME.ll" > "$NAME.ll.tmp" &&
+    mv "$NAME.ll.tmp" "$NAME.ll"
 "$LLVM/llvm-split" -j "$JOBS" -o "$NAME.part" "$NAME.ll"
 # SR_INLINE=1 links in the x87 helpers (build_runtime.sh) as internal copies for opt to
 # inline. Off by default, and in fact opt never inlines them: the helpers are compiled for

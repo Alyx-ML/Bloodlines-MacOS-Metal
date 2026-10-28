@@ -9,6 +9,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <mach-o/dyld.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #import "lm_bake.h"
 #import "mtl4.h"
@@ -736,6 +739,129 @@ int bl_gi_sample(const struct bl_gi *g, const float p[3], float bounce[6][3], fl
     return 1;
 }
 
+// --- the cache on disk -----------------------------------------------------------------
+// A capture takes a second or three; maps come back often, so each one is kept in
+// build/gi_cache, keyed on everything it was made from (the map's surfaces, lights,
+// lightmaps and props) and on this build of the game.
+
+static uint64_t fnv(uint64_t h, const void *p, size_t n)
+{
+    const uint8_t *b = p;
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+
+static uint64_t gi_key(const struct bl_bsp_world *w, char *path, size_t len)
+{
+    char exe[1024];
+    uint32_t n = sizeof exe;
+    struct stat st;
+    if (_NSGetExecutablePath(exe, &n) || stat(exe, &st)) return 0;
+    uint64_t h = fnv(0xcbf29ce484222325ull, &st.st_mtimespec, sizeof st.st_mtimespec);
+    h = fnv(h, w->name, sizeof w->name);
+    h = fnv(h, w->verts, sizeof *w->verts * (size_t)w->nverts);
+    h = fnv(h, w->index, sizeof *w->index * (size_t)w->nindex);
+    h = fnv(h, w->faces, sizeof *w->faces * (size_t)w->nfaces);
+    h = fnv(h, w->texinfo, sizeof *w->texinfo * (size_t)w->ntexinfo);
+    h = fnv(h, w->texdata, sizeof *w->texdata * (size_t)w->ntexdata);
+    h = fnv(h, w->lights, sizeof *w->lights * (size_t)w->nlights);
+    h = fnv(h, w->dverts, sizeof *w->dverts * (size_t)w->ndverts);
+    h = fnv(h, w->lighting, 4 * (size_t)w->nsamples);
+    h = fnv(h, w->planes, sizeof *w->planes * (size_t)w->nplanes);
+    h = fnv(h, w->nodes, sizeof *w->nodes * (size_t)w->nnodes);
+    h = fnv(h, w->leaves, sizeof *w->leaves * (size_t)w->nleaves);
+    if (w->props) {
+        h = fnv(h, w->props->tris, sizeof *w->props->tris * (size_t)w->props->ntris);
+        if (w->props->refl) h = fnv(h, w->props->refl, sizeof *w->props->refl * (size_t)w->props->ntris);
+    }
+    char *slash = strrchr(exe, '/');
+    if (!slash) return 0;
+    *slash = 0;  // build/tests
+    snprintf(path, len, "%s/../gi_cache", exe);
+    mkdir(path, 0755);
+    snprintf(path, len, "%s/../gi_cache/%s.gi", exe, w->name);
+    return h;
+}
+
+// The file: a header (magic, version, the key, the grid and a checksum of what follows),
+// then the arrays. A file that is short, long, damaged or out of range is not used.
+#define GI_MAGIC 0x49474c42u  // "BLGI"
+#define GI_VERSION 1
+struct gi_file {
+    uint32_t magic, version;
+    uint64_t key, sum;  // sum: fnv over the arrays
+    float origin[3], step;
+    int32_t n[3], nprobes, nvalid;
+    char summary[256];
+};
+
+#define GI_ARRAYS(g, np, cells) \
+    {g->slot, sizeof(int) * (cells)}, {g->bounce, sizeof *g->bounce * (np)}, {g->direct, sizeof *g->direct * (np)}, \
+    {g->vis, sizeof *g->vis * (np)}, {g->valid, (np)}
+
+static void gi_cache_save(const struct bl_gi *g, uint64_t key, const char *path)
+{
+    size_t np = (size_t)g->nprobes, cells = (size_t)g->n[0] * g->n[1] * g->n[2];
+    struct { const void *p; size_t n; } parts[] = {GI_ARRAYS(g, np, cells)};
+    struct gi_file h = {GI_MAGIC, GI_VERSION, key, 0xcbf29ce484222325ull, {g->origin[0], g->origin[1], g->origin[2]},
+                        g->step, {g->n[0], g->n[1], g->n[2]}, g->nprobes, g->nvalid, ""};
+    snprintf(h.summary, sizeof h.summary, "%s", g->summary);
+    for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) h.sum = fnv(h.sum, parts[i].p, parts[i].n);
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s.XXXXXX", path);  // its own name: two captures of one map can't mix
+    int fd = mkstemp(tmp);
+    FILE *f = fd < 0 ? NULL : fdopen(fd, "wb");
+    if (!f) {
+        if (fd >= 0) close(fd), remove(tmp);
+        return;
+    }
+    int ok = fwrite(&h, sizeof h, 1, f) == 1;
+    for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) ok &= fwrite(parts[i].p, 1, parts[i].n, f) == parts[i].n;
+    ok &= fclose(f) == 0;
+    if (!ok || rename(tmp, path)) remove(tmp);
+}
+
+static struct bl_gi *gi_cache_load(uint64_t key, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    struct gi_file h;
+    struct stat st;
+    int ok = fread(&h, sizeof h, 1, f) == 1 && !fstat(fileno(f), &st) && h.magic == GI_MAGIC &&
+             h.version == GI_VERSION && h.key == key && h.n[0] > 0 && h.n[1] > 0 && h.n[2] > 0 &&
+             h.n[0] <= GI_MAX_CELLS && h.n[1] <= GI_MAX_CELLS && h.n[2] <= GI_MAX_CELLS && h.nprobes > 0 &&
+             h.nprobes <= GI_MAX_PROBES && h.nvalid >= 0 && h.nvalid <= h.nprobes && h.step > 0;
+    size_t np = ok ? (size_t)h.nprobes : 0, cells = ok ? (size_t)h.n[0] * h.n[1] * h.n[2] : 0;
+    struct bl_gi *g = NULL;
+    if (ok && cells <= GI_MAX_CELLS) {
+        g = calloc(1, sizeof *g);
+        g->slot = malloc(sizeof(int) * cells), g->bounce = malloc(sizeof *g->bounce * np);
+        g->direct = malloc(sizeof *g->direct * np), g->vis = malloc(sizeof *g->vis * np), g->valid = malloc(np);
+        struct { void *p; size_t n; } parts[] = {GI_ARRAYS(g, np, cells)};
+        size_t want = sizeof h;
+        for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) want += parts[i].n, ok &= parts[i].p != NULL;
+        ok &= (size_t)st.st_size == want;
+        uint64_t sum = 0xcbf29ce484222325ull;
+        for (size_t i = 0; ok && i < sizeof parts / sizeof *parts; i++)
+            ok &= fread(parts[i].p, 1, parts[i].n, f) == parts[i].n, sum = fnv(sum, parts[i].p, parts[i].n);
+        ok &= sum == h.sum;
+        for (size_t i = 0; ok && i < cells; i++) ok &= g->slot[i] >= -1 && g->slot[i] < h.nprobes;
+    } else {
+        ok = 0;
+    }
+    fclose(f);
+    if (!ok) {
+        if (g) bl_gi_free(g);
+        fprintf(stderr, "[gi] %s: not used (damaged or from another version); captured again\n", path);
+        return NULL;
+    }
+    memcpy(g->origin, h.origin, sizeof g->origin), g->step = h.step;
+    memcpy(g->n, h.n, sizeof g->n), g->nprobes = h.nprobes, g->nvalid = h.nvalid;
+    h.summary[sizeof h.summary - 1] = 0;
+    snprintf(g->summary, sizeof g->summary, "%.200s (from the cache)", h.summary);
+    return g;
+}
+
 // --- the open map's probes -----------------------------------------------------------
 
 static pthread_mutex_t gi_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -768,9 +894,27 @@ const struct bl_gi *bl_gi_get(int start)
         struct bl_bsp_world *w = gi_world;
         int gen = gi_gen;
         gi_world = NULL, gi_started = gen;
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            char err[256];
-            struct bl_gi *g = bl_gi_capture(MTLCreateSystemDefaultDevice(), w, err, sizeof err);
+        // One capture at a time: a map opened twice in a row (a load in the same map) waits
+        // for the first and then finds it in the cache; one for a map since left is skipped.
+        static dispatch_queue_t queue;
+        if (!queue)
+            queue = dispatch_queue_create("bl.gi", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+                                                                                          QOS_CLASS_USER_INITIATED, 0));
+        dispatch_async(queue, ^{
+            pthread_mutex_lock(&gi_lock);
+            int stale = gen != gi_gen;
+            pthread_mutex_unlock(&gi_lock);
+            if (stale) {
+                bl_bsp_world_free(w);
+                return;
+            }
+            char err[256], path[1100];
+            uint64_t key = gi_key(w, path, sizeof path);
+            struct bl_gi *g = key ? gi_cache_load(key, path) : NULL;
+            if (!g) {
+                g = bl_gi_capture(MTLCreateSystemDefaultDevice(), w, err, sizeof err);
+                if (g && key) gi_cache_save(g, key, path);
+            }
             if (g) fprintf(stderr, "[gi] %s\n", g->summary);
             else fprintf(stderr, "[gi] %s: %s\n", w->name, err);
             bl_bsp_world_free(w);

@@ -37,10 +37,50 @@ static uint64_t arg64(uint32_t *ap)
     return v;
 }
 
+// Formats one conversion with the host printf; output of any length.
+static void emit(struct out *o, const char *spec, ...)
+{
+    char tmp[512];
+    va_list ap, ap2;
+    va_start(ap, spec);
+    va_copy(ap2, ap);
+    int n = vsnprintf(tmp, sizeof tmp, spec, ap);
+    if (n >= (int)sizeof tmp) {
+        char *big = malloc((size_t)n + 1);
+        vsnprintf(big, (size_t)n + 1, spec, ap2);
+        put(o, big, (size_t)n);
+        free(big);
+    } else if (n > 0) {
+        put(o, tmp, (size_t)n);
+    }
+    va_end(ap2);
+    va_end(ap);
+}
+
+// Widths and precisions past this are cut to it: far beyond any real format, and it
+// keeps INT_MIN and other huge `*` values from overflowing the host printf.
+#define MAX_FIELD 0x100000
+
+static int clamp_field(int64_t v)
+{
+    return v > MAX_FIELD ? MAX_FIELD : v < -MAX_FIELD ? -MAX_FIELD : (int)v;
+}
+
+// A literal width or precision: digits, saturating.
+static int64_t digits(const char **pp)
+{
+    int64_t v = 0;
+    for (; **pp >= '0' && **pp <= '9'; (*pp)++)
+        if (v <= MAX_FIELD) v = v * 10 + (**pp - '0');
+    return v;
+}
+
 int bl_format(char *outbuf, size_t cap, const char *fmt, uint32_t ap)
 {
     struct out o = { outbuf, cap, 0 };
-    char spec[32], tmp[512];
+    // The host spec is '%', the flags (each once), "*.*", an optional "ll" and the
+    // conversion: width and precision go as int arguments, so it stays short.
+    char spec[16];
     while (*fmt) {
         const char *pct = strchr(fmt, '%');
         if (!pct) {
@@ -51,22 +91,27 @@ int bl_format(char *outbuf, size_t cap, const char *fmt, uint32_t ap)
         const char *p = pct + 1;
         size_t sl = 0;
         spec[sl++] = '%';
-        while (strchr("-+ #0", *p) && sl < 8) spec[sl++] = *p++;
+        for (; *p && strchr("-+ #0", *p); p++)
+            if (!memchr(spec + 1, *p, sl - 1)) spec[sl++] = *p;
+        int has_width = 0;
+        int64_t width = 0, prec = -1;  // a negative precision is the same as none
         if (*p == '*') {
-            sl += (size_t)snprintf(spec + sl, sizeof spec - sl, "%d", (int32_t)arg32(&ap));
+            width = (int32_t)arg32(&ap), has_width = 1;  // negative: left-justified
             p++;
-        } else {
-            while (*p >= '0' && *p <= '9' && sl < 16) spec[sl++] = *p++;
+        } else if (*p >= '0' && *p <= '9') {
+            width = digits(&p), has_width = 1;
         }
         if (*p == '.') {
-            spec[sl++] = *p++;
+            p++;
             if (*p == '*') {
-                sl += (size_t)snprintf(spec + sl, sizeof spec - sl, "%d", (int32_t)arg32(&ap));
+                prec = (int32_t)arg32(&ap);
                 p++;
             } else {
-                while (*p >= '0' && *p <= '9' && sl < 24) spec[sl++] = *p++;
+                prec = digits(&p);
             }
         }
+        int w = clamp_field(width), pr = clamp_field(prec);
+        spec[sl++] = '*', spec[sl++] = '.', spec[sl++] = '*';
         int wide = 0, is64 = 0;
         for (;;) {
             if (*p == 'h') { wide = -1; p++; }
@@ -80,71 +125,65 @@ int bl_format(char *outbuf, size_t cap, const char *fmt, uint32_t ap)
         }
         char conv = *p ? *p++ : 0;
         fmt = p;
-        int n = 0;
         switch (conv) {
         case 'd': case 'i': case 'u': case 'o': case 'x': case 'X':
             if (is64) {
                 spec[sl++] = 'l', spec[sl++] = 'l', spec[sl++] = conv, spec[sl] = 0;
                 uint64_t v = arg64(&ap);
-                n = (conv == 'd' || conv == 'i') ? snprintf(tmp, sizeof tmp, spec, (long long)v)
-                                                 : snprintf(tmp, sizeof tmp, spec, (unsigned long long)v);
+                if (conv == 'd' || conv == 'i')
+                    emit(&o, spec, w, pr, (long long)v);
+                else
+                    emit(&o, spec, w, pr, (unsigned long long)v);
             } else {
                 spec[sl++] = conv, spec[sl] = 0;
                 uint32_t v = arg32(&ap);
                 if (wide < 0) v = (conv == 'd' || conv == 'i') ? (uint32_t)(int16_t)v : (uint16_t)v;
-                n = (conv == 'd' || conv == 'i') ? snprintf(tmp, sizeof tmp, spec, (int32_t)v)
-                                                 : snprintf(tmp, sizeof tmp, spec, v);
+                if (conv == 'd' || conv == 'i')
+                    emit(&o, spec, w, pr, (int32_t)v);
+                else
+                    emit(&o, spec, w, pr, v);
             }
-            put(&o, tmp, (size_t)n < sizeof tmp ? (size_t)n : sizeof tmp - 1);
             break;
         case 'p':
-            n = snprintf(tmp, sizeof tmp, "%08X", arg32(&ap));
-            put(&o, tmp, (size_t)n);
+            emit(&o, "%08X", arg32(&ap));
             break;
         case 'e': case 'E': case 'f': case 'F': case 'g': case 'G': case 'a': case 'A': {
             uint64_t bits = arg64(&ap);
             double d;
             memcpy(&d, &bits, 8);
             spec[sl++] = conv, spec[sl] = 0;
-            n = snprintf(tmp, sizeof tmp, spec, d);
-            put(&o, tmp, (size_t)n < sizeof tmp ? (size_t)n : sizeof tmp - 1);
+            emit(&o, spec, w, pr, d);
             break;
         }
         case 'c': case 'C': {
             uint32_t c = arg32(&ap);
             char ch = (char)(c > 0xff ? '?' : c);  // narrow and wide alike
             spec[sl++] = 'c', spec[sl] = 0;
-            n = snprintf(tmp, sizeof tmp, spec, ch);
-            put(&o, tmp, (size_t)n < sizeof tmp ? (size_t)n : sizeof tmp - 1);
+            emit(&o, spec, w, pr, ch);
             break;
         }
         case 's': case 'S': {
             uint32_t g = arg32(&ap);
-            int is_wide = (conv == 'S') != (wide > 0);
+            // MSVC: h makes it narrow and l/w wide; without one, %s is narrow and %S wide.
+            int is_wide = wide ? wide > 0 : conv == 'S';
             const char *str = "(null)";
             char *conv_buf = NULL;
             if (g && is_wide) {
-                const uint16_t *w = bl_g2h(g);
+                const uint16_t *ws = bl_g2h(g);
                 size_t len = 0;
-                while (w[len]) len++;
+                while (ws[len]) len++;
                 conv_buf = malloc(len + 1);
-                for (size_t i = 0; i < len; i++) conv_buf[i] = w[i] > 0xff ? '?' : (char)w[i];
+                for (size_t i = 0; i < len; i++) conv_buf[i] = ws[i] > 0xff ? '?' : (char)ws[i];
                 conv_buf[len] = 0;
                 str = conv_buf;
             } else if (g) {
                 str = bl_g2h(g);
             }
             spec[sl++] = 's', spec[sl] = 0;
-            if (sl == 2) {
-                put(&o, str, strlen(str));  // plain %s: no length limit
-            } else {
-                char *big = NULL;
-                n = snprintf(NULL, 0, spec, str);
-                big = malloc((size_t)n + 1);
-                snprintf(big, (size_t)n + 1, spec, str);
-                put(&o, big, (size_t)n);
-                free(big);
-            }
+            if (sl == 5 && !has_width && prec < 0)
+                put(&o, str, strlen(str));  // plain %s
+            else
+                emit(&o, spec, w, pr, str);
             free(conv_buf);
             break;
         }

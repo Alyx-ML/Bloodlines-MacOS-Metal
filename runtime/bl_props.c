@@ -66,13 +66,13 @@ static void vpk_open(struct search *s, const char *path)
     long cnt = 0, ofs = 0, end = 0;
     if (!fseek(f, 0, SEEK_END)) end = ftell(f);
     if (end >= 9 && !fseek(f, -9, SEEK_END) && fread(tail, 1, 9, f) == 9) cnt = (uint32_t)rd32(tail), ofs = (uint32_t)rd32(tail + 4);
-    if (cnt <= 0 || ofs <= 0 || ofs >= end) {
+    if (cnt <= 0 || ofs <= 0 || ofs > end - 9) {  // the directory lies before the 9-byte tail
         fclose(f);
         return;
     }
     size_t dlen = (size_t)(end - 9 - ofs);
     uint8_t *d = malloc(dlen + 1);
-    int ok = !fseek(f, ofs, SEEK_SET) && fread(d, 1, dlen, f) == dlen;
+    int ok = d && !fseek(f, ofs, SEEK_SET) && fread(d, 1, dlen, f) == dlen;
     fclose(f);
     if (!ok) {
         free(d);

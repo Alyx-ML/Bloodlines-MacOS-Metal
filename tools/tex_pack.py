@@ -187,6 +187,14 @@ def target_size(o, img):
     return w << k, h << k
 
 
+def write_file(path, data):
+    """Write to a temporary file, then rename: an interrupted run never leaves half a file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w" if isinstance(data, str) else "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
 def pack(job):
     png, name, out, force = job
     try:
@@ -209,10 +217,8 @@ def pack(job):
         replace = os.path.splitext(os.path.basename(png))[0].lower().endswith("-replace")
         tex = build(o, img if replace else colour_fix(o, img))
         os.makedirs(os.path.dirname(tex_out), exist_ok=True)
-        with open(tex_out, "wb") as f:
-            f.write(tex)
-        with open(keys_out, "w") as f:
-            f.write(keys(o, name))
+        write_file(tex_out, tex)
+        write_file(keys_out, keys(o, name))
         return name, f"{o['w']}x{o['h']} {FORMATS[o['fmt']]} -> {tw}x{th} BC7", None
     except Refused as e:
         return name, None, f"{os.path.basename(png)}: {e}"
@@ -283,8 +289,7 @@ def main():
                 with open(os.path.join(d, f)) as k:
                     lines.append(k.read())
                 count += 1
-    with open(os.path.join(out, "index.txt"), "w") as f:
-        f.write("".join(lines))
+    write_file(os.path.join(out, "index.txt"), "".join(lines))
     for r in refused:
         print("refused " + r, file=sys.stderr)
     print(f"{written} textures written, {count} in all in {out}, {len(refused)} refused")

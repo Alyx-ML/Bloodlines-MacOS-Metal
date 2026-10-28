@@ -26,6 +26,8 @@ uint32_t bl_guest_calloc(uint32_t count, uint32_t size);
 void bl_guest_free(uint32_t addr);
 uint32_t bl_guest_realloc(uint32_t addr, uint32_t size);
 uint32_t bl_guest_size(uint32_t addr);  // size requested at allocation
+// Whether the block at addr can hold size bytes without moving (HeapReAlloc in place).
+int bl_guest_fits(uint32_t addr, uint32_t size);
 // Whether [addr, addr + len) lies in the part of the guest heap handed out so far.
 int bl_guest_heap_has(uint32_t addr, uint32_t len);
 
@@ -34,6 +36,8 @@ uint32_t bl_guest_strdup(const char *s);
 
 // One CPU state per host thread that runs guest code; stack lives in the guest heap.
 void *bl_cpu_new(uint32_t stack_size);
+// Gives a CPU state and its stack back to the guest heap; not while running on that stack.
+void bl_cpu_free(void *cpu);
 
 // The CPU state of this thread (its first bl_cpu_new), for import handlers that
 // call back into guest code.

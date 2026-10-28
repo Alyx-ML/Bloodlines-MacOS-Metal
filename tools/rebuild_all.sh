@@ -6,12 +6,18 @@
 # pinned in modules/hashes.txt (the Unofficial Patch replaces some of the originals).
 # Prints one line per module with its time; stops at the first failure.
 set -e
+if [ -z "$1" ]; then
+    echo "usage: rebuild_all.sh <game dir> [module ...]" >&2
+    exit 2
+fi
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 . "$HERE/tools/build_lock.sh"  # one build at a time in build/
 GAME="$(cd "$1" && pwd)"
 shift
 MODULES="$*"
 [ -n "$MODULES" ] || MODULES="$(grep -v '^#' "$HERE/modules/modules.txt")"
+# One log per module, build/logs/<module>.log, overwritten by the next build of that
+# module. Safe because the build lock lets only one build run at a time.
 mkdir -p "$HERE/build/logs"
 for m in $MODULES; do
     # A module may have several pinned versions; take the first one listed that is present.
