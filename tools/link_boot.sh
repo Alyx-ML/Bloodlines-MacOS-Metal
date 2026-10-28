@@ -1,12 +1,13 @@
 #!/bin/sh
 # Link the boot test (tests/boot.c) with every recompiled module that has been built
-# into native/build/<module>/, plus the runtime. Modules missing from build/ are
-# skipped with a note; the boot then stops where the game loads them.
+# into native/build/<module>/, plus the runtime. A module missing from build/ stops the
+# link, unless SKIP names it.
 #
 #   tools/link_boot.sh            -> native/build/tests/boot
 #   SKIP="Mss32 binkw32" tools/link_boot.sh   leaves those modules out
 set -e
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+. "$HERE/tools/build_lock.sh"  # one build at a time in build/
 cd "$HERE/build"
 objs=""
 mkdir -p tests
@@ -17,7 +18,8 @@ for m in $(grep -v '^#' "$HERE/modules/modules.txt"); do
         objs="$objs $m/$m.o $m/${m}_exports.o"
         [ -f "$m/${m}_aliases.txt" ] && cat "$m/${m}_aliases.txt" >> tests/aliases.txt
     else
-        echo "link_boot: $m not built, skipped" >&2
+        echo "link_boot: $m is not built (build/$m/$m.o); build it, or name it in SKIP to leave it out" >&2
+        exit 1
     fi
 done
 rm -f tests/boot

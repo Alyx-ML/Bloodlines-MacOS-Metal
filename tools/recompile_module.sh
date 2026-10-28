@@ -6,6 +6,7 @@
 # Hand-written fixes go in native/modules/<name>/*.manual.sci and are merged in.
 set -e
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+. "$HERE/tools/build_lock.sh"  # one build at a time in build/
 SRC="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"  # absolute: the script changes directory
 NAME="$2"
 OUT="$HERE/build/$NAME"

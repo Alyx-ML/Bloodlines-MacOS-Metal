@@ -3,6 +3,7 @@
 # Paths are kept relative inside $OUT because the project path contains spaces.
 set -e
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+. "$HERE/tools/build_lock.sh"  # one build at a time in build/
 SR="$HERE/third_party/SR"
 OUT="$HERE/build/tools"
 mkdir -p "$OUT"

@@ -3,6 +3,7 @@
 # native/build/runtime/libbl_runtime.a. Contains no game code.
 set -e
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+. "$HERE/tools/build_lock.sh"  # one build at a time in build/
 OUT="$HERE/build/runtime"
 LLVM=/opt/homebrew/opt/llvm/bin
 ARM64_DL='e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32'
@@ -13,6 +14,9 @@ rm -f obj/*.o libbl_runtime.a
 
 python3 -I "$HERE/tools/gen_imports.py" "$HERE/runtime/imports.def" imports.llasm imports_names.h
 python3 -I "$HERE/tools/gen_com.py" "$HERE/runtime/d3d9/com.def" com.llasm com_gen.c com_gen.h
+# The quest compass's Python (bl_compass.c): its quest tables, then the code that reads them.
+python3 -I -c 'import sys, json; print("static const char compass_py[] = %s;" % json.dumps("".join(open(f).read() + "\n" for f in sys.argv[1:])))' \
+    "$HERE"/runtime/compass_quests_*.py "$HERE/runtime/compass.py" > compass_py.h
 
 # Relative include path: the project path contains spaces.
 # C23 because SR's llasm_cpu.h uses nullptr.
@@ -44,5 +48,7 @@ for f in *.llasm; do
     "$LLVM/llc" -O2 -mtriple=arm64-apple-macos26 -filetype=obj "$b.bc" -o "obj/llasm_$b.o"
 done
 
-ar rcs libbl_runtime.a obj/*.o
+rm -f libbl_runtime.a.tmp
+ar rcs libbl_runtime.a.tmp obj/*.o
+mv libbl_runtime.a.tmp libbl_runtime.a
 echo "built: $OUT/libbl_runtime.a"

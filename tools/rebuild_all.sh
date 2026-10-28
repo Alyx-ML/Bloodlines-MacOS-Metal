@@ -7,6 +7,7 @@
 # Prints one line per module with its time; stops at the first failure.
 set -e
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+. "$HERE/tools/build_lock.sh"  # one build at a time in build/
 GAME="$(cd "$1" && pwd)"
 shift
 MODULES="$*"

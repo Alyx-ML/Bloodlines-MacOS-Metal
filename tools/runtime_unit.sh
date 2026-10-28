@@ -3,6 +3,7 @@
 # with the runtime's own objects (tools/build_runtime.sh builds them first).
 set -e
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+. "$HERE/tools/build_lock.sh"  # one build at a time in build/
 OBJ="$HERE/build/runtime/obj"
 OUT="$HERE/build/tests"
 mkdir -p "$OUT"
