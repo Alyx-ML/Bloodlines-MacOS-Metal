@@ -37,8 +37,9 @@ void bl_bake_rgbe(const uint8_t *s, float out[3]);
 
 // The open map's rebake, for the renderer (metal_render.m, lightmaps). Each map's path is
 // noted as the game opens it (gi_probes.m, bl_map_note); the first ask with start set
-// reads the map again and bakes it, 4 times as fine with 3 bounces, on a thread of its
-// own. gen counts the maps opened, so the renderer can tell a bake is for the map it draws.
+// reads the map again and, with bake set, bakes it, 4 times as fine with 3 bounces, on a
+// thread of its own (without: the map alone, bake NULL, for its own samples). gen counts
+// the maps opened, so the renderer can tell a bake is for the map it draws.
 struct bl_rebake {
     int gen;
     struct bl_bsp_world *world;
@@ -46,5 +47,5 @@ struct bl_rebake {
 };
 void bl_rebake_note_path(const char *host_path);
 // The open map's bake once it is done, else NULL; good until the map after next opens.
-const struct bl_rebake *bl_rebake_get(int start);
+const struct bl_rebake *bl_rebake_get(int start, int bake);
 int bl_rebake_gen(void);

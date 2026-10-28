@@ -31,6 +31,7 @@
 //   BL_PACING=0              plain presents, even on screens whose refresh is a multiple of the cap
 //   BL_PACING_STATS=1        log how many refreshes apart frames reach the screen
 //   BL_FULLSCREEN=0|1        start in a window or full screen (default: what the game asks for)
+//                            until a Display Mode is picked on the Video tab
 //   BL_WIDESCREEN=stretch    keep the game's 4:3 projection on wider modes (default: corrected)
 //   BL_ANISO=n               anisotropic filtering for filtered mipmapped textures (default 16, 1 = off)
 //   BL_AO=0|1|show           ambient occlusion (see post_run), over the options' check box;
@@ -63,11 +64,23 @@
 //                            to the caster, green the blockers found, blue the penumbra) with
 //                            BL_PCSS_SOFT (penumbra per world unit, 0.03), BL_PCSS_MAX (largest
 //                            penumbra, world units, 4), BL_PCSS_SEARCH (blocker search radius, 3);
-//                            BL_CONTACT=0|1|show (contact shadows, default on) with
-//                            BL_CONTACT_LENGTH (world units, 12) and BL_CONTACT_STRENGTH (0..1, 0.5);
+//                            BL_CONTACT=0|1|show (contact shadows, Bend's screen-space shadows,
+//                            default on) with BL_CONTACT_STRENGTH (0..1, 0.5);
+//                            BL_PROP_SHADOWS=0|1|show (the map's lights' shadows of its props, default
+//                            on; see the object shadows section) with BL_PROP_SHADOWS_STRENGTH (0..1,
+//                            0.5), BL_PROP_SHADOWS_RES (texels across each view, 512),
+//                            BL_PROP_SHADOWS_NEAR (world units, 12), BL_PROP_SHADOWS_SOFT (the lights'
+//                            radius in world units, for the shadows' soft edges, 6);
 //                            BL_SHADOWS_AB=n turns the setting over every n frames (comparisons)
 //   BL_TAA_JITTER=n          the temporal anti-aliasing's offset (pixels, default 0.5; see the TAA
 //                            section), negative flips it for MetalFX
+//   BL_UPSCALER=u            the temporal scaler (the TAA section), over the Visual tab's
+//                            drop-down: metalfx (the default) or fsr4 (AMD FSR 4, loaded from
+//                            BL_FSR4_DIR, by default the FSR4Metal folder next to the game's)
+//   BL_UPSCALER_QUALITY=q    the world view's resolution, which the scaler brings up to the
+//                            window's, over the Visual tab's drop-down: native (the window's own,
+//                            the default), quality (67%), balanced (59%), performance (50%) or
+//                            ultra (33%)
 //   BL_SHARPEN=0|1           sharpening of the world view after the anti-aliasing (taa_resolve), over
 //                            the options' check box; BL_SHARPEN_STRENGTH (0..1, default 0.3)
 //   BL_SKIN_DETAIL=0|1       pores and uneven shine on characters' faces (ps_detail), over the
@@ -109,6 +122,7 @@
 #import "mtl4.h"
 #import <objc/runtime.h>
 
+#include <dlfcn.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <os/lock.h>
@@ -117,6 +131,7 @@
 #include <string.h>
 
 #include "bl_bsp.h"
+#include "bl_props.h"
 #import "gi_probes.h"
 #import "lm_bake.h"
 #import "tex_detail.h"
@@ -193,6 +208,15 @@ static uint32_t clear_stencil;
 static int clear_has_stencil;
 
 static uint32_t resized_w, resized_h;  // back buffer size (resize comes before init)
+// The size the device's own surfaces (back buffer, depth) are drawn at: the window's own
+// pixels at the game's shape (out_follow_window), so menus, HUD and text are as sharp as
+// the screen whatever the resolution; 0 for the game's size (no window). The world view is
+// drawn at the resolution (view_w, view_h: one applied live from the Video tab,
+// bl_render_live_mode, 0 for the game's own) and brought up to it. The next ones are taken
+// up between frames.
+static uint32_t out_w, out_h, out_next_w, out_next_h;
+static uint32_t view_w, view_h, view_next_w, view_next_h;
+void bl_render_output_size(uint32_t *width, uint32_t *height);
 static unsigned long frames, draws, frame_draws;
 static long max_frames = -1;
 static int draw_stats;
@@ -230,7 +254,7 @@ static int deep_color;  // 16-bit back buffer, 10-bit window (BL_DEEP_COLOR, def
 // view_state: 0 no world view yet this frame, 1 world drawn (view_proj holds its
 // projection), 2 done for this frame.
 static int env_ao, env_ao_show, env_ssr, env_ssr_show, env_tonemap, env_hdr, env_fog, env_sss, env_sss_show;
-static float env_ao_radius, env_ao_strength, env_ao_thickness, env_ssr_strength, env_ssr_fresnel, env_ssr_blur,
+static float env_ao_radius, env_ao_strength, env_ao_thickness, env_ao_power, env_ssr_strength, env_ssr_fresnel, env_ssr_blur,
     env_tonemap_expand, env_hdr_peak, env_hdr_headroom, env_fog_density, env_fog_dist, env_sss_width,
     env_sss_strength, env_sss_sheen, env_sss_through;
 static int view_state;
@@ -250,9 +274,42 @@ static float taa_jitter[2];
 static int taa_pending;
 static void taa_note_camera(const float r8[4], const float r9[4], const float r10[4], const float r11[4], float clip_y);
 static void taa_forget_camera(void);
-static int taa_motion(id<MTLTexture> depth, NSUInteger w, NSUInteger h);
-static void taa_resolve(id<MTLTexture> color);
+static int taa_motion(id<MTLTexture> depth, NSUInteger w, NSUInteger h, NSUInteger ow, NSUInteger oh);
+static int taa_resolve(id<MTLTexture> color, id<MTLTexture> out);
 static void taa_frame_end(void);
+
+// Upscaling (BL_UPSCALER_QUALITY): the world view is drawn at world_res of the resolution
+// (world_size), smaller than the back buffer at the window's pixels. While world_low is set (from present, for a frame after one with a
+// world view) the back buffer and its depth buffer (world_bb, world_ds) stand for smaller
+// textures of their own, world_color and world_depth: target_texture gives those, and
+// what draws to them takes the game's pixels to theirs (set_viewport and the like, from
+// the texture's size against the surface's). The pass that ends the world view brings the
+// picture up to the window's size, through the temporal scaler (taa_resolve) or, in a
+// frame without a camera to go by, stretched; the view model and HUD then draw at full size.
+static float world_res = 1;
+static int world_low;
+// The upscaler and its quality, chosen with the Visual tab's dropdowns (bl_vgui.c) and
+// saved in the registry like the effects; BL_UPSCALER (metalfx, fsr4) and
+// BL_UPSCALER_QUALITY (native, quality, balanced, performance, ultra), when set, win at
+// start. FSR 4 is AMD's (FSR4Metal, loaded from its folder: fsr4_resolve).
+enum { UPSCALER_METALFX, UPSCALER_FSR4 };
+static int upscaler, upscaler_quality;
+// A change from the options menu, taken up between frames (d3d_render_present).
+static int upscaler_next = -1, quality_next = -1;
+static const char *const upscaler_names[] = {"metalfx", "fsr4"};
+static const char *const quality_names[] = {"native", "quality", "balanced", "performance", "ultra"};
+static const float quality_res[] = {1, 1 / 1.5f, 1 / 1.7f, 0.5f, 1 / 3.0f};
+#define UPSCALER_KEY_VALUE "Upscaler"
+#define QUALITY_KEY_VALUE "UpscalerQuality"
+#define FSR4_MAX_W 3840  // the largest picture FSR 4 makes
+#define FSR4_MAX_H 2160
+static void upscaler_settings(void);
+static int fsr4_try(char *why, size_t n);
+
+static struct obj *world_bb, *world_ds;
+static id<MTLTexture> world_color, world_depth;
+static id<MTLTexture> target_full(struct obj *o);
+static void world_up(struct d3d_state *s, MTL4RenderPassDescriptor *d);
 
 // The Visual options tab's check boxes (bl_vgui.c, read once a frame by bl_vgui_poll)
 // set the effects and save them in the registry. The environment, when set, wins over the
@@ -260,9 +317,10 @@ static void taa_frame_end(void);
 #define EFFECT_KEY "HKCU\\Software\\Troika\\Vampire\\Native"
 enum { BL_EFFECT_AO, BL_EFFECT_SSR, BL_EFFECT_HDR, BL_EFFECT_FOG, BL_EFFECT_SSS, BL_EFFECT_SHADOWS,
        BL_EFFECT_BLOOM, BL_EFFECT_EXPOSURE, BL_EFFECT_SSIL, BL_EFFECT_GI, BL_EFFECT_ROUND, BL_EFFECT_SHARPEN,
-       BL_EFFECT_SKIN_DETAIL,
+       BL_EFFECT_SKIN_DETAIL, BL_EFFECT_COMPASS,
        BL_EFFECTS };
 static int env_shadows;  // the shadows section's switch
+static int env_compass;  // the quest compass (compass_overlay)
 // The shadows section (below the stretch copies): the atlas's scale, its receivers, contact shadows.
 static struct obj *shadow_atlas;
 static int is_shadow_atlas(const struct obj *tex);
@@ -276,6 +334,8 @@ static void shadow_match_depth(struct obj *color, struct obj *depth);
 static int contact_on(void);
 static id<MTLTexture> contact_result;  // waiting to be multiplied in, like ao_result
 static void contact_apply(BLRender *e, id<MTLTexture> color, int has_depth);
+static id<MTLTexture> pshadow_result;  // the object shadows, likewise
+static void pshadow_apply(BLRender *e, id<MTLTexture> color, int has_depth);
 // Off until ticked, except where `def` says otherwise.
 static const struct { const char *env, *value; int *on, *show, def; } effects[BL_EFFECTS] = {
     {"BL_AO", "AmbientOcclusion", &env_ao, &env_ao_show},
@@ -291,6 +351,7 @@ static const struct { const char *env, *value; int *on, *show, def; } effects[BL
     {"BL_ROUND", "SmoothCharacters", &env_round, NULL, 1},
     {"BL_SHARPEN", "SharpenAfterAA", &env_sharpen, NULL, 1},
     {"BL_SKIN_DETAIL", "SkinDetail", &env_skin_detail, NULL, 1},
+    {"BL_COMPASS", "QuestCompass", &env_compass, NULL, 1},  // a box on the Gameplay tab, not Enhanced
 };
 static int effects_loaded;
 void bl_vgui_poll(void);
@@ -320,6 +381,67 @@ void bl_effect_set(int effect, int on)
     bl_reg_set_dword(EFFECT_KEY, effects[effect].value, on != 0);
     *effects[effect].on = on != 0;
     if (!on && effects[effect].show) *effects[effect].show = 0;
+}
+
+static int upscaler_pick(const char *env, const char *const *names, int n, int def)
+{
+    const char *v = getenv(env);
+    if (!v) return def;
+    for (int i = 0; i < n; i++)
+        if (!strcmp(v, names[i])) return i;
+    bl_fatal("%s=%s is not one of the choices", env, v);
+}
+
+static void upscaler_settings(void)
+{
+    static int loaded;
+    if (loaded) return;
+    loaded = 1;
+    upscaler = upscaler_pick("BL_UPSCALER", upscaler_names, 2,
+                             (int)bl_reg_get_dword(EFFECT_KEY, UPSCALER_KEY_VALUE, UPSCALER_METALFX) % 2);
+    upscaler_quality = upscaler_pick("BL_UPSCALER_QUALITY", quality_names, 5,
+                                     (int)bl_reg_get_dword(EFFECT_KEY, QUALITY_KEY_VALUE, 0) % 5);
+    world_res = quality_res[upscaler_quality];
+}
+
+// For bl_vgui.c: `which` 0 the upscaler (0 MetalFX, 1 FSR 4), 1 the quality (0 native ..
+// 4 ultra performance).
+int bl_upscaler_get(int which)
+{
+    upscaler_settings();
+    return which ? upscaler_quality : upscaler;
+}
+
+// Returns 0 when the choice is refused: FSR 4 that can't load here, or a window bigger
+// than it can make. Nothing is saved then, so a bad pick can't stop every later start.
+int bl_upscaler_set(int which, int value)
+{
+    upscaler_settings();
+    if (which) {
+        if (value < 0 || value > 4) return 0;
+        quality_next = value;
+        bl_reg_set_dword(EFFECT_KEY, QUALITY_KEY_VALUE, (uint32_t)value);
+    } else {
+        if (value < 0 || value > 1) return 0;
+        if (value == UPSCALER_FSR4) {
+            char why[1400] = "";
+            CGSize size = layer.drawableSize;
+            if (size.width > FSR4_MAX_W || size.height > FSR4_MAX_H)
+                snprintf(why, sizeof why, "the window is %.0fx%.0f, more than the %dx%d it can make", size.width,
+                         size.height, FSR4_MAX_W, FSR4_MAX_H);
+            else
+                fsr4_try(why, sizeof why);
+            if (why[0]) {
+                fprintf(stderr, "[metal] upscaling: FSR 4 not chosen: %s\n", why);
+                return 0;
+            }
+        }
+        upscaler_next = value;
+        bl_reg_set_dword(EFFECT_KEY, UPSCALER_KEY_VALUE, (uint32_t)value);
+    }
+    fprintf(stderr, "[metal] upscaling: %s, %s\n", (upscaler_next >= 0 ? upscaler_next : upscaler) ? "FSR 4" : "MetalFX",
+            quality_names[quality_next >= 0 ? quality_next : upscaler_quality]);
+    return 1;
 }
 
 #define LOG_ONCE(...) do { static int once_; if (!once_++) fprintf(stderr, __VA_ARGS__); } while (0)
@@ -703,8 +825,46 @@ static id<MTLTexture> texture_of(struct obj *tex)
     return tex->hires ? (__bridge id<MTLTexture>)tex->hires : t;
 }
 
-// Render target surfaces: their own texture, or a level of the texture they belong to.
+// The world view's size for a back buffer `full`: world_res of the resolution, the whole
+// of `full` if that is not smaller. Returns 1 if smaller.
+static int world_size(id<MTLTexture> full, NSUInteger *w, NSUInteger *h)
+{
+    uint32_t vw = view_w ? view_w : resized_w, vh = view_h ? view_h : resized_h;
+    *w = (NSUInteger)lround(vw * world_res), *h = (NSUInteger)lround(vh * world_res);
+    if (vw && vh && *w < full.width && *h < full.height && *w && *h) return 1;
+    *w = full.width, *h = full.height;
+    return 0;
+}
+
+// The world view's own smaller texture standing for the back buffer or its depth buffer
+// (`full`) while it is drawn (world_low).
+static id<MTLTexture> world_texture(struct obj *o, id<MTLTexture> full)
+{
+    id<MTLTexture> __strong *t = o == world_bb ? &world_color : &world_depth;
+    NSUInteger w, h;
+    world_size(full, &w, &h);
+    if (!*t || (*t).width != w || (*t).height != h || (*t).pixelFormat != full.pixelFormat) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:full.pixelFormat width:w
+                                                                                     height:h mipmapped:NO];
+        td.usage = full.usage;
+        td.storageMode = MTLStorageModePrivate;
+        *t = [mtl newTextureWithDescriptor:td];
+        (*t).label = o == world_bb ? @"world view" : @"world view depth";
+        fprintf(stderr, "[metal] upscaling: the world view at %lux%lu, the window %lux%lu\n", (unsigned long)w,
+                 (unsigned long)h, (unsigned long)full.width, (unsigned long)full.height);
+    }
+    return *t;
+}
+
+// Render target surfaces: their own texture, or a level of the texture they belong to;
+// the back buffer and its depth buffer the world view's smaller ones while it is drawn.
 static id<MTLTexture> target_texture(struct obj *o)
+{
+    id<MTLTexture> t = target_full(o);
+    return world_low && (o == world_bb || o == world_ds) ? world_texture(o, t) : t;
+}
+
+static id<MTLTexture> target_full(struct obj *o)
 {
     if (o->gpu) return (__bridge id<MTLTexture>)o->gpu;
     id<MTLTexture> t;
@@ -728,9 +888,10 @@ static id<MTLTexture> target_texture(struct obj *o)
         MTLPixelFormat pf = target_format(o->format);
         if (deep_color && pf == MTLPixelFormatBGRA8Unorm && owner && owner->type == OBJ_DEVICE)
             pf = MTLPixelFormatRGBA16Float;
-        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
-                                                                                     width:o->width * obj_scale(o)
-                                                                                    height:o->height * obj_scale(o)
+        NSUInteger w = o->width * obj_scale(o), h = o->height * obj_scale(o);
+        if (out_w && owner && owner->type == OBJ_DEVICE && o->width == resized_w && o->height == resized_h)
+            w = out_w, h = out_h;  // drawn at the window's pixels
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h
                                                                                  mipmapped:NO];
         d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         d.storageMode = MTLStorageModePrivate;
@@ -1364,8 +1525,9 @@ static void ensure_device(void)
     env_widescreen = !(getenv("BL_WIDESCREEN") && !strcmp(getenv("BL_WIDESCREEN"), "stretch"));
     effect_settings();
     env_ao_radius = getenv("BL_AO_RADIUS") ? (float)atof(getenv("BL_AO_RADIUS")) : 32;
-    env_ao_strength = getenv("BL_AO_STRENGTH") ? (float)atof(getenv("BL_AO_STRENGTH")) : 0.6f;
+    env_ao_strength = getenv("BL_AO_STRENGTH") ? (float)atof(getenv("BL_AO_STRENGTH")) : 1;
     env_ao_thickness = getenv("BL_AO_THICKNESS") ? (float)atof(getenv("BL_AO_THICKNESS")) : 16;
+    env_ao_power = getenv("BL_AO_POWER") ? (float)atof(getenv("BL_AO_POWER")) : 2.2f;
     env_pbr = getenv("BL_PBR") ? atoi(getenv("BL_PBR")) != 0 : 1;
     env_pbr_spec = getenv("BL_PBR_SPEC") ? (float)atof(getenv("BL_PBR_SPEC")) : 1.5f;
     env_pbr_bump = getenv("BL_PBR_BUMP") ? (float)atof(getenv("BL_PBR_BUMP")) : 1;
@@ -1420,6 +1582,7 @@ static void ensure_device(void)
     if (getenv("BL_HAIR_MESH")) env_hair_mesh = atoi(getenv("BL_HAIR_MESH"));
     if (env_tess > 16) env_tess = 16;
     env_upscale_off = getenv("BL_UPSCALE") && !strcmp(getenv("BL_UPSCALE"), "0");
+    upscaler_settings();
     env_remodel_off = getenv("BL_REMODEL") && !strcmp(getenv("BL_REMODEL"), "0");
     env_sss_eyes = !(getenv("BL_SSS_EYES") && !strcmp(getenv("BL_SSS_EYES"), "0"));
     env_tonemap_expand = getenv("BL_TONEMAP_EXPAND") ? (float)atof(getenv("BL_TONEMAP_EXPAND")) : 0.8f;
@@ -1636,6 +1799,12 @@ static BLRender *pass(struct d3d_state *s)
     }
     if (depth) {
         id<MTLTexture> t = target_texture(depth);
+        // The world view's smaller depth buffer goes with its smaller picture only: another
+        // target drawn with the depth buffer meanwhile gets the window-sized one.
+        if (world_low && depth == world_ds && color != world_bb) t = target_full(depth);
+        if (world_low && color == world_bb && depth != world_ds)
+            bl_fatal("upscaling: the world view is drawn with a depth buffer of its own (%ux%u)", depth->width,
+                     depth->height);
         d.depthAttachment.texture = t;
         d.stencilAttachment.texture = t;
         d.depthAttachment.storeAction = d.stencilAttachment.storeAction = MTLStoreActionStore;
@@ -1691,22 +1860,16 @@ static BLRender *pass(struct d3d_state *s)
     }
     enc = stat_render(d, __func__);
     enc_color = color, enc_depth = depth, enc_info = info, enc_albedo = albedo, enc_surface = surface;
-    int world_end = (post_result || ao_result || contact_result) && color && color == s->back_buffer;
+    int world_end = (post_result || ao_result || contact_result || pshadow_result) && color && color == s->back_buffer;
     if (post_result && color && color == s->back_buffer) post_apply(enc, target_texture(color), depth != NULL);
     if (ao_result && color && color == s->back_buffer) ao_apply(enc, target_texture(color), depth != NULL);
     if (contact_result && color && color == s->back_buffer)
         contact_apply(enc, target_texture(color), depth != NULL);
-    if (taa_pending && color && color == s->back_buffer) {
-        // The world view with its effects drawn in, before the view model and HUD:
-        // through the temporal scaler and back.
-        [enc endEncoding];
-        taa_resolve(target_texture(color));
-        taa_pending = 0;
-        d.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        d.depthAttachment.loadAction = d.stencilAttachment.loadAction = MTLLoadActionLoad;
-        if (info) d.colorAttachments[1].loadAction = MTLLoadActionLoad;
-        enc = stat_render(d, __func__);
-    }
+    if (pshadow_result && color && color == s->back_buffer)
+        pshadow_apply(enc, target_texture(color), depth != NULL);
+    // The world view with its effects drawn in, before the view model and HUD: through
+    // the temporal scaler (and up to the window's size when upscaling).
+    if ((taa_pending || world_low) && view_state == 2 && color && color == s->back_buffer) world_up(s, d);
     if (world_end) {
         // A copy of the finished world view, before the view model and HUD: what the
         // pause menu shows behind it.
@@ -1753,6 +1916,8 @@ void d3d_render_free(struct obj *o)
     if (o->hires) CFRelease(o->hires), o->hires = NULL;
     if (o->pbr) CFRelease(o->pbr), o->pbr = NULL;
     if (o->pom) CFRelease(o->pom), o->pom = NULL;
+    if (o == world_bb) world_bb = NULL, world_low = 0;
+    if (o == world_ds) world_ds = NULL, world_low = 0;
     if (!o->gpu) return;
     id t = (__bridge_transfer id)o->gpu;  // released when t goes out of scope
     (void)t;
@@ -1770,6 +1935,24 @@ static int full_screen(void)
 {
     const char *f = getenv("BL_FULLSCREEN");
     return f && *f ? f[0] != '0' : !game_windowed;
+}
+
+// Display Mode, the Video tab's (bl_vgui.c): 0 windowed, 1 borderless, 2 full screen
+// (bl_cocoa_set_display_mode), saved in the registry. Until the player picks one: full
+// screen or a window as above.
+#define DISPLAY_KEY_VALUE "DisplayMode"
+int bl_display_mode_get(void)
+{
+    uint32_t v = bl_reg_get_dword(EFFECT_KEY, DISPLAY_KEY_VALUE, 3);
+    return v <= 2 ? (int)v : full_screen() ? 2 : 0;
+}
+
+void bl_display_mode_set(int mode)
+{
+    if (mode < 0 || mode > 2) return;
+    bl_reg_set_dword(EFFECT_KEY, DISPLAY_KEY_VALUE, (uint32_t)mode);
+    if (layer) bl_cocoa_set_display_mode(mode);
+    fprintf(stderr, "[metal] display mode: %s\n", mode == 2 ? "full screen" : mode ? "borderless" : "windowed");
 }
 
 static uint32_t game_window;
@@ -1817,7 +2000,7 @@ void d3d_render_init(uint32_t window)
             layer_format();
             layer.framebufferOnly = NO;
             layer.drawableSize = CGSizeMake(w, h);
-            bl_cocoa_set_fullscreen(full_screen());
+            bl_cocoa_set_display_mode(bl_display_mode_get());
         }
     }
 }
@@ -1827,17 +2010,80 @@ void d3d_render_windowed(int windowed)
     // Only a change of the game's setting moves the window; Cmd+Ctrl+F in between stays.
     if (windowed == game_windowed) return;
     game_windowed = windowed;
-    if (layer) bl_cocoa_set_fullscreen(full_screen());
+    if (layer) bl_cocoa_set_display_mode(bl_display_mode_get());
 }
 
 void d3d_render_resize(uint32_t width, uint32_t height)
 {
     ensure_device();
+    if (width != resized_w || height != resized_h)  // the game's own size changed
+        out_w = out_h = view_w = view_h = view_next_w = view_next_h = 0;
     resized_w = width, resized_h = height;
     if (layer) {
-        layer.drawableSize = CGSizeMake(width, height);
+        layer.drawableSize = CGSizeMake(out_w ? out_w : width, out_h ? out_h : height);
         bl_cocoa_set_content_size(width, height);
     }
+}
+
+// The Video tab's Apply with a new resolution (bl_vgui.c): 1 if it is drawn live from the
+// next frame, 0 if it needs the game started again. Live are the sizes of the game's
+// shape (within 1%): the world view is drawn at it (world_size); the game keeps its own
+// size, which its menus and HUD are laid out for. The game saves the size, so the next
+// start is at it.
+int bl_render_live_mode(uint32_t width, uint32_t height)
+{
+    if (!resized_w || !resized_h || !width || !height || width > 16384 || height > 16384) return 0;
+    uint32_t cw, ch;
+    bl_render_output_size(&cw, &ch);
+    if (width == cw && height == ch) return 0;
+    if (fabs((double)width * resized_h - (double)height * resized_w) > 0.01 * (double)height * resized_w) return 0;
+    view_next_w = width, view_next_h = height;
+    return 1;
+}
+
+// The resolution the world view is drawn at now (or from the next frame), for bl_vgui.c.
+void bl_render_output_size(uint32_t *width, uint32_t *height)
+{
+    *width = view_next_w ? view_next_w : view_w ? view_w : resized_w;
+    *height = view_next_h ? view_next_h : view_h ? view_h : resized_h;
+}
+
+// From present: the back buffer to the window's pixels (the picture's part of it, at the
+// game's shape), no bigger than FSR 4 can make, from the next frame.
+static void out_follow_window(void)
+{
+    uint32_t pw, ph;
+    if (!layer || !resized_w || !resized_h || !bl_cocoa_image_pixels(&pw, &ph)) return;
+    double k = fmin(fmin((double)pw / resized_w, (double)ph / resized_h),
+                    fmin((double)FSR4_MAX_W / resized_w, (double)FSR4_MAX_H / resized_h));
+    uint32_t w = (uint32_t)floor(resized_w * k), h = (uint32_t)floor(resized_h * k);
+    if (w < 1 || h < 1) return;
+    if (w == resized_w && h == resized_h) w = h = 0;
+    if (w != out_w || h != out_h) out_next_w = w ? w : resized_w, out_next_h = h ? h : resized_h;
+}
+
+// Between frames: a resolution from the Video tab, and the device's surfaces at the
+// window's new size (made again by target_full).
+static void out_apply(struct d3d_state *s)
+{
+    if (view_next_w) {
+        int native = view_next_w == resized_w && view_next_h == resized_h;
+        view_w = native ? 0 : view_next_w, view_h = native ? 0 : view_next_h;
+        fprintf(stderr, "[metal] resolution: %ux%u, drawn live (the game's own %ux%u)\n", view_next_w, view_next_h,
+                resized_w, resized_h);
+        view_next_w = view_next_h = 0;
+    }
+    out_follow_window();
+    if (!out_next_w) return;
+    int native = out_next_w == resized_w && out_next_h == resized_h;
+    out_w = native ? 0 : out_next_w, out_h = native ? 0 : out_next_h;
+    out_next_w = out_next_h = 0;
+    end_pass();
+    if (s->back_buffer) d3d_render_free(s->back_buffer);
+    if (s->auto_depth) d3d_render_free(s->auto_depth);
+    uint32_t w = out_w ? out_w : resized_w, h = out_h ? out_h : resized_h;
+    layer.drawableSize = CGSizeMake(w, h);
+    fprintf(stderr, "[metal] menus and HUD drawn at the window's %ux%u (the game's own %ux%u)\n", w, h, resized_w, resized_h);
 }
 
 // Viewport and scissor for the bound target.
@@ -1863,11 +2109,14 @@ static void set_viewport(struct d3d_state *s, BLRender *e, uint32_t tw, uint32_t
         if (r[2] < x1) x1 = r[2];
         if (r[3] < y1) y1 = r[3];
     }
-    int sc = obj_scale(s->render_target[0]);
-    if (sc > 1) {  // the shadow atlas, drawn larger than the game made it
-        [e setViewport:(MTLViewport){(double)vp[0] * sc, (double)vp[1] * sc, (double)vp[2] * sc, (double)vp[3] * sc,
-                                     u2f(vp[4]), u2f(vp[5])}];
-        x0 *= sc, y0 *= sc, x1 *= sc, y1 *= sc;
+    // A target drawn at another size than the game made it (the shadow atlas larger, the
+    // world view smaller when upscaling): the game's pixels taken to the texture's.
+    const struct obj *rt = s->render_target[0];
+    double sx = rt && rt->width ? (double)tw / rt->width : 1, sy = rt && rt->height ? (double)th / rt->height : 1;
+    if (sx != 1 || sy != 1) {
+        [e setViewport:(MTLViewport){vp[0] * sx, vp[1] * sy, vp[2] * sx, vp[3] * sy, u2f(vp[4]), u2f(vp[5])}];
+        x0 = (int32_t)lround(x0 * sx), y0 = (int32_t)lround(y0 * sy), x1 = (int32_t)lround(x1 * sx),
+        y1 = (int32_t)lround(y1 * sy);
     }
     if (squeeze < 1) x0 = (int32_t)floor(SQUEEZE(x0)), x1 = (int32_t)ceil(SQUEEZE(x1));
 #undef SQUEEZE
@@ -1960,8 +2209,9 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
             if (r[2] < x1) x1 = r[2];
             if (r[3] < y1) y1 = r[3];
         }
-        int sc = obj_scale(rt);
-        x0 *= sc, y0 *= sc, x1 *= sc, y1 *= sc;
+        double sx = (double)t.width / rt->width, sy = (double)t.height / rt->height;  // as set_viewport
+        x0 = (int32_t)lround(x0 * sx), y0 = (int32_t)lround(y0 * sy), x1 = (int32_t)lround(x1 * sx),
+        y1 = (int32_t)lround(y1 * sy);
         if (x0 < 0) x0 = 0;
         if (y0 < 0) y0 = 0;
         if (x1 > (int32_t)t.width) x1 = (int32_t)t.width;
@@ -2120,7 +2370,9 @@ static void stretch_draw(id<MTLTexture> a, const uint32_t sr[4], id<MTLTexture> 
 //    yet keep the game's own lookup.
 static int env_shadow_res = 4, env_pcss = 1, env_pcss_show, env_contact = 1, env_contact_show;
 static float env_pcss_soft = 0.03f, env_pcss_max = 4, env_pcss_search = 3;
-static float env_contact_length = 12, env_contact_strength = 0.5f;
+static float env_contact_strength = 0.5f;
+static int env_pshadow = 1, env_pshadow_show, env_pshadow_res = 512;
+static float env_pshadow_strength = 0.5f, env_pshadow_near = 12, env_pshadow_soft = 6;
 static struct d3d_shadow_cell shadow_cells[64];
 static float shadow_rows[64][2][4];  // the x and y rows of each cell's caster (skin_through)
 
@@ -2154,9 +2406,17 @@ static void shadow_settings(void)
     if (getenv("BL_PCSS_SEARCH")) env_pcss_search = (float)atof(getenv("BL_PCSS_SEARCH"));
     const char *c = getenv("BL_CONTACT");
     if (c) env_contact = atoi(c) != 0 || !strcmp(c, "show"), env_contact_show = !strcmp(c, "show");
-    if (getenv("BL_CONTACT_LENGTH")) env_contact_length = (float)atof(getenv("BL_CONTACT_LENGTH"));
     if (getenv("BL_CONTACT_STRENGTH")) env_contact_strength = (float)atof(getenv("BL_CONTACT_STRENGTH"));
     env_contact_strength = env_contact_strength < 0 ? 0 : env_contact_strength > 1 ? 1 : env_contact_strength;
+    const char *o = getenv("BL_PROP_SHADOWS");
+    if (o) env_pshadow = atoi(o) != 0 || !strcmp(o, "show"), env_pshadow_show = !strcmp(o, "show");
+    if (getenv("BL_PROP_SHADOWS_STRENGTH")) env_pshadow_strength = (float)atof(getenv("BL_PROP_SHADOWS_STRENGTH"));
+    env_pshadow_strength = env_pshadow_strength < 0 ? 0 : env_pshadow_strength > 1 ? 1 : env_pshadow_strength;
+    if (getenv("BL_PROP_SHADOWS_RES")) env_pshadow_res = atoi(getenv("BL_PROP_SHADOWS_RES"));
+    env_pshadow_res = env_pshadow_res < 64 ? 64 : env_pshadow_res > 2048 ? 2048 : env_pshadow_res;
+    if (getenv("BL_PROP_SHADOWS_NEAR")) env_pshadow_near = (float)atof(getenv("BL_PROP_SHADOWS_NEAR"));
+    if (getenv("BL_PROP_SHADOWS_SOFT")) env_pshadow_soft = (float)atof(getenv("BL_PROP_SHADOWS_SOFT"));
+    env_pshadow_soft = env_pshadow_soft < 0 ? 0 : env_pshadow_soft;
 }
 
 static int pcss_on(void) { return env_shadows && env_pcss && shadow_atlas; }
@@ -2323,9 +2583,11 @@ static int draw_reads_atlas(const struct d3d_state *s)
 // blended with last frame's (ao_history) before the upsample, which weights the four
 // half-resolution pixels around by how close their depth is (ao_up). Pixels bright in the
 // image (lamps, neon, lit signs) are left undarkened (ao_apply).
+// As XeGTAO, the result is raised to a power before it is applied, which darkens corners
+// and creases to what the eye expects.
 // BL_AO=1 turns it on, BL_AO=show shows the occlusion alone; BL_AO_RADIUS
-// (world units, default 32), BL_AO_THICKNESS (world units, default 16) and BL_AO_STRENGTH
-// (default 0.6) tune it.
+// (world units, default 32), BL_AO_THICKNESS (world units, default 16), BL_AO_POWER
+// (default 2.2) and BL_AO_STRENGTH (default 1) tune it.
 
 struct ao_params {
     float full[2], half[2];  // back buffer and half-resolution sizes
@@ -2337,7 +2599,8 @@ struct ao_params {
     float mip_offset;        // steps longer than 2^this half-resolution pixels read the smaller depth copies
     float frame;             // under TAA the frame number (the sample pattern turns with it), else 0
     float glow;              // 1: leave bright pixels (lamps, neon) undarkened as they get bright
-    float slices, pad;       // the occlusion's slices: fewer under TAA
+    float slices;            // the occlusion's slices: fewer under TAA
+    float power;             // the occlusion raised to this before it is applied (XeGTAO's final power)
     // The bounced light gathered along (ao_main_il, ssil_run): its strength (0 none), how
     // far it reaches (world units, and at most this many half-resolution pixels), the
     // picture's mipmap levels, and its fade with distance: saturate(depth * mul + add).
@@ -2348,7 +2611,7 @@ static NSString *const ao_source =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
      "struct AOP { float2 full, hsize; float alpha, beta, p00, p11, radius, inv_radius2, max_px, strength, thickness, mip_offset,\n"
-     "             frame, glow, slices, pad, il, il_radius, il_max_px, il_level, fade_mul, fade_add; };\n"
+     "             frame, glow, slices, power, il, il_radius, il_max_px, il_level, fade_mul, fade_add; };\n"
      "struct V { float4 pos [[position]]; };\n"
      "vertex V ao_vs(uint id [[vertex_id]]) {\n"
      "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
@@ -2569,11 +2832,11 @@ static NSString *const ao_source =
      // up to 1) are left as they are: lamps, neon and lit signs give off their own light.
      "fragment float4 ao_apply(V in [[stage_in]], float4 dst [[color(0)]], texture2d<float> ao [[texture(0)]],\n"
      "                         constant AOP &a [[buffer(0)]]) {\n"
-     "    float o = mix(1.0, ao.read(uint2(in.pos.xy)).x, a.strength);\n"
+     "    float o = mix(1.0, pow(ao.read(uint2(in.pos.xy)).x, a.power), a.strength);\n"
      "    o = mix(o, 1.0, a.glow * smoothstep(0.7, 1.0, max(dst.r, max(dst.g, dst.b))));\n"
      "    return float4(dst.rgb * o, dst.a); }\n"
      "fragment float4 ao_show(V in [[stage_in]], texture2d<float> ao [[texture(0)]], constant AOP &a [[buffer(0)]]) {\n"
-     "    float o = mix(1.0, ao.read(uint2(in.pos.xy)).x, a.strength);\n"
+     "    float o = mix(1.0, pow(ao.read(uint2(in.pos.xy)).x, a.power), a.strength);\n"
      "    return float4(o, o, o, 1.0); }\n";
 
 // kind 0: view depth (from the depth buffer); 1: occlusion (ao_occlusion);
@@ -2659,14 +2922,14 @@ static void note_projection(const float r8[4], const float r9[4], const float r1
 // world view).
 static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h)
 {
-    static id<MTLTexture> t[25];
+    static id<MTLTexture> t[28];
     if (!t[i] || t[i].width != w || t[i].height != h || t[i].pixelFormat != pf) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h
                                                                                  mipmapped:NO];
-        // The traces' kernels write 1, 9 and 15 (post_traces); writable textures may not be
-        // kept compressed, so only those.
+        // The traces' kernels write 1, 9, 15 and 25 (post_traces); writable textures may not
+        // be kept compressed, so only those.
         td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
-                   (i == 1 || i == 9 || i == 15 ? MTLTextureUsageShaderWrite : 0);
+                   (i == 1 || i == 9 || i == 15 || i == 25 ? MTLTextureUsageShaderWrite : 0);
         td.storageMode = MTLStorageModePrivate;
         t[i] = [mtl newTextureWithDescriptor:td];
     }
@@ -2928,7 +3191,7 @@ static NSString *const ssr_source =
      // (toe, linear section, exponential shoulder); the result's intensity in ICtCp is kept,
      // with the original chroma faded out towards white, and the two are blended 40:60.
      "static float gt7_smooth(float x, float e0, float e1) { float t = saturate((x - e0) / (e1 - e0)); return t * t * (3.0 - 2.0 * t); }\n"
-     "constant float GT7_PEAK = 2.5, GT7_ALPHA = 0.25, GT7_MID = 0.538, GT7_LIN = 0.444, GT7_TOE = 1.28;\n"
+     "constant float GT7_PEAK = 2.5, GT7_ALPHA = 0.25, GT7_MID = 0.2, GT7_LIN = 0.444, GT7_TOE = 1.28;\n"
      "static float gt7_curve(float x, float P) {\n"
      "    if (x < 0.0) return 0.0;\n"
      "    float k = (GT7_LIN - 1.0) / (GT7_ALPHA - 1.0);\n"
@@ -2971,23 +3234,26 @@ static NSString *const ssr_source =
      "               dot(o, float3(-0.0182, -0.1006, 1.1187)));\n"
      "    o = saturate(o);\n"
      "    return select(1.055 * pow(o, 1.0 / 2.4) - 0.055, o * 12.92, o <= 0.0031308); }\n"
-     // HDR: GT7's whole tone map (as gt7 above: the toe, the curve on each channel, the
-     // chroma kept in ICtCp) at the screen's peak, GT7_PEAK times the headroom H. First the
-     // highlights the game rolled off into white are turned back into the light they would
-     // have been, as HDR mods for old games do (RenoDX): the game's colours taken as GT7's
-     // normal-screen output and its shoulder inverted (by the brightest channel, so hues
-     // stay). Game white comes out about 1.45 times white with a headroom of 2.67, and the
-     // toe deepens the darks. Values past white kept (not saturated) for the EDR screen.
+     // HDR: GT7's tone map at the screen's headroom H, as Polyphony publish it except for
+     // the toe's reach, on the game's light with white at GT7's paper white (GT7_PEAK, 250
+     // nits): the toe deepens only the darkest shades (below GT7_MID, 0.2 in place of GT7's
+     // 0.538, since Bloodlines' dark rooms were made without a toe and its full reach hid
+     // them), straight on to 0.444 of the peak (GT7_PEAK times
+     // H), and the shoulder rolls the rest off into the peak; the ICtCp result weighs 0.6
+     // against the per-channel curve. The light past white comes from the lightmaps, which
+     // keep the map's own (the rebake section). The game's purest colours (neon, coloured
+     // lamps) are taken towards the screen's wider range (P3), the more the purer they are,
+     // so greys and skin stay as drawn; the result is kept within P3, outside sRGB as
+     // negative values, which the extended-range screen shows. Values past white kept too.
      "static float3 gt7_full(float3 srgb, float H) {\n"
      "    float3 s = max(srgb, 0.0), lin = select(pow((s + 0.055) / 1.055, 2.4), s / 12.92, s <= 0.04045);\n"
-     "    float P = GT7_PEAK, Ph = GT7_PEAK * H, y = max(max(lin.r, lin.g), lin.b) * P;\n"
-     "    if (y > GT7_LIN * P) {\n"
-     "        float k = (GT7_LIN - 1.0) / (GT7_ALPHA - 1.0);\n"
-     "        float ka = P * (GT7_LIN + k), kb = -P * k * exp(GT7_LIN / k), kc = -1.0 / (k * P);\n"
-     "        lin *= (y < P ? log((y - ka) / kb) / kc : log((P - ka) / kb) / kc * y / P) / y;\n"
-     "    }\n"
+     "    float P = GT7_PEAK, Ph = GT7_PEAK * H;\n"
      "    float3 c = float3(dot(lin, float3(0.6274, 0.3293, 0.0433)), dot(lin, float3(0.0691, 0.9195, 0.0114)),\n"
-     "                      dot(lin, float3(0.0164, 0.0880, 0.8956))) * P;\n"
+     "                      dot(lin, float3(0.0164, 0.0880, 0.8956)));\n"
+     "    float3 w = float3(dot(lin, float3(0.7538, 0.1986, 0.0476)), dot(lin, float3(0.0457, 0.9418, 0.0125)),\n"
+     "                      dot(lin, float3(-0.0012, 0.0176, 0.9836)));\n"
+     "    float hi = max(max(lin.r, lin.g), lin.b), sat = hi > 1e-5 ? 1.0 - min(min(lin.r, lin.g), lin.b) / hi : 0.0;\n"
+     "    c = mix(c, w, sat * sat) * P;\n"
      "    float3 ucs = to_ictcp(c);\n"
      "    float3 skew = float3(gt7_curve(c.r, Ph), gt7_curve(c.g, Ph), gt7_curve(c.b, Ph));\n"
      "    float3 su = to_ictcp(skew);\n"
@@ -2995,9 +3261,12 @@ static NSString *const ssr_source =
      "    float chroma = 1.0 - gt7_smooth(ucs.x, 0.98 * target, 1.16 * target);\n"
      "    float3 scaled = from_ictcp(float3(su.x, ucs.y * chroma, ucs.z * chroma));\n"
      "    float3 o = min(mix(skew, scaled, 0.6), Ph) / P;\n"
-     "    o = max(float3(dot(o, float3(1.6605, -0.5876, -0.0728)), dot(o, float3(-0.1246, 1.1329, -0.0083)),\n"
-     "                   dot(o, float3(-0.0182, -0.1006, 1.1187))), 0.0);\n"
-     "    return select(1.055 * pow(o, 1.0 / 2.4) - 0.055, o * 12.92, o <= 0.0031308); }\n"
+     "    o = max(float3(dot(o, float3(1.3436, -0.2822, -0.0614)), dot(o, float3(-0.0653, 1.0758, -0.0105)),\n"
+     "                   dot(o, float3(0.0028, -0.0196, 1.0168))), 0.0);\n"
+     "    o = float3(dot(o, float3(1.2249, -0.2249, 0.0)), dot(o, float3(-0.0421, 1.0421, 0.0)),\n"
+     "               dot(o, float3(-0.0196, -0.0786, 1.0983)));\n"
+     "    float3 a = abs(o);\n"
+     "    return sign(o) * select(1.055 * pow(a, 1.0 / 2.4) - 0.055, a * 12.92, a <= 0.0031308); }\n"
      // Khronos PBR Neutral (the reference version), on linear sRGB.
      "static float3 pbr_neutral(float3 srgb, float mode, float expand) {\n"
      "    float3 c = select(pow((srgb + 0.055) / 1.055, 2.4), srgb / 12.92, srgb <= 0.04045);\n"
@@ -3016,13 +3285,14 @@ static NSString *const ssr_source =
      "    return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308); }\n"
      // HDR output: the picture in linear light, 1 at normal white (the sRGB curve carried on
      // past 1). post_apply's tone map (gt7_full) took the world view's highlights past white
-     // up to the peak (hdr_peak); the HUD and view model stay within white. `preview` writes the
+     // up to the peak (hdr_peak), and its colours outside sRGB as negative values, for the
+     // screen's wider range; the HUD and view model stay within white. `preview` writes the
      // result divided by the headroom, in sRGB, for dumps.
      "struct HP { float headroom, preview, pad0, pad1; };\n"
      "fragment float4 hdr_present(V in [[stage_in]], texture2d<float> pic [[texture(0)]], constant HP &h [[buffer(0)]]) {\n"
-     "    float3 c = max(pic.read(uint2(in.pos.xy)).rgb, 0.0);\n"
+     "    float3 c = pic.read(uint2(in.pos.xy)).rgb, a = abs(c);\n"
      "    float H = h.headroom;\n"
-     "    float3 o = min(select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045), H);\n"
+     "    float3 o = clamp(sign(c) * select(pow((a + 0.055) / 1.055, 2.4), a / 12.92, a <= 0.04045), -1.0, H);\n"
      "    if (h.preview > 0.0) {\n"
      "        o = saturate(o / H);\n"
      "        return float4(select(1.055 * pow(o, 1.0 / 2.4) - 0.055, o * 12.92, o <= 0.0031308), 1.0);\n"
@@ -3100,7 +3370,8 @@ static NSString *const ssr_source =
      "    if (a.tonemap > 2.5) col = pbr_neutral(saturate(col), a.tonemap, a.expand);\n"
      "    else if (a.tonemap > 0.0) col = gt7(saturate(col), a.tonemap, a.expand);\n"
      "    if (a.exposure > 1.5 && p.y < 12) col = float(p.x) < a.full.x * eye[0] * 0.5 ? float3(1.0, 0.8, 0.0) : float3(0.1);\n"
-     "    return float4(clamp(col, 0.0, a.peak), c.a); }\n";
+     // With HDR the colours outside sRGB stay (negative; gt7_full).
+     "    return float4(clamp(col, a.peak > 1.001 ? -1.0 : 0.0, a.peak), c.a); }\n";
 
 // kind 0: trace (a second target for the ray's length and Fresnel factor); 1: filter;
 // 2: post_apply, in the game's pass with its depth attachment (`depth`); 4: the blend
@@ -3617,7 +3888,8 @@ static void fx_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTe
 #define CHAR_LIGHTS 64
 static struct fog_light frame_lights[FOG_LIGHTS], char_lights[CHAR_LIGHTS];
 static int frame_nlights, frame_nchar;
-static float frame_cam[3];
+static float frame_cam[3], frame_wpos[CHAR_LIGHTS][3];  // frame_wpos: char_lights' in world space
+static float frame_wvis[CHAR_LIGHTS];                     // and how much the camera sees each (bl_light vis)
 static int view_lights(void)
 {
     static unsigned long done = ~0ul;
@@ -3642,6 +3914,8 @@ static int view_lights(void)
         }
         fl[i].pos[3] = l[i].radius, fl[i].color[3] = l[i].inner, fl[i].dir[3] = l[i].outer, fl[i].att[3] = l[i].exponent;
         char_lights[i] = fl[i];
+        memcpy(frame_wpos[i], l[i].pos, sizeof frame_wpos[i]);
+        frame_wvis[i] = l[i].vis;
         for (int r = 0; r < 3; r++) char_lights[i].color[r] = l[i].color[r] * l[i].seen;
         if (i < FOG_LIGHTS) frame_lights[i] = fl[i];
     }
@@ -3740,178 +4014,353 @@ static void skin_run(id<MTLTexture> color, id<MTLTexture> z, NSUInteger hw, NSUI
 // --- contact shadows -----------------------------------------------------------------------
 //
 // Part of BL_SHADOWS (BL_CONTACT, default on): the small, sharp shadows where a character
-// touches a surface or itself, which the atlas is too coarse for. At half resolution
-// after the ambient occlusion's view depth: from each pixel, 16 steps towards the light
-// that gives it the most and 8 towards the next (view_lights; each weighted by its share of
-// all of them, the second only when it gives a sixth or more), up to BL_CONTACT_LENGTH
-// world units; the first step behind something drawn, at most that far
-// behind, is in shadow, fading with the step's distance. Only characters (marked in the
-// reflection info, d3d_shader_variant skin) and props (marked in the surfaces' colour,
-// d3d_shader_variant albedo 2: bottles on a bar, chairs on a floor) cast them onto
-// anything but themselves for props (each tagged, so a carved panel does not shade its own
-// relief all over); characters also take them from anything. The map's own shadows on itself are
-// baked into its lightmaps already. The result is filtered like the occlusion and
-// multiplied in at full resolution (contact_apply); BL_CONTACT_STRENGTH (0..1, default 0.5)
-// is the most it darkens, BL_CONTACT=show shows it alone.
+// or a prop touches a surface or itself, which the atlas and the object shadows are too
+// coarse for. Bend Studio's screen-space shadows (Days Gone; bend_sss_gpu.h, Apache 2.0,
+// Sony Interactive Entertainment 2023), at half resolution on the ambient occlusion's view
+// depth: for each of the SSS_LIGHTS lights brightest at the camera (view_lights'
+// char_lights), wavefronts of 64 pixels run along the screen's lines towards the light's
+// point on the screen, share their depths, and each pixel takes the nearest of the next 60
+// to the line from it to the light (in a depth space where every ray is parallel), 4 of
+// them hard, the rest kept as 4 interleaved minimums and averaged, the last 8 fading.
+// contact_bend_list is Bend's BuildDispatchList: up to 8 dispatches a light, around the
+// light's point. Depth here is reversed (1 at the near plane, 0 at the far one and off
+// the picture): d = (1 - alpha) - beta / w, as precise near as far.
+//
+// Who casts on whom: characters (marked in the reflection info, d3d_shader_variant skin)
+// on anything and take them from anything; props (marked in the surfaces' colour,
+// d3d_shader_variant albedo 2: bottles on a bar, chairs on a floor) on anything but
+// themselves (each tagged, so a carved panel does not shade its own relief all over); the
+// map not on itself, its own shadows being baked into its lightmaps. Hair takes none: on
+// its layered cards they come out as specks. Then contact_run weighs each light's shadow
+// by its share of all the lights on the pixel, filters the result like the occlusion and
+// it is multiplied in at full resolution (contact_apply); BL_CONTACT_STRENGTH (0..1,
+// default 0.5) is the most it darkens, BL_CONTACT=show shows it alone.
 
+#define SSS_LIGHTS 4
+
+// For each Bend dispatch (struct BP).
+struct bend_params {
+    float light[4];  // the light on the screen (half-resolution pixels), its depth, the side of the camera it is on
+    int wave[2];     // the dispatch's first wavefront
+    float half[2], full[2];
+    float proj[2];   // 1 - alpha, beta
+    float props, slice;
+    float thickness, contrast;
+    float threshold, pad[3];
+};
+
+// For the weighing (struct CP).
 struct contact_params {
     float full[2], half[2];
     float p00, p11;
-    float length, strength;
-    float nlights, pad;
-    float props, pad2;  // props: 1 when the surfaces' colour marks them this frame
+    float strength, nlights;
+    float pick[SSS_LIGHTS];  // which of char_lights each slice is, -1 for none
 };
 
 static NSString *const contact_source =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
-     "struct CP { float2 full, hsize; float p00, p11, length, strength, nlights, pad, props, pad2; };\n"
+     "#define WAVE 64\n"
+     "#define SAMPLES 60\n"
+     "#define HARD 4\n"
+     "#define FADE 8\n"
+     "#define READS (SAMPLES / WAVE + 2)\n"
+     "struct BP { float4 light; int2 wave; float2 hsize, full, proj; float props, slice, thickness, contrast,\n"
+     "            threshold, pad1, pad2, pad3; };\n"
+     "struct CP { float2 full, hsize; float p00, p11, strength, nlights; float4 pick; };\n"
      "struct FL { float4 pos, color, dir, att; };\n"  // struct fog_light
-     "struct V { float4 pos [[position]]; };\n"
-     "vertex V contact_vs(uint id [[vertex_id]]) {\n"
-     "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
-     "static float3 vpos(constant CP &a, texture2d<float> zt, int2 p) {\n"
-     "    p = clamp(p, int2(0), int2(a.hsize) - 1);\n"
-     "    float w = zt.read(uint2(p)).x;\n"
-     "    if (w <= 0.0) w = 1e6;\n"
-     "    float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.hsize.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.hsize.y);\n"
-     "    return float3(ndc.x * w / a.p00, ndc.y * w / a.p11, w); }\n"
-     // A character's pixel: the reflection info's alpha is -1 or -2 there.
-     "static bool person(constant CP &a, texture2d<float> info, int2 p) {\n"
-     "    return info.read(uint2(min(p * 2, int2(a.full) - 1))).w < -0.5; }\n"
-     // A prop's pixel: the surfaces' colour's alpha is its tag there, 0.26 to 0.73
-     // (d3d_shader_variant albedo 2).
-     "static bool prop(constant CP &a, texture2d<float> alb, int2 p) {\n"
-     "    float t = alb.read(uint2(min(p * 2, int2(a.full) - 1))).w;\n"
-     "    return a.props > 0.5 && t > 0.25 && t < 0.75; }\n"
-     // A prop other than the one tagged `tag` (-1: none).
-     "static bool other_prop(constant CP &a, texture2d<float> alb, int2 p, float tag) {\n"
-     "    float t = alb.read(uint2(min(p * 2, int2(a.full) - 1))).w;\n"
-     "    return a.props > 0.5 && t > 0.25 && t < 0.75 && abs(t - tag) > 0.002; }\n"
-     "static float ign(float2 p) { return fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715)))); }\n"
-     // How much is in the way from O towards the light along bl, len units, in steps.
-     "static float march(constant CP &a, texture2d<float> zt, texture2d<float> info, texture2d<float> alb, int2 p,\n"
-     "                   float3 O, float3 bl, float len, float w, float j, bool me, float tag, int steps) {\n"
-     "    float bias = 0.3 + 0.004 * w, thick = max(a.length, 0.02 * w);\n"
-     "    for (int i = 0; i < steps; i++) {\n"
-     "        float t = (float(i) + j) / float(steps);\n"
-     "        float3 Q = O + bl * (len * t);\n"
-     "        if (Q.z <= 1.0) break;\n"
-     "        float2 ndc = float2(Q.x * a.p00, Q.y * a.p11) / Q.z;\n"
-     "        float2 q = float2(ndc.x + 1.0, 1.0 - ndc.y) * 0.5 * a.hsize;\n"
-     "        if (any(q < 0.0) || any(q >= a.hsize)) break;\n"
-     "        int2 qi = int2(q);\n"
-     "        if (all(qi == p)) continue;\n"
-     // Not the surface it starts on: the next flat face of the same fold, within a
-     // world unit or so, would shade it in triangles.
-     "        if (len * t < 1.0 + 0.004 * w) continue;\n"
-     "        float zs = zt.read(uint2(qi)).x;\n"
-     "        if (zs <= 0.0) continue;\n"
-     "        float diff = Q.z - zs;\n"
-     "        if (diff > bias && diff < thick && (me || person(a, info, qi) || other_prop(a, alb, qi, tag))) return 1.0 - t * t;\n"
+     // The reversed depth at a half-resolution pixel: 0 off the picture and where nothing is drawn.
+     "static float rdepth(texture2d<float> zt, constant BP &a, int2 q) {\n"
+     "    if (any(q < 0) || any(q >= int2(a.hsize))) return 0.0;\n"
+     "    float w = zt.read(uint2(q)).x;\n"
+     "    return w > 0.0 ? max(a.proj.x - a.proj.y / w, 0.0) : 0.0; }\n"
+     // What a pixel casts on: 2 a character's (anything), its tag a prop's (all but that
+     // prop), -1 the map's (characters only). A character's reflection info alpha is -1 or
+     // -2; a prop's surfaces' colour alpha is its tag, 0.26 to 0.73.
+     "static float caster(texture2d<float> info, texture2d<float> alb, constant BP &a, int2 q) {\n"
+     "    if (any(q < 0) || any(q >= int2(a.hsize))) return -1.0;\n"
+     "    uint2 f = uint2(min(q * 2, int2(a.full) - 1));\n"
+     "    if (info.read(f).w < -0.5) return 2.0;\n"
+     "    float t = alb.read(f).w;\n"
+     "    return a.props > 0.5 && t > 0.25 && t < 0.75 ? t : -1.0; }\n"
+     // Bend's WriteScreenSpaceShadow, with FarDepthValue 0, NearDepthValue 1, IgnoreEdgePixels
+     // and BilinearSamplingOffsetMode off, no early out.
+     "kernel void bend_main(texture2d<float> zt [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
+     "                      texture2d<float> alb [[texture(2)]],\n"
+     "                      texture2d_array<float, access::write> out [[texture(3)]], constant BP &a [[buffer(0)]],\n"
+     "                      uint3 gid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {\n"
+     "    threadgroup float depth_data[READS * WAVE], kind_data[READS * WAVE];\n"
+     // ComputeWavefrontExtents
+     "    int2 xy = int2(gid.yz) * WAVE + a.wave;\n"
+     "    float2 light_xy = floor(a.light.xy) + 0.5, light_frac = a.light.xy - light_xy;\n"
+     "    bool reverse = a.light.w > 0.0;\n"
+     "    int2 sxy = int2(sign(float2(xy)));\n"
+     "    bool horizontal = abs(xy.x + sxy.y) < abs(xy.y - sxy.x);\n"
+     "    int2 axis = horizontal ? int2(sxy.y, 0) : int2(0, -sxy.x);\n"
+     "    xy = axis * int(gid.x) + xy;\n"
+     "    float2 xyf = float2(xy);\n"
+     "    bool xmajor = abs(xyf.x) > abs(xyf.y);\n"
+     "    float major = xmajor ? xyf.x : xyf.y;\n"
+     "    float mstart = abs(major), mend = abs(major) - float(WAVE);\n"
+     "    float mfrac = xmajor ? light_frac.x : light_frac.y;\n"
+     "    mfrac = major > 0.0 ? -mfrac : mfrac;\n"
+     "    float2 start = xyf + light_xy;\n"
+     "    float2 end = mix(a.light.xy, start, (mend + mfrac) / (mstart + mfrac));\n"
+     "    float2 delta = start - end;\n"
+     "    float step = float(tid ^ (reverse ? 0u : uint(WAVE - 1)));\n"
+     "    float2 pxy = mix(start, end, step / float(WAVE));\n"
+     "    float pdist = mstart - step + mfrac;\n"
+     // The depths, twice a pixel, across the ray's minor axis; an edge reads one.
+     "    float direction = -a.light.w;\n"
+     "    float sampling[READS], shadowing[READS], dist[READS], kind[READS], scale0 = 0.0;\n"
+     "    int2 write_xy = int2(floor(pxy));\n"
+     "    for (int i = 0; i < READS; i++) {\n"
+     "        int2 rxy = int2(floor(pxy));\n"
+     "        float minor = xmajor ? pxy.y : pxy.x;\n"
+     "        int b = fract(minor) - 0.5 > 0.0 ? 1 : -1;\n"
+     "        float d0 = rdepth(zt, a, rxy), d1 = rdepth(zt, a, rxy + (xmajor ? int2(0, b) : int2(b, 0)));\n"
+     "        if (i == 0) scale0 = d0;\n"
+     "        bool point = abs(d0 - d1) > d0 * a.threshold;\n"
+     "        sampling[i] = d0;\n"
+     "        shadowing[i] = point ? d0 : d0 - abs(d0 - d1);\n"
+     "        dist[i] = pdist + float(WAVE * i) * direction;\n"
+     "        kind[i] = caster(info, alb, a, rxy);\n"
+     "        pxy += delta * direction;\n"
      "    }\n"
-     "    return 0.0; }\n"
-     "static float contact_at(int2 p, texture2d<float> zt, texture2d<float> info, texture2d<float> alb, constant CP &a,\n"
-     "                        constant FL *L) {\n"
-     "    float w = zt.read(uint2(p)).x;\n"
-     "    if (w <= 0.0) return 1.0;\n"
-     "    float3 P = vpos(a, zt, p);\n"
-     "    float3 l = vpos(a, zt, p - int2(1, 0)), r = vpos(a, zt, p + int2(1, 0));\n"
-     "    float3 u = vpos(a, zt, p - int2(0, 1)), b = vpos(a, zt, p + int2(0, 1));\n"
-     "    float3 dx = abs(r.z - P.z) < abs(P.z - l.z) ? r - P : P - l;\n"
-     "    float3 dy = abs(b.z - P.z) < abs(P.z - u.z) ? b - P : P - u;\n"
-     "    float3 N = normalize(cross(dx, dy));\n"
-     "    if (dot(N, P) > 0.0) N = -N;\n"
-     // The two lights that give this pixel the most, and their shares.
-     "    const float3 lw = float3(0.2126, 0.7152, 0.0722);\n"
-     "    float best = 0.0, next = 0.0, total = 0.0; float3 bl = 0.0, bv = 0.0, nl = 0.0, nv = 0.0;\n"
-     "    for (int k = 0; k < int(a.nlights); k++) {\n"
-     "        float3 v = L[k].pos.xyz - P;\n"
-     "        float d2 = max(dot(v, v), 64.0), d = sqrt(d2);\n"
-     "        float3 ld = v / d;\n"
-     "        float e = 1.0 / (L[k].att.x + L[k].att.y * d + L[k].att.z * d2);\n"
-     "        if (L[k].pos.w > 0.0) { float x = d / L[k].pos.w; e *= saturate(1.0 - x * x * x * x); }\n"
-     "        if (dot(L[k].dir.xyz, L[k].dir.xyz) > 0.25) {\n"
-     "            float cs = dot(-ld, L[k].dir.xyz), inner = L[k].color.w, outer = L[k].dir.w;\n"
-     "            if (cs <= outer) continue;\n"
-     "            if (cs < inner) e *= (cs - outer) / max(inner - outer, 1e-4);\n"
-     "        }\n"
-     // Not weighted by how the surface faces the light: N comes from the depth, so on
-     // low-poly parts (a collar) each flat face would pick its own light and the shadow
-     // would come and go in whole triangles as the character moves.
-     "        float li = dot(L[k].color.rgb, lw) * e;\n"
-     "        total += li;\n"
-     "        if (li > best) next = best, nl = bl, nv = bv, best = li, bl = ld, bv = v;\n"
-     "        else if (li > next) next = li, nl = ld, nv = v;\n"
+     // Into threadgroup memory, perspective corrected: there every light ray is parallel.
+     "    for (int i = 0; i < READS; i++) {\n"
+     "        float s = (shadowing[i] - a.light.z) / dist[i];\n"
+     "        if (i != 0) s = dist[i] > 0.0 ? s : 1e10;\n"
+     "        depth_data[i * WAVE + tid] = s, kind_data[i * WAVE + tid] = kind[i];\n"
      "    }\n"
-     "    if (best <= 0.0) return 1.0;\n"
-     // Hair (-1.4) casts them but takes none: on its layered cards they come out as specks.
-     "    float iw = info.read(uint2(min(p * 2, int2(a.full) - 1))).w;\n"
-     "    if (iw < -1.3 && iw > -1.5) return 1.0;\n"
-     "    bool me = person(a, info, p);\n"
-     // A prop takes none from itself: a carved panel would shade its own relief all over.
-     "    float tag = prop(a, alb, p) ? alb.read(uint2(min(p * 2, int2(a.full) - 1))).w : -1.0;\n"
-     "    float3 O = P + N * (0.002 * w);\n"
-     // pad: a frame number under TAA, so the grain moves and the scaler averages it out.
-     "    float j = ign(float2(p) + a.pad * 5.588238);\n"
-     "    float occ = march(a, zt, info, alb, p, O, bl, min(a.length, length(bv) * 0.9), w, j, me, tag, 16) * best;\n"
-     "    if (next * 6.0 >= total)\n"
-     "        occ += march(a, zt, info, alb, p, O, nl, min(a.length, length(nv) * 0.9), w, fract(j + 0.5), me, tag, 8) * next;\n"
-     "    return 1.0 - a.strength * occ / total; }\n"
-     // A kernel (post_traces).
-     "kernel void contact_main(texture2d<float> zt [[texture(0)]], texture2d<float> info [[texture(1)]],\n"
-     "                         texture2d<float> alb [[texture(2)]], texture2d<float, access::write> out [[texture(3)]],\n"
+     "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+     "    if (any(write_xy < 0) || any(write_xy >= int2(a.hsize))) return;\n"
+     "    uint2 wp = uint2(write_xy);\n"
+     "    float iw = info.read(uint2(min(write_xy * 2, int2(a.full) - 1))).w;\n"
+     "    if (scale0 <= 0.0 || (iw < -1.3 && iw > -1.5)) { out.write(float4(1.0), wp, uint(a.slice)); return; }\n"
+     "    bool me = kind[0] > 1.5;\n"
+     "    float tag = kind[0];\n"
+     "    float start_depth = (sampling[0] - a.light.z) / dist[0];\n"
+     "    float depth_scale = min(dist[0] + direction, 1.0 / a.thickness) * dist[0] / scale0;\n"
+     "    start_depth = start_depth * depth_scale + 1.0;\n"
+     "    int si = int(tid) + 1;\n"
+     "    float hard = 1.0; float4 sv = 1.0;\n"
+     "    for (int i = 0; i < SAMPLES; i++) {\n"
+     "        float k = kind_data[si + i];\n"
+     "        if (!(me || k > 1.5 || (k > 0.0 && abs(k - tag) > 0.002))) continue;\n"
+     "        float dd = abs(start_depth - depth_data[si + i] * depth_scale);\n"
+     "        if (i < HARD) hard = min(hard, dd);\n"
+     "        else if (i < SAMPLES - FADE) sv[i & 3] = min(sv[i & 3], dd);\n"
+     "        else sv[i & 3] = min(sv[i & 3], dd + float(i + 1 - (SAMPLES - FADE)) / float(FADE + 1) * 0.75);\n"
+     "    }\n"
+     "    sv = saturate(sv * a.contrast + (1.0 - a.contrast));\n"
+     "    hard = saturate(hard * a.contrast + (1.0 - a.contrast));\n"
+     "    out.write(float4(min(hard, dot(sv, 0.25))), wp, uint(a.slice)); }\n"
+     // The weighing: each traced light's shadow by its share of all the lights on the pixel.
+     "kernel void contact_main(texture2d<float> zt [[texture(0)]], texture2d_array<float> ss [[texture(1)]],\n"
+     "                         texture2d<float, access::write> out [[texture(2)]],\n"
      "                         constant CP &a [[buffer(0)]], constant FL *L [[buffer(1)]],\n"
      "                         uint2 gid [[thread_position_in_grid]]) {\n"
      "    if (any(gid >= uint2(a.hsize))) return;\n"
-     "    out.write(float4(contact_at(int2(gid), zt, info, alb, a, L)), gid); }\n";
+     "    float w = zt.read(gid).x;\n"
+     "    if (w <= 0.0) { out.write(float4(1.0), gid); return; }\n"
+     "    float2 ndc = float2((float(gid.x) + 0.5) * 2.0 / a.hsize.x - 1.0, 1.0 - (float(gid.y) + 0.5) * 2.0 / a.hsize.y);\n"
+     "    float3 P = float3(ndc.x * w / a.p00, ndc.y * w / a.p11, w);\n"
+     "    const float3 lw = float3(0.2126, 0.7152, 0.0722);\n"
+     "    float total = 0.0, occ = 0.0;\n"
+     "    for (int k = 0; k < int(a.nlights); k++) {\n"
+     "        float3 v = L[k].pos.xyz - P;\n"
+     "        float d2 = max(dot(v, v), 64.0), d = sqrt(d2);\n"
+     "        float e = 1.0 / (L[k].att.x + L[k].att.y * d + L[k].att.z * d2);\n"
+     "        if (L[k].pos.w > 0.0) { float x = d / L[k].pos.w; e *= saturate(1.0 - x * x * x * x); }\n"
+     "        if (dot(L[k].dir.xyz, L[k].dir.xyz) > 0.25) {\n"
+     "            float cs = dot(-v / d, L[k].dir.xyz), inner = L[k].color.w, outer = L[k].dir.w;\n"
+     "            if (cs <= outer) continue;\n"
+     "            if (cs < inner) e *= (cs - outer) / max(inner - outer, 1e-4);\n"
+     "        }\n"
+     "        float li = dot(L[k].color.rgb, lw) * e;\n"
+     "        total += li;\n"
+     "        for (int j = 0; j < 4; j++)\n"
+     "            if (int(a.pick[j]) == k) occ += li * (1.0 - ss.read(gid, uint(j)).x);\n"
+     "    }\n"
+     "    out.write(float4(total > 0.0 ? 1.0 - a.strength * occ / total : 1.0), gid); }\n";
 
-static id<MTLComputePipelineState> contact_kernel(void)
+static id<MTLLibrary> contact_library(void)
 {
     static id<MTLLibrary> lib;
-    static id<MTLComputePipelineState> k;
     if (!lib) {
         NSError *error = nil;
         lib = [mtl newLibraryWithSource:contact_source options:nil error:&error];
         if (!lib) bl_fatal("contact shadow shader: %s", error.localizedDescription.UTF8String);
     }
-    return kernel_of(lib, @"contact_main", &k);
+    return lib;
+}
+
+// Bend's BuildDispatchList: the dispatches (64 by count[1] by count[2] groups of 64) that
+// cover a w by h picture with wavefronts running towards the light at `light` (a clip
+// position); fills shader[4] (struct BP light) and returns how many.
+struct bend_dispatch { int count[3], wave[2]; };
+static int contact_bend_list(const float light[4], int w, int h, float shader[4], struct bend_dispatch out[8])
+{
+    enum { WAVE = 64 };
+    int n = 0;
+    float lw = light[3], limit = 0.000002f * WAVE;
+    if (lw >= 0 && lw < limit) lw = limit;
+    else if (lw < 0 && lw > -limit) lw = -limit;
+    shader[0] = (light[0] / lw * 0.5f + 0.5f) * (float)w;
+    shader[1] = (light[1] / lw * -0.5f + 0.5f) * (float)h;
+    shader[2] = light[3] == 0 ? 0 : light[2] / light[3];
+    shader[3] = light[3] > 0 ? 1 : -1;
+    int lxy[2] = {(int)(shader[0] + 0.5f), (int)(shader[1] + 0.5f)};
+    const int bb[4] = {0 - lxy[0], -(h - lxy[1]), w - lxy[0], -(0 - lxy[1])};
+#define BMAX(a, b) ((a) > (b) ? (a) : (b))
+#define BMIN(a, b) ((a) < (b) ? (a) : (b))
+    for (int q = 0; q < 4; q++) {
+        int vertical = q == 0 || q == 3;
+        const int bounds[4] = {
+            BMAX(0, ((q & 1) ? bb[0] : -bb[2])) / WAVE,
+            BMAX(0, ((q & 2) ? bb[1] : -bb[3])) / WAVE,
+            BMAX(0, (((q & 1) ? bb[2] : -bb[0]) + WAVE * (vertical ? 1 : 2) - 1)) / WAVE,
+            BMAX(0, (((q & 2) ? bb[3] : -bb[1]) + WAVE * (vertical ? 2 : 1) - 1)) / WAVE,
+        };
+        if (bounds[2] - bounds[0] <= 0 || bounds[3] - bounds[1] <= 0) continue;
+        int bias_x = q == 2 || q == 3, bias_y = q == 1 || q == 3;
+        struct bend_dispatch *d = &out[n++];
+        d->count[0] = WAVE, d->count[1] = bounds[2] - bounds[0], d->count[2] = bounds[3] - bounds[1];
+        d->wave[0] = ((q & 1) ? bounds[0] : -bounds[2]) + bias_x;
+        d->wave[1] = ((q & 2) ? -bounds[3] : bounds[1]) + bias_y;
+        int axis_delta = bb[0] - bb[1];
+        if (q == 1) axis_delta = bb[2] + bb[1];
+        if (q == 2) axis_delta = -bb[0] - bb[3];
+        if (q == 3) axis_delta = -bb[2] + bb[3];
+        axis_delta = (axis_delta + WAVE - 1) / WAVE;
+        if (axis_delta <= 0) continue;
+        struct bend_dispatch *d2 = &out[n++];
+        *d2 = *d;
+        if (q == 0) {
+            d2->count[2] = BMIN(d->count[2], axis_delta);
+            d->count[2] -= d2->count[2];
+            d2->wave[1] = d->wave[1] + d->count[2];
+            d2->wave[0]--, d2->count[1]++;
+        }
+        if (q == 1) {
+            d2->count[1] = BMIN(d->count[1], axis_delta);
+            d->count[1] -= d2->count[1];
+            d2->wave[0] = d->wave[0] + d->count[1];
+            d2->count[2]++;
+        }
+        if (q == 2) {
+            d2->count[1] = BMIN(d->count[1], axis_delta);
+            d->count[1] -= d2->count[1];
+            d->wave[0] += d2->count[1];
+            d2->count[2]++, d2->wave[1]--;
+        }
+        if (q == 3) {
+            d2->count[2] = BMIN(d->count[2], axis_delta);
+            d->count[2] -= d2->count[2];
+            d->wave[1] += d2->count[2];
+            d2->count[1]++;
+        }
+        if (d2->count[1] <= 0 || d2->count[2] <= 0) *d2 = out[--n];
+        if (d->count[1] <= 0 || d->count[2] <= 0) *d = out[--n];
+    }
+#undef BMAX
+#undef BMIN
+    for (int i = 0; i < n; i++) out[i].wave[0] *= WAVE, out[i].wave[1] *= WAVE;
+    return n;
 }
 
 static struct ao_params contact_result_params;
+static struct contact_params contact_frame;
 
-// The trace into ao_texture 15, in post_traces' encoder, from the half-resolution view
+// Each light's shadow, a slice each, half resolution.
+static id<MTLTexture> contact_slices(NSUInteger w, NSUInteger h)
+{
+    static id<MTLTexture> t;
+    if (!t || t.width != w || t.height != h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                                                      width:w height:h mipmapped:NO];
+        td.textureType = MTLTextureType2DArray;
+        td.arrayLength = SSS_LIGHTS;
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        td.storageMode = MTLStorageModePrivate;
+        t = [mtl newTextureWithDescriptor:td];
+    }
+    return t;
+}
+
+// The traces into contact_slices, in post_traces' encoder, from the half-resolution view
 // depth z (ao_pass kind 0) and its parameters; 0 when no light is near.
 static int contact_trace(BLCompute *e, id<MTLTexture> color, id<MTLTexture> z, const struct ao_params *ap)
 {
     int n = view_lights();
     if (!n) return 0;
+    // The lights: the brightest at the camera (the view's origin), as the characters see them.
+    int pick[SSS_LIGHTS], ns = 0;
+    float best[SSS_LIGHTS];
+    for (int i = 0; i < n; i++) {
+        const float *p = char_lights[i].pos, *c = char_lights[i].color, *t = char_lights[i].att;
+        float d2 = p[0] * p[0] + p[1] * p[1] + p[2] * p[2], d = sqrtf(d2);
+        float score = (0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2]) / (t[0] + t[1] * d + t[2] * d2 + 1);
+        if (score <= 0) continue;
+        int j = ns < SSS_LIGHTS ? ns++ : SSS_LIGHTS;
+        if (j == SSS_LIGHTS && score <= best[SSS_LIGHTS - 1]) continue;
+        if (j == SSS_LIGHTS) j = SSS_LIGHTS - 1;
+        while (j > 0 && best[j - 1] < score) pick[j] = pick[j - 1], best[j] = best[j - 1], j--;
+        pick[j] = i, best[j] = score;
+    }
+    if (!ns) return 0;
     struct contact_params c = {{ap->full[0], ap->full[1]}, {ap->half[0], ap->half[1]}, ap->p00, ap->p11,
-                               env_contact_length, env_contact_strength, (float)n, (float)(frames % 16),
-                               albedo_frame == frames, 0};
-    [e setComputePipelineState:contact_kernel()];
+                               env_contact_strength, (float)n, {-1, -1, -1, -1}};
+    static id<MTLComputePipelineState> k;
+    [e setComputePipelineState:kernel_of(contact_library(), @"bend_main", &k)];
     [e setTexture:z atIndex:0];
     [e setTexture:info_texture(color) atIndex:1];
     [e setTexture:albedo_frame == frames ? albedo_texture(color) : info_texture(color) atIndex:2];
-    [e setTexture:ao_texture(15, MTLPixelFormatR16Float, z.width, z.height) atIndex:3];
-    [e setBytes:&c length:sizeof c atIndex:0];
-    [e setBytes:char_lights length:sizeof char_lights[0] * (size_t)n atIndex:1];
-    [e dispatchAlongside:MTLSizeMake((z.width + 7) / 8, (z.height + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [e setTexture:contact_slices(z.width, z.height) atIndex:3];
+    for (int s = 0; s < ns; s++) {
+        const float *p = char_lights[pick[s]].pos;
+        float clip[4] = {p[0] * view_proj.p00, p[1] * view_proj.p11, (1 - view_proj.alpha) * p[2] - view_proj.beta, p[2]};
+        struct bend_params b = {{0}, {0}, {ap->half[0], ap->half[1]}, {ap->full[0], ap->full[1]},
+                                {1 - view_proj.alpha, view_proj.beta}, albedo_frame == frames, (float)s,
+                                0.005f, 4, 0.02f};
+        struct bend_dispatch list[8];
+        int nd = contact_bend_list(clip, (int)z.width, (int)z.height, b.light, list);
+        for (int i = 0; i < nd; i++) {
+            b.wave[0] = list[i].wave[0], b.wave[1] = list[i].wave[1];
+            [e setBytes:&b length:sizeof b atIndex:0];
+            [e dispatchAlongside:MTLSizeMake((NSUInteger)list[i].count[0], (NSUInteger)list[i].count[1],
+                                             (NSUInteger)list[i].count[2])
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        }
+        c.pick[s] = (float)pick[s];
+    }
+    contact_frame = c;
     return 1;
 }
 
-// After the trace: the occlusion's depth-aware filter and upsample, then its multiply at
-// full strength.
+// After the traces: the lights weighed into ao_texture 15, then the occlusion's
+// depth-aware filter and upsample, then its multiply at full strength.
 static void contact_run(id<MTLTexture> z, id<MTLTexture> depth, const struct ao_params *ap)
 {
     NSUInteger hw = z.width, hh = z.height;
     id<MTLTexture> raw = ao_texture(15, MTLPixelFormatR16Float, hw, hh);
+    BLCompute *e = stat_compute("contact_weigh");
+    static id<MTLComputePipelineState> k;
+    [e setComputePipelineState:kernel_of(contact_library(), @"contact_main", &k)];
+    [e setTexture:z atIndex:0];
+    [e setTexture:contact_slices(hw, hh) atIndex:1];
+    [e setTexture:raw atIndex:2];
+    [e setBytes:&contact_frame length:sizeof contact_frame atIndex:0];
+    [e setBytes:char_lights length:sizeof char_lights[0] * (size_t)contact_frame.nlights atIndex:1];
+    [e dispatchThreadgroups:MTLSizeMake((hw + 7) / 8, (hh + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [e endEncoding];
     id<MTLTexture> soft = ao_texture(16, MTLPixelFormatRG32Float, hw, hh);
     ao_pass(2, soft, raw, z, ap);
     id<MTLTexture> full = ao_texture(24, MTLPixelFormatR8Unorm, depth.width, depth.height);
     ao_pass(7, full, soft, depth, ap);
     contact_result = full, contact_result_params = *ap;
-    contact_result_params.strength = 1, contact_result_params.glow = 0;
+    contact_result_params.strength = 1, contact_result_params.glow = 0, contact_result_params.power = 1;
 }
 
 // Called by pass() for a new pass on the back buffer, after ao_apply.
@@ -3931,10 +4380,503 @@ static void contact_apply(BLRender *e, id<MTLTexture> color, int has_depth)
     contact_result = nil;
 }
 
+// --- object shadows ------------------------------------------------------------------------
+//
+// Part of BL_SHADOWS (BL_PROP_SHADOWS, default on): the shadows the map's lights cast from
+// its static props, which the 2004 lightmaps hold only blurred and faint (the map compiler
+// cast them from collision models and boxes, a luxel 16 units across). The casters are
+// the map's own surfaces and its static props, each by its visible mesh
+// (bl_props_load_visible), in world space, read when the map opens (bl_shadow_note_map).
+// For each of the first PSHADOW_LIGHTS lights in view_lights' list, six views round the
+// light (env_pshadow_res texels across, slices of one array texture) hold two distances a
+// texel: to the nearest of the map's surfaces (red) and to the nearest of those and the
+// props (green). They are drawn once per light and kept while it stays in the list, at
+// most one light's a frame. A pixel is in an object's shadow where the light reaches it
+// past the map's surfaces but not past the props; the map's shadows on itself are baked
+// in already. Prop faces nearer the light than BL_PROP_SHADOWS_NEAR are left out: the
+// light's own fitting. At half resolution after the occlusion's view depth, each such
+// light's share of all the lights on the pixel (as the contact shadows weigh them, times
+// how the surface faces it) is taken off, filtered like the occlusion and multiplied in at
+// full resolution (pshadow_apply); bright pixels (lamps) are left alone.
+// The edges are soft as a light BL_PROP_SHADOWS_SOFT units across casts them: the further the
+// pixel from the prop shading it, the wider the blur (found from the props' distances round it).
+// BL_PROP_SHADOWS_STRENGTH (0..1, default 0.5) is the most it darkens, BL_PROP_SHADOWS=show
+// shows it alone. Not yet: moving props, characters as casters, flickering lights.
+
+#define PSHADOW_LIGHTS 4
+
+// The map's casters, from bl_shadow_note_map's thread: 9 floats a triangle, the map's
+// surfaces' then the props'; and each prop triangle's prop.
+static os_unfair_lock pshadow_lock = OS_UNFAIR_LOCK_INIT;
+static float *pshadow_new;
+static int *pshadow_new_owner;
+static long pshadow_new_world, pshadow_new_props;
+static int pshadow_new_note;  // the bl_shadow_note_map call they are from
+static atomic_int pshadow_notes;
+
+// The world's own faces (not brush entities: doors move) that stop light: not nodraw,
+// hint, skip, sky or see-through faces, nor displacements whose surface could not be read.
+static int pshadow_face(const struct bl_bsp_world *w, const struct bl_bsp_face *f)
+{
+    return f->model == 0 && f->texinfo >= 0 && (f->disp < 0 || f->dside) && f->count >= 3 &&
+           !(w->texinfo[f->texinfo].flags & (0x4 | 0x10 | 0x80 | 0x100 | 0x200));
+}
+
+// Called by bl_bsp when a map opens: its surfaces as triangles now (w is not kept), its
+// props on a thread of their own (their models are read from the game's files).
+void bl_shadow_note_map(const struct bl_bsp_world *w, const char *host_path)
+{
+    long n = 0;
+    for (int i = 0; i < w->nfaces; i++) {
+        const struct bl_bsp_face *f = &w->faces[i];
+        if (pshadow_face(w, f)) n += f->dside ? 2L * (f->dside - 1) * (f->dside - 1) : f->count - 2;
+    }
+    float *t = malloc(sizeof(float) * 9 * (size_t)(n + 1));
+    long k = 0;
+    for (int i = 0; i < w->nfaces; i++) {
+        const struct bl_bsp_face *f = &w->faces[i];
+        if (!pshadow_face(w, f)) continue;
+        int d = f->dside;
+        if (d)
+            for (int r = 0; r + 1 < d; r++)
+                for (int c = 0; c + 1 < d; c++) {
+                    int a = f->dfirst + r * d + c, q[2][3] = {{a, a + d, a + d + 1}, {a, a + d + 1, a + 1}};
+                    for (int h = 0; h < 2; h++, k++)
+                        for (int v = 0; v < 3; v++) memcpy(t + 9 * k + 3 * v, w->dverts[q[h][v]].pos, 12);
+                }
+        else
+            for (int c = 1; c + 1 < f->count; c++, k++) {
+                memcpy(t + 9 * k, w->verts[w->index[f->first]], 12);
+                memcpy(t + 9 * k + 3, w->verts[w->index[f->first + c]], 12);
+                memcpy(t + 9 * k + 6, w->verts[w->index[f->first + c + 1]], 12);
+            }
+    }
+    int note = atomic_fetch_add(&pshadow_notes, 1) + 1;
+    char *path = strdup(host_path);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        uint8_t *d = NULL;
+        long size = 0;
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            size = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            d = size > 1032 ? malloc((size_t)size) : NULL;
+            if (d && fread(d, 1, (size_t)size, f) != (size_t)size) free(d), d = NULL;
+            fclose(f);
+        }
+        char err[128] = "not read";
+        struct bl_props *p = d ? bl_props_load_visible(path, d, size, err, sizeof err) : NULL;
+        long np = p ? p->ntris : 0;
+        float *all = realloc(t, sizeof(float) * 9 * (size_t)(k + np + 1));
+        int *owner = malloc(sizeof(int) * (size_t)(np + 1));
+        if (np) memcpy(all + 9 * k, p->tris, sizeof(float) * 9 * (size_t)np), memcpy(owner, p->owner, sizeof(int) * (size_t)np);
+        if (p)
+            fprintf(stderr, "[metal] object shadows: %ld map triangles, %ld from %d props (%d by mesh)\n", k, np, p->nfound,
+                    p->nmesh);
+        else
+            fprintf(stderr, "[metal] object shadows: %ld map triangles, props: %s\n", k, err);
+        os_unfair_lock_lock(&pshadow_lock);
+        if (note == atomic_load(&pshadow_notes)) {
+            free(pshadow_new), free(pshadow_new_owner);
+            pshadow_new = all, pshadow_new_owner = owner, pshadow_new_world = k, pshadow_new_props = np;
+            pshadow_new_note = note;
+            all = NULL, owner = NULL;
+        }
+        os_unfair_lock_unlock(&pshadow_lock);
+        free(all), free(owner), free(d), free(path);
+        bl_props_free(p);
+    });
+}
+
+// What the renderer holds: the casters (and each prop triangle's prop, and each prop's
+// bounds), the lights' views (6 slices a light) and which light each set of views is of.
+static id<MTLBuffer> pshadow_mesh, pshadow_owner;
+static long pshadow_world, pshadow_props;
+static float (*pshadow_box)[6];
+static int pshadow_nbox;
+static id<MTLTexture> pshadow_views;
+static struct { float pos[3]; int valid; } pshadow_slot[PSHADOW_LIGHTS];
+
+static int pshadow_held_note;  // the map pshadow_mesh is of (pshadow_notes' count)
+
+static int pshadow_on(void) { return env_shadows && env_pshadow; }
+
+// The newest casters, once read; 1 when there are any for the open map. While a new map's
+// are still being read, there are none: the last map's must not cast shadows on this one.
+static int pshadow_ready(void)
+{
+    os_unfair_lock_lock(&pshadow_lock);
+    float *t = pshadow_new;
+    int *owner = pshadow_new_owner;
+    long nw = pshadow_new_world, np = pshadow_new_props;
+    if (t) pshadow_held_note = pshadow_new_note;
+    pshadow_new = NULL, pshadow_new_owner = NULL;
+    os_unfair_lock_unlock(&pshadow_lock);
+    if (t) {
+        pshadow_mesh = nw + np ? [mtl newBufferWithBytes:t length:sizeof(float) * 9 * (size_t)(nw + np)
+                                                 options:MTLResourceStorageModeShared]
+                               : nil;
+        pshadow_owner = [mtl newBufferWithBytes:owner length:sizeof(int) * (size_t)(np + 1) options:MTLResourceStorageModeShared];
+        pshadow_world = nw, pshadow_props = np;
+        pshadow_nbox = 0;
+        for (long i = 0; i < np; i++)
+            if (owner[i] >= pshadow_nbox) pshadow_nbox = owner[i] + 1;
+        free(pshadow_box);
+        pshadow_box = malloc(sizeof *pshadow_box * (size_t)(pshadow_nbox + 1));
+        for (int b = 0; b < pshadow_nbox; b++)
+            for (int k = 0; k < 3; k++) pshadow_box[b][k] = 1e30f, pshadow_box[b][k + 3] = -1e30f;
+        for (long i = 0; i < np; i++)
+            for (int v = 0; v < 3; v++)
+                for (int k = 0; k < 3; k++) {
+                    float x = t[9 * (nw + i) + 3 * v + k];
+                    float *b = pshadow_box[owner[i]];
+                    b[k] = fminf(b[k], x), b[k + 3] = fmaxf(b[k + 3], x);
+                }
+        memset(pshadow_slot, 0, sizeof pshadow_slot);
+        free(t), free(owner);
+    }
+    return pshadow_mesh != nil && pshadow_props > 0 && pshadow_held_note == atomic_load(&pshadow_notes);
+}
+
+// light: position, near; face: axis, sign; skip: props left out (the light's own fittings,
+// -1 none); world: the map's triangles before the props' (-1 drawing the map's).
+struct pshadow_view { float light[4], face[4]; int skip[8], world, pad[3]; };
+
+struct pshadow_params {
+    float full[2], half[2];
+    float p00, p11;
+    float strength, nlights, nshadow, res;
+    float debug, soft, pad[4];       // debug (BL_PROP_SHADOWS_DEBUG): the first light's views; soft: the
+                                     // lights' radius (BL_PROP_SHADOWS_SOFT); pad: inv on 16 bytes
+    float inv[3][4];                 // view to world rows
+    float light[PSHADOW_LIGHTS][4];  // each shadow light's position, its views' first slice (-1: none)
+    float index[PSHADOW_LIGHTS];     // and its place in char_lights
+};
+
+static NSString *const pshadow_source =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct SV { float4 pos [[position]]; float3 rel; };\n"
+     "struct VP { float4 light, face; int4 skip0, skip1; int world, pad0, pad1, pad2; };\n"
+     // One of the six views: the axis it looks along (0 x, 1 y, 2 z) and which way; on
+     // screen the next axis across, the one after up.
+     "static float3 face_of(float3 r, int ax) { return ax == 0 ? r.yzx : ax == 1 ? r.zxy : r; }\n"
+     "vertex SV pshadow_vs(uint id [[vertex_id]], const device float *p [[buffer(0)]], constant VP &a [[buffer(1)]],\n"
+     "                     const device int *owner [[buffer(2)]]) {\n"
+     "    float3 r = float3(p[id * 3], p[id * 3 + 1], p[id * 3 + 2]) - a.light.xyz;\n"
+     "    if (a.world >= 0) {\n"
+     "        int o = owner[int(id / 3) - a.world];\n"
+     "        if (any(int4(o) == a.skip0) || any(int4(o) == a.skip1)) { SV x; x.pos = float4(0.0, 0.0, -1.0, 1.0); x.rel = 0.0; return x; }\n"
+     "    }\n"
+     "    float3 q = face_of(r, int(a.face.x));\n"
+     "    float m = q.z * a.face.y;\n"
+     "    SV o; o.pos = float4(q.x, q.y, 0.5 * m, m); o.rel = r; return o; }\n"
+     "fragment float2 pshadow_fs(SV in [[stage_in]], constant VP &a [[buffer(1)]]) {\n"
+     "    float d = length(in.rel);\n"
+     "    if (d < a.light.w) discard_fragment();\n"
+     "    return float2(d); }\n"
+     "struct PP { float2 full, hsize; float p00, p11, strength, nlights, nshadow, res, debug, soft, pad1, pad2; float4 inv[3]; float4 light[4];\n"
+     "            float4 index; };\n"
+     "struct FL { float4 pos, color, dir, att; };\n"  // struct fog_light
+     "static float3 vpos(constant PP &a, texture2d<float> zt, int2 p) {\n"
+     "    p = clamp(p, int2(0), int2(a.hsize) - 1);\n"
+     "    float w = zt.read(uint2(p)).x;\n"
+     "    if (w <= 0.0) w = 1e6;\n"
+     "    float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.hsize.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.hsize.y);\n"
+     "    return float3(ndc.x * w / a.p00, ndc.y * w / a.p11, w); }\n"
+     // How much of light k's views round the point Pw (world) see the map's surfaces past it
+     // but a prop in front: the share of it in a prop's shadow. N: the surface's facing, to
+     // lift the point off it by a texel and a half. First the props in front, 5 x 5 texels 4
+     // apart: their mean distance gives the blur, as a light a.soft units in radius makes it
+     // (1 to 8 texels); then 5 x 5 texels across that.
+     "static float blocked(constant PP &a, texture2d_array<float> views, int k, float3 Pw, float3 N) {\n"
+     "    float3 r = Pw - a.light[k].xyz;\n"
+     "    float texel = 2.0 * length(r) / a.res;\n"
+     "    r += N * (1.5 * texel);\n"
+     "    float d = length(r);\n"
+     "    float3 ar = abs(r);\n"
+     "    int ax = ar.x >= ar.y && ar.x >= ar.z ? 0 : ar.y >= ar.z ? 1 : 2;\n"
+     "    float3 q = face_of(r, ax);\n"
+     "    float s = q.z >= 0.0 ? 1.0 : -1.0;\n"
+     "    float2 ndc = q.xy / (q.z * s);\n"
+     "    int2 c = int2(float2(ndc.x * 0.5 + 0.5, 0.5 - 0.5 * ndc.y) * a.res);\n"
+     "    uint slice = uint(a.light[k].w) + uint(ax * 2) + (s < 0.0 ? 1u : 0u);\n"
+     "    float bias = 1.0 + 2.0 * texel, near = 0.0, n = 0.0, sum = 0.0;\n"
+     "    for (int j = -2; j <= 2; j++)\n"
+     "        for (int i = -2; i <= 2; i++) {\n"
+     "            float2 m = views.read(uint2(clamp(c + int2(i, j) * 4, int2(0), int2(a.res) - 1)), slice).xy;\n"
+     "            if (d <= m.x + bias && d > m.y + bias) near += m.y, n += 1.0;\n"
+     "        }\n"
+     "    if (n == 0.0) return 0.0;\n"
+     "    near /= n;\n"
+     "    float step = 0.5 * clamp(a.soft * (d - near) / max(near, 1.0) / texel, 1.0, 8.0);\n"
+     "    for (int j = -2; j <= 2; j++)\n"
+     "        for (int i = -2; i <= 2; i++) {\n"
+     "            int2 o = int2(round(float2(i, j) * step));\n"
+     "            float2 m = views.read(uint2(clamp(c + o, int2(0), int2(a.res) - 1)), slice).xy;\n"
+     "            sum += d <= m.x + bias && d > m.y + bias ? 1.0 : 0.0;\n"
+     "        }\n"
+     "    return sum / 25.0; }\n"
+     "kernel void pshadow_main(texture2d<float> zt [[texture(0)]], texture2d_array<float> views [[texture(1)]],\n"
+     "                         texture2d<float, access::write> out [[texture(2)]], constant PP &a [[buffer(0)]],\n"
+     "                         constant FL *L [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {\n"
+     "    if (any(gid >= uint2(a.hsize))) return;\n"
+     "    int2 p = int2(gid);\n"
+     "    if (zt.read(gid).x <= 0.0) { out.write(float4(1.0), gid); return; }\n"
+     "    float3 P = vpos(a, zt, p);\n"
+     "    float3 l = vpos(a, zt, p - int2(1, 0)), r = vpos(a, zt, p + int2(1, 0));\n"
+     "    float3 u = vpos(a, zt, p - int2(0, 1)), b = vpos(a, zt, p + int2(0, 1));\n"
+     "    float3 dx = abs(r.z - P.z) < abs(P.z - l.z) ? r - P : P - l;\n"
+     "    float3 dy = abs(b.z - P.z) < abs(P.z - u.z) ? b - P : P - u;\n"
+     "    float3 N = normalize(cross(dx, dy));\n"
+     "    if (dot(N, P) > 0.0) N = -N;\n"
+     "    float3 Pw = float3(dot(a.inv[0].xyz, P), dot(a.inv[1].xyz, P), dot(a.inv[2].xyz, P)) +\n"
+     "                float3(a.inv[0].w, a.inv[1].w, a.inv[2].w);\n"
+     "    float3 Nw = float3(dot(a.inv[0].xyz, N), dot(a.inv[1].xyz, N), dot(a.inv[2].xyz, N));\n"
+     // Debugging (BL_PROP_SHADOWS_DEBUG = 10 x light + what): what 1 the distance to the map's
+     // surfaces over the pixel's (0.5 equal), 2 to the props too, 3 whether in the light's cone
+     // and facing it.
+     "    if (a.debug > 0.0) {\n"
+     "        int k = int(a.debug) / 10, what = int(a.debug) % 10;\n"
+     "        if (k >= int(a.nshadow) || a.light[k].w < 0.0) { out.write(float4(0.25), gid); return; }\n"
+     "        float3 r = Pw - a.light[k].xyz; float d = length(r); float3 ar = abs(r);\n"
+     "        if (what == 3) { int i = int(a.index[k]); float3 ld = normalize(L[i].pos.xyz - P); float cs = dot(-ld, L[i].dir.xyz);\n"
+     "            bool in = dot(L[i].dir.xyz, L[i].dir.xyz) < 0.25 || cs > L[i].dir.w;\n"
+     "            out.write(float4(in ? saturate(dot(N, ld)) : 0.0), gid); return; }\n"
+     "        int ax = ar.x >= ar.y && ar.x >= ar.z ? 0 : ar.y >= ar.z ? 1 : 2;\n"
+     "        float3 q = face_of(r, ax); float s = q.z >= 0.0 ? 1.0 : -1.0; float2 ndc = q.xy / (q.z * s);\n"
+     "        int2 c = int2(float2(ndc.x * 0.5 + 0.5, 0.5 - 0.5 * ndc.y) * a.res);\n"
+     "        float2 m = views.read(uint2(clamp(c, int2(0), int2(a.res) - 1)), uint(a.light[k].w) + uint(ax * 2) + (s < 0.0 ? 1u : 0u)).xy;\n"
+     "        out.write(float4(saturate((what == 2 ? m.y : m.x) / d * 0.5)), gid); return; }\n"
+     "    const float3 lw = float3(0.2126, 0.7152, 0.0722);\n"
+     "    float total = 0.0, occ = 0.0;\n"
+     "    for (int k = 0; k < int(a.nlights); k++) {\n"
+     "        float3 v = L[k].pos.xyz - P;\n"
+     "        float d2 = max(dot(v, v), 64.0), d = sqrt(d2);\n"
+     "        float3 ld = v / d;\n"
+     "        float e = 1.0 / (L[k].att.x + L[k].att.y * d + L[k].att.z * d2);\n"
+     "        if (L[k].pos.w > 0.0) { float x = d / L[k].pos.w; e *= saturate(1.0 - x * x * x * x); }\n"
+     "        if (dot(L[k].dir.xyz, L[k].dir.xyz) > 0.25) {\n"
+     "            float cs = dot(-ld, L[k].dir.xyz), inner = L[k].color.w, outer = L[k].dir.w;\n"
+     "            if (cs <= outer) continue;\n"
+     "            if (cs < inner) e *= (cs - outer) / max(inner - outer, 1e-4);\n"
+     "        }\n"
+     "        float li = dot(L[k].color.rgb, lw) * e * saturate(dot(N, ld));\n"
+     "        if (li <= 0.0) continue;\n"
+     "        total += li;\n"
+     "        for (int j = 0; j < int(a.nshadow); j++)\n"
+     "            if (int(a.index[j]) == k && a.light[j].w >= 0.0) occ += li * blocked(a, views, j, Pw, Nw);\n"
+     "    }\n"
+     "    out.write(float4(total > 0.0 ? 1.0 - a.strength * occ / total : 1.0), gid); }\n";
+
+static id<MTLLibrary> pshadow_library(void)
+{
+    static id<MTLLibrary> lib;
+    if (!lib) {
+        NSError *error = nil;
+        lib = [mtl newLibraryWithSource:pshadow_source options:nil error:&error];
+        if (!lib) bl_fatal("object shadow shader: %s", error.localizedDescription.UTF8String);
+    }
+    return lib;
+}
+
+// The views' pipelines: the map's surfaces into both distances (props 0), the props into
+// the second; each keeps the nearest (blend min).
+static id<MTLRenderPipelineState> pshadow_pipeline(int props)
+{
+    static id<MTLRenderPipelineState> p[2];
+    if (p[props]) return p[props];
+    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    d.vertexFunction = [pshadow_library() newFunctionWithName:@"pshadow_vs"];
+    d.fragmentFunction = [pshadow_library() newFunctionWithName:@"pshadow_fs"];
+    MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[0];
+    c.pixelFormat = MTLPixelFormatRG16Float;
+    c.blendingEnabled = YES;
+    c.rgbBlendOperation = c.alphaBlendOperation = MTLBlendOperationMin;
+    c.sourceRGBBlendFactor = c.destinationRGBBlendFactor = MTLBlendFactorOne;
+    c.sourceAlphaBlendFactor = c.destinationAlphaBlendFactor = MTLBlendFactorOne;
+    c.writeMask = props ? MTLColorWriteMaskGreen : MTLColorWriteMaskRed | MTLColorWriteMaskGreen;
+    NSError *error = nil;
+    p[props] = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
+    if (!p[props]) bl_fatal("object shadow pipeline: %s", error.localizedDescription.UTF8String);
+    return p[props];
+}
+
+// Light `slot`'s six views, round pos. Props whose bounds hold the light (within 4 units)
+// are its fittings (a spot under the bar's counter, a lamp's shade) and cast none of its
+// shadows, as the map compiler had it.
+static void pshadow_draw_views(int slot, const float pos[3])
+{
+    int res = env_pshadow_res, skip[8] = {-1, -1, -1, -1, -1, -1, -1, -1}, nskip = 0;
+    for (int b = 0; b < pshadow_nbox && nskip < 8; b++) {
+        const float *x = pshadow_box[b];
+        if (pos[0] > x[0] - 4 && pos[0] < x[3] + 4 && pos[1] > x[1] - 4 && pos[1] < x[4] + 4 && pos[2] > x[2] - 4 && pos[2] < x[5] + 4)
+            skip[nskip++] = b;
+    }
+    if (!pshadow_views || (int)pshadow_views.width != res) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float
+                                                                                      width:(NSUInteger)res
+                                                                                     height:(NSUInteger)res
+                                                                                  mipmapped:NO];
+        td.textureType = MTLTextureType2DArray;
+        td.arrayLength = 6 * PSHADOW_LIGHTS;
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        pshadow_views = [mtl newTextureWithDescriptor:td];
+        memset(pshadow_slot, 0, sizeof pshadow_slot);
+    }
+    for (int f = 0; f < 6; f++) {
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+        rp.colorAttachments[0].texture = pshadow_views;
+        rp.colorAttachments[0].slice = (NSUInteger)(slot * 6 + f);
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(60000, 60000, 0, 0);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        BLRender *e = stat_render(rp, "pshadow_views");
+        struct pshadow_view v = {{pos[0], pos[1], pos[2], 0.5f}, {(float)(f / 2), f & 1 ? -1.0f : 1.0f, 0, 0}, {0}, -1, {0}};
+        memcpy(v.skip, skip, sizeof skip);
+        [e setViewport:(MTLViewport){0, 0, res, res, 0, 1}];
+        [e setScissorRect:(MTLScissorRect){0, 0, (NSUInteger)res, (NSUInteger)res}];
+        [e setCullMode:MTLCullModeNone];
+        [e setVertexBuffer:pshadow_mesh offset:0 atIndex:0];
+        [e setVertexBuffer:pshadow_owner offset:0 atIndex:2];
+        [e setRenderPipelineState:pshadow_pipeline(0)];
+        [e setVertexBytes:&v length:sizeof v atIndex:1];
+        [e setFragmentBytes:&v length:sizeof v atIndex:1];
+        if (pshadow_world) [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:(NSUInteger)(3 * pshadow_world)];
+        v.light[3] = env_pshadow_near, v.world = (int)pshadow_world;
+        [e setRenderPipelineState:pshadow_pipeline(1)];
+        [e setVertexBytes:&v length:sizeof v atIndex:1];
+        [e setFragmentBytes:&v length:sizeof v atIndex:1];
+        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:(NSUInteger)(3 * pshadow_world)
+              vertexCount:(NSUInteger)(3 * pshadow_props)];
+        [e endEncoding];
+    }
+    memcpy(pshadow_slot[slot].pos, pos, 12);
+    pshadow_slot[slot].valid = 1;
+    if (getenv("BL_PROP_SHADOWS_LOG"))
+        fprintf(stderr, "[metal] object shadows: views of the light at %.0f %.0f %.0f, %d of its fittings left out\n", pos[0], pos[1],
+                pos[2], nskip);
+}
+
+static struct pshadow_params pshadow_frame;
+static struct ao_params pshadow_result_params;
+
+// Before the traces: the shadow lights' views (drawing at most one light's new ones) and
+// the trace's parameters; 0 when no light is near.
+static int pshadow_prepare(const struct ao_params *ap)
+{
+    int n = view_lights();
+    if (!n) return 0;
+    struct pshadow_params *a = &pshadow_frame;
+    memset(a, 0, sizeof *a);
+    a->full[0] = ap->full[0], a->full[1] = ap->full[1], a->half[0] = ap->half[0], a->half[1] = ap->half[1];
+    a->p00 = ap->p00, a->p11 = ap->p11, a->strength = env_pshadow_strength, a->nlights = (float)frame_nchar;
+    a->res = (float)env_pshadow_res;
+    a->debug = getenv("BL_PROP_SHADOWS_DEBUG") ? (float)atof(getenv("BL_PROP_SHADOWS_DEBUG")) : 0;
+    a->soft = env_pshadow_soft;
+    // The shadow lights: the brightest at the camera, as much as it sees them (a lamp upstairs
+    // lights nothing the camera sees).
+    int pick[PSHADOW_LIGHTS], ns = 0;
+    float best[PSHADOW_LIGHTS];
+    for (int i = 0; i < frame_nchar; i++) {
+        const float *c = char_lights[i].color, *t = char_lights[i].att;
+        float v[3] = {frame_wpos[i][0] - frame_cam[0], frame_wpos[i][1] - frame_cam[1], frame_wpos[i][2] - frame_cam[2]};
+        float d2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2], d = sqrtf(d2);
+        float score = (0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2]) / (t[0] + t[1] * d + t[2] * d2 + 1) * frame_wvis[i];
+        if (frame_wvis[i] < 0.5f) continue;
+        int j = ns < PSHADOW_LIGHTS ? ns++ : PSHADOW_LIGHTS;
+        if (j == PSHADOW_LIGHTS && score <= best[PSHADOW_LIGHTS - 1]) continue;
+        if (j == PSHADOW_LIGHTS) j = PSHADOW_LIGHTS - 1;
+        while (j > 0 && best[j - 1] < score) pick[j] = pick[j - 1], best[j] = best[j - 1], j--;
+        pick[j] = i, best[j] = score;
+    }
+    a->nshadow = (float)ns;
+    // view_rows: world to view, a rotation and a shift; back is the transpose.
+    for (int c = 0; c < 3; c++) {
+        for (int r = 0; r < 3; r++) a->inv[c][r] = view_rows[r][c];
+        a->inv[c][3] = -(view_rows[0][c] * view_rows[0][3] + view_rows[1][c] * view_rows[1][3] + view_rows[2][c] * view_rows[2][3]);
+    }
+    int taken[PSHADOW_LIGHTS] = {0}, slot_of[PSHADOW_LIGHTS];
+    for (int i = 0; i < ns; i++) {
+        slot_of[i] = -1;
+        for (int s = 0; s < PSHADOW_LIGHTS; s++)
+            if (pshadow_slot[s].valid && !taken[s] && !memcmp(pshadow_slot[s].pos, frame_wpos[pick[i]], 12)) {
+                slot_of[i] = s, taken[s] = 1;
+                break;
+            }
+    }
+    int drawn = 0;
+    for (int i = 0; i < ns; i++) {
+        if (slot_of[i] < 0 && !drawn) {
+            int s = 0;
+            while (s < PSHADOW_LIGHTS && taken[s]) s++;
+            pshadow_draw_views(s, frame_wpos[pick[i]]);
+            slot_of[i] = s, taken[s] = 1, drawn = 1;
+        }
+        for (int k = 0; k < 3; k++) a->light[i][k] = frame_wpos[pick[i]][k];
+        a->light[i][3] = slot_of[i] < 0 ? -1 : (float)(slot_of[i] * 6);
+        a->index[i] = (float)pick[i];
+    }
+    LOG_ONCE("[metal] object shadows: %d lights, %ld + %ld triangles, views %d across\n", ns, pshadow_world, pshadow_props,
+             env_pshadow_res);
+    if (getenv("BL_PROP_SHADOWS_LOG") && frames % 60 == 0)
+        for (int j = 0, i; j < ns && (i = pick[j]) >= 0; j++)
+            fprintf(stderr, "[metal] object shadows: frame %lu light %d at %.0f %.0f %.0f colour %.0f %.0f %.0f spot %d, camera %.0f %.0f %.0f\n",
+                    frames, i, frame_wpos[i][0], frame_wpos[i][1], frame_wpos[i][2], char_lights[i].color[0], char_lights[i].color[1],
+                    char_lights[i].color[2], (char_lights[i].dir[0] * char_lights[i].dir[0] + char_lights[i].dir[1] * char_lights[i].dir[1] + char_lights[i].dir[2] * char_lights[i].dir[2]) > 0.25f, frame_cam[0], frame_cam[1], frame_cam[2]);
+    return 1;
+}
+
+// The trace into ao_texture 25, in post_traces' encoder.
+static void pshadow_trace(BLCompute *c, id<MTLTexture> z)
+{
+    static id<MTLComputePipelineState> k;
+    [c setComputePipelineState:kernel_of(pshadow_library(), @"pshadow_main", &k)];
+    [c setTexture:z atIndex:0];
+    [c setTexture:pshadow_views atIndex:1];
+    [c setTexture:ao_texture(25, MTLPixelFormatR16Float, z.width, z.height) atIndex:2];
+    [c setBytes:&pshadow_frame length:sizeof pshadow_frame atIndex:0];
+    [c setBytes:char_lights length:sizeof char_lights[0] * (size_t)frame_nchar atIndex:1];
+    [c dispatchAlongside:MTLSizeMake((z.width + 7) / 8, (z.height + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+}
+
+// After the trace: the occlusion's filter and upsample; multiplied in as it is, but not on
+// bright pixels.
+static void pshadow_run(id<MTLTexture> z, id<MTLTexture> depth, const struct ao_params *ap)
+{
+    id<MTLTexture> raw = ao_texture(25, MTLPixelFormatR16Float, z.width, z.height);
+    id<MTLTexture> soft = ao_texture(26, MTLPixelFormatRG32Float, z.width, z.height);
+    ao_pass(2, soft, raw, z, ap);
+    id<MTLTexture> full = ao_texture(27, MTLPixelFormatR8Unorm, depth.width, depth.height);
+    ao_pass(7, full, soft, depth, ap);
+    pshadow_result = full, pshadow_result_params = *ap;
+    pshadow_result_params.strength = 1, pshadow_result_params.glow = 1, pshadow_result_params.power = 1;
+}
+
+// Called by pass() for a new pass on the back buffer, after contact_apply.
+static void pshadow_apply(BLRender *e, id<MTLTexture> color, int has_depth)
+{
+    MTLPixelFormat df = has_depth ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
+    [e setRenderPipelineState:ao_pipeline(env_pshadow_show ? 4 : 3, color.pixelFormat, df)];
+    static id<MTLDepthStencilState> none;
+    if (!none) none = [mtl newDepthStencilStateWithDescriptor:[MTLDepthStencilDescriptor new]];
+    [e setDepthStencilState:none];
+    [e setCullMode:MTLCullModeNone];
+    [e setViewport:(MTLViewport){0, 0, color.width, color.height, 0, 1}];
+    [e setScissorRect:(MTLScissorRect){0, 0, color.width, color.height}];
+    [e setFragmentTexture:pshadow_result atIndex:0];
+    [e setFragmentBytes:&pshadow_result_params length:sizeof pshadow_result_params atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    pshadow_result = nil;
+}
+
 // --- temporal anti-aliasing --------------------------------------------------------------
 //
 // The anti-aliasing: MetalFX's temporal scaler at the back buffer's own size (there is no
-// multisampling). Each frame the world view's draws move by a
+// multisampling), or with upscaling (world_res) from the world view's smaller one up to
+// it. Each frame the world view's draws move by a
 // different fraction of a pixel (a Halton 2,3 pattern of 8, added to D3D9's half-pixel
 // offset in d3d_vs_params.inv_viewport), and the scaler blends the frame with the ones
 // before it, following motion vectors. Those are the camera's alone (taa_motion): each
@@ -4012,17 +4954,111 @@ static float halton(unsigned i, unsigned b)
     return r;
 }
 
-// The scaler and its textures for a w x h picture.
-static void taa_setup(NSUInteger w, NSUInteger h)
+// --- FSR 4 (FSR4Metal) ---
+// AMD's FSR 4 in MetalFX's place when the Visual tab's Upscaler says so: libFSR4Metal and
+// its model (fsr4_assets), loaded from the FSR4Metal folder beside the game's
+// (BL_FSR4_DIR: elsewhere). Neither is part of this project: FSR4Metal's code is GPL and
+// its model is under AMD's driver licence. It takes the same picture, depth, motion vectors
+// and offset as MetalFX's scaler (taa_resolve) and writes the window-sized picture.
+typedef struct FSR4MtlContext FSR4MtlContext;
+typedef struct {
+    __unsafe_unretained id<MTLTexture> color, motion, depth, output;
+    uint32_t renderWidth, renderHeight;
+    float jitterX, jitterY, motionScaleX, motionScaleY, preExposure, sharpness;
+    bool sharpen, reset, depthReversed, autoExposure;
+} FSR4MtlDispatch;  // as FSR4Metal.h declares it
+static FSR4MtlContext *fsr4;
+static bool (*fsr4_encode)(FSR4MtlContext *, id<MTL4CommandBuffer>, const FSR4MtlDispatch *);
+static const char *(*fsr4_error)(const FSR4MtlContext *);
+
+// Loads FSR4Metal; 0 with why filled when it can't be.
+static int fsr4_try(char *why, size_t n)
 {
-    if (taa_scaler && taa_scaler.inputWidth == w && taa_scaler.inputHeight == h) return;
+    if (fsr4) return 1;
+    char dir[1024], host[1024], path[1200];
+    if (getenv("BL_FSR4_DIR")) {
+        snprintf(dir, sizeof dir, "%s", getenv("BL_FSR4_DIR"));
+    } else {
+        if (!bl_path_to_host(BL_WIN_ROOT, host, sizeof host)) return snprintf(why, n, "no game folder"), 0;
+        char *slash = strrchr(host, '/');
+        if (slash && !slash[1]) *slash = 0, slash = strrchr(host, '/');
+        if (slash) *slash = 0;
+        snprintf(dir, sizeof dir, "%s/FSR4Metal", host);
+    }
+    snprintf(path, sizeof path, "%s/lib/libFSR4Metal.dylib", dir);
+    void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!lib) return snprintf(why, n, "can't load %s (%s); BL_FSR4_DIR sets the FSR4Metal folder", path, dlerror()), 0;
+    FSR4MtlContext *(*create)(id<MTLDevice>, const char *, const char **) = dlsym(lib, "fsr4mtl_create");
+    fsr4_encode = dlsym(lib, "fsr4mtl_encode");
+    fsr4_error = dlsym(lib, "fsr4mtl_error");
+    const char *(*describe)(const FSR4MtlContext *) = dlsym(lib, "fsr4mtl_describe");
+    if (!create || !fsr4_encode || !fsr4_error) return snprintf(why, n, "%s is not FSR4Metal's library", path), 0;
+    snprintf(path, sizeof path, "%s/fsr4_assets", dir);
+    const char *err = NULL;
+    fsr4 = create(mtl, path, &err);
+    if (!fsr4) return snprintf(why, n, "%s (%s)", err ? err : "no context", path), 0;
+    fprintf(stderr, "[metal] FSR 4: loaded from %s%s%s\n", dir, describe ? ", " : "", describe ? describe(fsr4) : "");
+    return 1;
+}
+
+// FSR 4 is the choice but can't run: the game stops (no fallback), but the saved choice
+// goes back to MetalFX first, so the next start isn't stopped the same way.
+static _Noreturn void fsr4_fail(const char *why)
+{
+    bl_reg_set_dword(EFFECT_KEY, UPSCALER_KEY_VALUE, UPSCALER_METALFX);
+    bl_fatal("FSR 4: %s. The Upscaler is set back to MetalFX for the next start%s", why,
+             getenv("BL_UPSCALER") ? " (BL_UPSCALER still asks for FSR 4)" : "");
+}
+
+// FSR 4's textures for a w x h picture brought to ow x oh (taa_setup's, with an output it
+// can write).
+static void fsr4_setup(NSUInteger w, NSUInteger h, NSUInteger ow, NSUInteger oh)
+{
+    char why[1400];
+    if (!fsr4_try(why, sizeof why)) fsr4_fail(why);
+    if (ow > FSR4_MAX_W || oh > FSR4_MAX_H) {
+        snprintf(why, sizeof why, "the window is %lux%lu, more than the %dx%d it can make", (unsigned long)ow,
+                 (unsigned long)oh, FSR4_MAX_W, FSR4_MAX_H);
+        fsr4_fail(why);
+    }
+    MTLPixelFormat pf[4] = {MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA16Float, MTLPixelFormatRG16Float,
+                            MTLPixelFormatDepth32Float};
+    id<MTLTexture> __strong *t[4] = {&taa_in, &taa_out, &taa_mv, &taa_z};
+    static NSString *const labels[4] = {@"FSR 4 input", @"FSR 4 output", @"FSR 4 motion", @"FSR 4 depth"};
+    for (int i = 0; i < 4; i++) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf[i] width:i == 1 ? ow : w
+                                                                                     height:i == 1 ? oh : h
+                                                                                  mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | (i == 1 ? MTLTextureUsageShaderWrite : 0);
+        td.storageMode = MTLStorageModePrivate;
+        *t[i] = [mtl newTextureWithDescriptor:td];
+        (*t[i]).label = labels[i];
+    }
+    taa_reset = 1;
+    fprintf(stderr, "[metal] TAA: FSR 4, %lux%lu to %lux%lu\n", (unsigned long)w, (unsigned long)h, (unsigned long)ow,
+            (unsigned long)oh);
+}
+
+// The scaler and its textures for a w x h picture brought to ow x oh (the same size
+// unless upscaling).
+static void taa_setup(NSUInteger w, NSUInteger h, NSUInteger ow, NSUInteger oh)
+{
+    static int made_for = -1;  // the upscaler the textures were made for
+    if (taa_in && taa_in.width == w && taa_in.height == h && taa_out.width == ow && taa_out.height == oh &&
+        made_for == upscaler)
+        return;
+    made_for = upscaler;
     taa_scaler = nil;
+    if (upscaler == UPSCALER_FSR4) {
+        fsr4_setup(w, h, ow, oh);
+        return;
+    }
     MTLFXTemporalScalerDescriptor *d = [MTLFXTemporalScalerDescriptor new];
     d.colorTextureFormat = d.outputTextureFormat = MTLPixelFormatRGBA16Float;
     d.depthTextureFormat = MTLPixelFormatDepth32Float;
     d.motionTextureFormat = MTLPixelFormatRG16Float;
-    d.inputWidth = d.outputWidth = w;
-    d.inputHeight = d.outputHeight = h;
+    d.inputWidth = w, d.outputWidth = ow;
+    d.inputHeight = h, d.outputHeight = oh;
     static id<MTL4Compiler> compiler;
     if (!compiler) compiler = [mtl newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:nil];
     taa_scaler = [d newTemporalScalerWithDevice:mtl compiler:compiler];
@@ -4035,7 +5071,8 @@ static void taa_setup(NSUInteger w, NSUInteger h)
     id<MTLTexture> __strong *t[4] = {&taa_in, &taa_out, &taa_mv, &taa_z};
     static NSString *const labels[4] = {@"TAA input", @"TAA output", @"TAA motion", @"TAA depth"};
     for (int i = 0; i < 4; i++) {
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf[i] width:w height:h
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf[i] width:i == 1 ? ow : w
+                                                                                     height:i == 1 ? oh : h
                                                                                   mipmapped:NO];
         td.usage = usage[i] | MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         td.storageMode = MTLStorageModePrivate;
@@ -4043,7 +5080,8 @@ static void taa_setup(NSUInteger w, NSUInteger h)
         (*t[i]).label = labels[i];
     }
     taa_reset = 1;
-    LOG_ONCE("[metal] TAA: MetalFX temporal scaler at %lux%lu\n", (unsigned long)w, (unsigned long)h);
+    fprintf(stderr, "[metal] TAA: MetalFX temporal scaler, %lux%lu to %lux%lu\n", (unsigned long)w, (unsigned long)h,
+            (unsigned long)ow, (unsigned long)oh);
 }
 
 static NSString *const taa_source =
@@ -4077,9 +5115,16 @@ static NSString *const taa_source =
      "    float3 s = t.read(uint2(clamp(p + int2(0, 1), int2(0), m))).rgb;\n"
      "    float3 mn = min(min(min(n, w), min(e, s)), c.rgb), mx = max(max(max(n, w), max(e, s)), c.rgb);\n"
      "    float3 k = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1e-4))) * (-1.0 / mix(8.0, 5.0, sharpen));\n"
-     "    return float4(max(((n + w + e + s) * k + c.rgb) / (1.0 + 4.0 * k), 0.0), c.a); }\n";
+     "    return float4(max(((n + w + e + s) * k + c.rgb) / (1.0 + 4.0 * k), 0.0), c.a); }\n"
+     // Upscaling: the world view's depth (nearest) into the window-sized depth buffer, for
+     // the view model drawn after it (world_up).
+     "struct DO { float depth [[depth(any)]]; };\n"
+     "fragment DO taa_depth_up(V in [[stage_in]], depth2d<float> z [[texture(0)]], constant float2 &k [[buffer(0)]]) {\n"
+     "    uint2 m = uint2(z.get_width(), z.get_height()) - 1;\n"
+     "    DO o; o.depth = z.read(min(uint2(in.pos.xy * k), m)); return o; }\n";
 
-// kind 0: the motion vectors and depth copy; 1: the copy back into a `color` target.
+// kind 0: the motion vectors and depth copy; 1: the copy back into a `color` target;
+// 2: the world view's depth into a `color` (here a depth and stencil) target.
 static id<MTLRenderPipelineState> taa_pipeline(int kind, MTLPixelFormat color)
 {
     static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *cache;
@@ -4090,15 +5135,21 @@ static id<MTLRenderPipelineState> taa_pipeline(int kind, MTLPixelFormat color)
         lib = [mtl newLibraryWithSource:taa_source options:nil error:&error];
         if (!lib) bl_fatal("TAA shader: %s", error.localizedDescription.UTF8String);
     }
-    NSNumber *key = @(color * 2 + (NSUInteger)kind);
+    NSNumber *key = @(color * 4 + (NSUInteger)kind);
     id<MTLRenderPipelineState> p = cache[key];
     if (p) return p;
     MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+    static NSString *const names[3] = {@"taa_motion", @"taa_copy", @"taa_depth_up"};
     d.vertexFunction = [lib newFunctionWithName:@"taa_vs"];
-    d.fragmentFunction = [lib newFunctionWithName:kind ? @"taa_copy" : @"taa_motion"];
-    d.colorAttachments[0].pixelFormat = color;
-    if (kind) d.colorAttachments[0].writeMask = MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue;
-    else d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    d.fragmentFunction = [lib newFunctionWithName:names[kind]];
+    if (kind == 2) {
+        d.depthAttachmentPixelFormat = color;
+        if (color == MTLPixelFormatDepth32Float_Stencil8) d.stencilAttachmentPixelFormat = color;
+    } else {
+        d.colorAttachments[0].pixelFormat = color;
+    }
+    if (kind == 1) d.colorAttachments[0].writeMask = MTLColorWriteMaskRed | MTLColorWriteMaskGreen | MTLColorWriteMaskBlue;
+    else if (kind == 0) d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     NSError *error = nil;
     p = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
     if (!p) bl_fatal("TAA pipeline: %s", error.localizedDescription.UTF8String);
@@ -4106,15 +5157,15 @@ static id<MTLRenderPipelineState> taa_pipeline(int kind, MTLPixelFormat color)
     return p;
 }
 
-// From post_run, with the world view's depth (single-sampled) and size; 0 when this frame
-// has no camera to go by.
-static int taa_motion(id<MTLTexture> depth, NSUInteger w, NSUInteger h)
+// From post_run, with the world view's depth (single-sampled) and size, and the window's;
+// 0 when this frame has no camera to go by.
+static int taa_motion(id<MTLTexture> depth, NSUInteger w, NSUInteger h, NSUInteger ow, NSUInteger oh)
 {
     int best = -1;
     for (int i = 0; i < taa_ncams; i++)
         if (taa_cams[i].n >= 2 && (best < 0 || taa_cams[i].n > taa_cams[best].n)) best = i;
     if (best < 0) return 0;
-    taa_setup(w, h);
+    taa_setup(w, h, ow, oh);
     double cur[4][4], inv[4][4], reproj[4][4];
     for (int i = 0; i < 4; i++)
         for (int k = 0; k < 4; k++) cur[i][k] = taa_cams[best].m[i][k];
@@ -4180,41 +5231,135 @@ static int taa_motion(id<MTLTexture> depth, NSUInteger w, NSUInteger h)
     return 1;
 }
 
-// From pass(), on the back buffer's texture once the effects are drawn in.
-static void taa_resolve(id<MTLTexture> color)
+// From world_up, on the back buffer's texture once the effects are drawn in (the world
+// view's smaller one when upscaling), into `out` (the back buffer's window-sized one); 0
+// when the scaler is not made for these sizes (the setting changed since post_run).
+static int taa_resolve(id<MTLTexture> color, id<MTLTexture> out)
 {
     NSUInteger w = color.width, h = color.height;
-    if (!taa_scaler || taa_in.width != w || taa_in.height != h) return;
+    int fsr = upscaler == UPSCALER_FSR4;
+    if ((fsr ? !fsr4 : !taa_scaler) || taa_in.width != w || taa_in.height != h || taa_out.width != out.width ||
+        taa_out.height != out.height)
+        return 0;
     uint32_t r[4] = {0, 0, (uint32_t)w, (uint32_t)h};
     stretch_draw(color, r, taa_in, r, 0);
-    taa_scaler.colorTexture = taa_in;
-    taa_scaler.depthTexture = taa_z;
-    taa_scaler.motionTexture = taa_mv;
-    taa_scaler.outputTexture = taa_out;
-    taa_scaler.inputContentWidth = w;
-    taa_scaler.inputContentHeight = h;
-    taa_scaler.jitterOffsetX = taa_jitter_sign * taa_jitter[0];
-    taa_scaler.jitterOffsetY = taa_jitter_sign * taa_jitter[1];
-    taa_scaler.motionVectorScaleX = (float)w;
-    taa_scaler.motionVectorScaleY = (float)h;
-    taa_scaler.depthReversed = NO;
-    taa_scaler.reset = taa_reset;
     mtl4_track(taa_in), mtl4_track(taa_z), mtl4_track(taa_mv), mtl4_track(taa_out);
-    [taa_scaler encodeToCommandBuffer:command_buffer()];
+    if (fsr) {
+        FSR4MtlDispatch f = {taa_in, taa_mv, taa_z, taa_out, (uint32_t)w, (uint32_t)h,
+                             taa_jitter_sign * taa_jitter[0], taa_jitter_sign * taa_jitter[1], (float)w, (float)h,
+                             1, 0, false, taa_reset != 0, false, true};
+        if (!fsr4_encode(fsr4, command_buffer(), &f)) bl_fatal("FSR 4: %s", fsr4_error(fsr4));
+    } else {
+        taa_scaler.colorTexture = taa_in;
+        taa_scaler.depthTexture = taa_z;
+        taa_scaler.motionTexture = taa_mv;
+        taa_scaler.outputTexture = taa_out;
+        taa_scaler.inputContentWidth = w;
+        taa_scaler.inputContentHeight = h;
+        taa_scaler.jitterOffsetX = taa_jitter_sign * taa_jitter[0];
+        taa_scaler.jitterOffsetY = taa_jitter_sign * taa_jitter[1];
+        taa_scaler.motionVectorScaleX = (float)w;
+        taa_scaler.motionVectorScaleY = (float)h;
+        taa_scaler.depthReversed = NO;
+        taa_scaler.reset = taa_reset;
+        [taa_scaler encodeToCommandBuffer:command_buffer()];
+    }
     // Colour only: the game never clears the back buffer, so its alpha (which the scaler
     // need not keep) stays the game's own for the next frame's draws.
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
-    rp.colorAttachments[0].texture = color;
+    rp.colorAttachments[0].texture = out;
     rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     BLRender *e = stat_render(rp, __func__);
-    [e setRenderPipelineState:taa_pipeline(1, color.pixelFormat)];
+    [e setRenderPipelineState:taa_pipeline(1, out.pixelFormat)];
     [e setFragmentTexture:taa_out atIndex:0];
     float sharpen = env_sharpen ? fminf(fmaxf(env_sharpen_strength, 0), 1) : 0;
     [e setFragmentBytes:&sharpen length:sizeof sharpen atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
     taa_reset = 0, taa_done = 1;
+    return 1;
+}
+
+// Upscaling: the world view's depth (nearest) into the window-sized depth buffer.
+static void world_depth_up(id<MTLTexture> from, id<MTLTexture> to)
+{
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.depthAttachment.texture = to;
+    rp.depthAttachment.loadAction = MTLLoadActionDontCare;
+    rp.depthAttachment.storeAction = MTLStoreActionStore;
+    if (to.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+        rp.stencilAttachment.texture = to;
+        rp.stencilAttachment.loadAction = MTLLoadActionLoad;
+        rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    }
+    BLRender *e = stat_render(rp, __func__);
+    [e setRenderPipelineState:taa_pipeline(2, to.pixelFormat)];
+    static id<MTLDepthStencilState> write;
+    if (!write) {
+        MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = YES;
+        write = [mtl newDepthStencilStateWithDescriptor:dd];
+    }
+    [e setDepthStencilState:write];
+    float k[2] = {(float)from.width / to.width, (float)from.height / to.height};
+    [e setFragmentTexture:from atIndex:0];
+    [e setFragmentBytes:k length:sizeof k atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+}
+
+// From pass(), for the pass that ends the world view (its effects drawn in): the picture
+// through the temporal scaler, or upscaling with no camera to go by this frame, stretched
+// up; with upscaling the depth too, and the pass reopened on the window-sized targets for
+// the view model and HUD.
+static void world_up(struct d3d_state *s, MTL4RenderPassDescriptor *d)
+{
+    [enc endEncoding];
+    struct obj *color = s->render_target[0], *depth = s->depth_stencil;
+    id<MTLTexture> from = target_texture(color), zfrom = depth ? target_texture(depth) : nil;
+    world_low = 0;
+    id<MTLTexture> to = target_texture(color);
+    if (!(taa_pending && taa_resolve(from, to)) && from != to) {
+        uint32_t fr[4] = {0, 0, (uint32_t)from.width, (uint32_t)from.height}, tr[4] = {0, 0, (uint32_t)to.width, (uint32_t)to.height};
+        stretch_draw(from, fr, to, tr, 1);
+    }
+    taa_pending = 0;
+    d.colorAttachments[0].texture = to;
+    d.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    if (depth) {
+        id<MTLTexture> zto = target_texture(depth);
+        if (zto != zfrom) world_depth_up(zfrom, zto);
+        d.depthAttachment.texture = zto;
+        d.stencilAttachment.texture = zto;
+    }
+    d.depthAttachment.loadAction = d.stencilAttachment.loadAction = MTLLoadActionLoad;
+    enc = stat_render(d, "pass");
+}
+
+// Before the renderer's own drawing over the HUD (the pause menu's backdrop, the HUD's
+// images): the world view brought up to the window's size first, if the game's drawing
+// since it ended has not.
+static void world_end_now(struct d3d_state *s)
+{
+    if (world_low && view_state == 2 && s->render_target[0] == s->back_buffer) pass(s), end_pass();
+}
+
+// From present: a world view drawn smaller that no pass on the back buffer brought up to
+// the window's size (a frame that ended with its world view, or had none), stretched up.
+static void world_finish(void)
+{
+    if (!world_low) return;
+    end_pass();
+    id<MTLTexture> from = world_bb ? target_texture(world_bb) : nil, zfrom = world_ds ? target_texture(world_ds) : nil;
+    world_low = 0;
+    if (from) {
+        id<MTLTexture> to = target_texture(world_bb);
+        uint32_t fr[4] = {0, 0, (uint32_t)from.width, (uint32_t)from.height}, tr[4] = {0, 0, (uint32_t)to.width, (uint32_t)to.height};
+        stretch_draw(from, fr, to, tr, 1);
+    }
+    if (zfrom) world_depth_up(zfrom, target_texture(world_ds));
 }
 
 // From present: the next frame's offset; a frame the scaler did not see breaks the history.
@@ -4222,7 +5367,19 @@ static void taa_frame_end(void)
 {
     static float scale = 2;  // BL_TAA_JITTER: the span in pixels, negative flipped for MetalFX
     static int resolved;
-    if (scale == 2) scale = getenv("BL_TAA_JITTER") ? (float)atof(getenv("BL_TAA_JITTER")) : 0.5f;
+    // Upscaling: the whole pixel, and more steps to the pattern (8 for each window pixel a
+    // world view pixel covers), as MetalFX asks for, so the scaler has every part of each
+    // window pixel to build it from.
+    float r = 1;  // the world view's share of the back buffer's width
+    if (world_bb) {
+        id<MTLTexture> full = target_full(world_bb);
+        NSUInteger w, h;
+        world_size(full, &w, &h);
+        r = (float)w / (float)full.width;
+    }
+    unsigned phases = r < 1 ? (unsigned)ceilf(8 / (r * r)) : 8;
+    if (scale == 2) scale = getenv("BL_TAA_JITTER") ? (float)atof(getenv("BL_TAA_JITTER")) : 0;
+    float span = scale ? fabsf(scale) : r < 1 ? 1.0f : 0.5f;
     taa_jitter_sign = scale < 0 ? -1 : 1;
     resolved += taa_done;
     if (frames % 100 == 0) {
@@ -4231,9 +5388,9 @@ static void taa_frame_end(void)
     }
     if (!taa_done) taa_have_prev = 0, taa_reset = 1;
     taa_done = 0, taa_pending = 0, taa_ncams = 0;
-    taa_phase = taa_phase % 8 + 1;
-    taa_jitter[0] = fabsf(scale) * (halton(taa_phase, 2) - 0.5f);
-    taa_jitter[1] = fabsf(scale) * (halton(taa_phase, 3) - 0.5f);
+    taa_phase = taa_phase % phases + 1;
+    taa_jitter[0] = span * (halton(taa_phase, 2) - 0.5f);
+    taa_jitter[1] = span * (halton(taa_phase, 3) - 0.5f);
 }
 
 // --- bloom and eye adaptation ---------------------------------------------------------
@@ -4756,17 +5913,20 @@ static void post_run(struct d3d_state *s)
     id<MTLTexture> color = target_texture(bb);
     id<MTLTexture> depth = target_texture(ds);
     if (depth.width != color.width || depth.height != color.height) return;
-    taa_pending = taa_motion(depth, color.width, color.height);
+    id<MTLTexture> window = target_full(bb);  // the size the scaler brings it to
+    taa_pending = taa_motion(depth, color.width, color.height, window.width, window.height);
     NSUInteger hw = (color.width + 1) / 2, hh = (color.height + 1) / 2;
     int reflect = env_ssr && info_frame == frames, skin = env_sss && info_frame == frames;
     int contact = contact_on() && info_frame == frames;
+    int pshadow = pshadow_on() && pshadow_ready();
     id<MTLTexture> z = ao_texture(0, MTLPixelFormatR32Float, hw, hh);
     struct ao_params a = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, view_proj.alpha,
                           view_proj.beta, view_proj.p00, view_proj.p11, env_ao_radius,
                           1 / (env_ao_radius * env_ao_radius), 0.2f * (float)hh, env_ao_strength, env_ao_thickness, 3.3f,
-                          taa_pending ? (float)(frames % 64) : 0, 1, taa_pending ? 2.0f : 3.0f};
+                          taa_pending ? (float)(frames % 64) : 0, 1, taa_pending ? 2.0f : 3.0f, env_ao_power};
     int ssil = env_ssil && albedo_frame == frames;
-    if (env_ao || reflect || env_fog || skin || contact || ssil) ao_pass(0, z, depth, nil, &a);
+    if (env_ao || reflect || env_fog || skin || contact || ssil || pshadow) ao_pass(0, z, depth, nil, &a);
+    if (pshadow) pshadow = pshadow_prepare(&a);
     int bloom = env_bloom && (long)frames >= env_bloom_at, eye = env_exposure && (long)frames >= env_bloom_at;
     int post = reflect || env_tonemap || env_hdr || env_fog || skin || bloom || eye || ssil;
     if (post) {
@@ -4784,11 +5944,12 @@ static void post_run(struct d3d_state *s)
         il = ssil_texture(2, MTLPixelFormatRGBA16Float, hw, hh, 0), il_edges = ssil_texture(4, MTLPixelFormatR8Unorm, hw, hh, 0);
     }
     int fog = 0;
-    if (env_ao || ssil || contact || env_fog) {
+    if (env_ao || ssil || contact || env_fog || pshadow) {
         if (env_ao || ssil) ao_depth_copies(z, &a);
         BLCompute *traces = stat_compute("post_traces");
         if (env_ao || ssil) ao_occlusion(traces, raw, z, &a, picture, il, il_edges);
         if (contact) contact = contact_trace(traces, color, z, &a);
+        if (pshadow) pshadow_trace(traces, z);
         if (env_fog) fog = fog_trace(traces, z, a.full);
         [traces endEncoding];
     }
@@ -4813,6 +5974,7 @@ static void post_run(struct d3d_state *s)
         ao_result = full, ao_result_params = a;
     }
     if (contact) contact_run(z, depth, &a);
+    if (pshadow) pshadow_run(z, depth, &a);
     if (!post) return;
     BLCompute *blit;
     struct ssr_params p = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, view_proj.p00,
@@ -5427,17 +6589,37 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
         }
     }
     [e setVertexBytes:vc length:sizeof vc atIndex:20];
+    // The world view on the back buffer may pass white (its float format), unless its
+    // blending weighs by colour (SRCCOLOR, INVSRCCOLOR, DESTCOLOR, INVDESTCOLOR), which
+    // takes 0 to 1 as D3D9 gives it. The view model and HUD (after post_apply's tone map)
+    // stay within white. With HDR its lighting may pass white on the way as well, where
+    // D3D9 clamps it (the vertices' colours, vp color_max, and the fixed-function stages,
+    // pp stage_max), so characters and props under a lamp go past white like the walls
+    // beside them (rebake section); and the bright parts of what it adds on (ONE or
+    // SRCALPHA onto ONE: the lamps' glow sprites) go up to the tone map's peak (pp out_gain).
+    int world_float = 0, added = 0;
+    if (view_state == 1 && !menu_frame && s->render_target[0] == s->back_buffer &&
+        target_texture(s->back_buffer).pixelFormat == MTLPixelFormatRGBA16Float) {
+        int by_colour = 0;
+        for (int i = 1; i <= 2 && k->blend[0]; i++) by_colour |= k->blend[i] == 3 || k->blend[i] == 4 || k->blend[i] == 9 || k->blend[i] == 10;
+        world_float = !by_colour;
+        added = k->blend[0] && (k->blend[1] == 2 || k->blend[1] == 5) && k->blend[2] == 2 && k->blend[3] <= 1;
+    }
+    int hdr_lit = world_float && env_hdr && hdr_peak() > 1.001f;
     struct d3d_vs_params vp;
     memset(&vp, 0, sizeof vp);
+    vp.color_max = hdr_lit ? 64 : 1;
     memcpy(vp.i, s->vs_i, sizeof vp.i);
     memcpy(vp.b, s->vs_b, sizeof vp.b);
     for (int i = 0; i < vs->info.ndefis; i++)
         if (vs->info.defis[i].reg < 16) memcpy(vp.i[vs->info.defis[i].reg], vs->info.defis[i].value, 16);
     for (int i = 0; i < vs->info.ndefbs; i++)
         if (vs->info.defbs[i].reg < 16) vp.b[vs->info.defbs[i].reg] = vs->info.defbs[i].value;
-    float vsc = (float)obj_scale(s->render_target[0]);  // half a pixel of what is drawn
-    vp.inv_viewport[0] = s->viewport[2] ? 1.0f / (s->viewport[2] * vsc) : 0;
-    vp.inv_viewport[1] = s->viewport[3] ? 1.0f / (s->viewport[3] * vsc) : 0;
+    // Half a pixel of what is drawn: the texture's pixels (larger or smaller than the game's
+    // when the target is drawn at another size, as set_viewport).
+    float vsx = rt->width ? (float)rtt.width / rt->width : 1, vsy = rt->height ? (float)rtt.height / rt->height : 1;
+    vp.inv_viewport[0] = s->viewport[2] ? 1.0f / (s->viewport[2] * vsx) : 0;
+    vp.inv_viewport[1] = s->viewport[3] ? 1.0f / (s->viewport[3] * vsy) : 0;
     // The game projects 3D views for a 4:3 screen whatever the resolution, so wider
     // modes come out stretched sideways. Perspective draws whose projection aspect is
     // narrower than the viewport are scaled up vertically to undo it (the view keeps
@@ -5477,8 +6659,8 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
         }
         if (proj > 0 && aspect > proj * 1.01f) vp.clip_y = aspect / proj;
     }
-    if (perspective && to_back_buffer && fabsf(w_row[3]) > 1e-4f && s->viewport[2] == rtt.width &&
-        s->viewport[3] == rtt.height && u2f(s->viewport[4]) == 0 && u2f(s->viewport[5]) >= 0.99f) {
+    if (perspective && to_back_buffer && fabsf(w_row[3]) > 1e-4f && s->viewport[2] == rt->width &&
+        s->viewport[3] == rt->height && u2f(s->viewport[4]) == 0 && u2f(s->viewport[5]) >= 0.99f) {
         const float(*r)[4] = vs->ff_vertex ? vc : vc + 8;
         note_projection(r[0], r[1], r[2], r[3], vp.clip_y);
         // The camera for the motion vectors: from draws without bones (a character's
@@ -5491,8 +6673,8 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
     // nor a menu's) move by this frame's offset, on top of D3D9's half pixel.
     if (perspective && to_back_buffer && !menu_frame && view_state != 2 && fabsf(w_row[3]) > 1e-4f &&
         u2f(s->viewport[5]) >= 0.99f && s->viewport[2] && s->viewport[3]) {
-        vp.inv_viewport[0] += 2 * taa_jitter[0] / (float)s->viewport[2];
-        vp.inv_viewport[1] += 2 * taa_jitter[1] / (float)s->viewport[3];
+        vp.inv_viewport[0] += 2 * taa_jitter[0] / (s->viewport[2] * vsx);
+        vp.inv_viewport[1] += 2 * taa_jitter[1] / (s->viewport[3] * vsy);
     }
     set_viewport(s, e, (uint32_t)rtt.width, (uint32_t)rtt.height, squeeze);
     [e setVertexBytes:&vp length:sizeof vp atIndex:21];
@@ -5516,17 +6698,10 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
         uint64_t h = (s->stream[0]->serial * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)s->stream_offset[0] * 0xC2B2AE3D27D4EB4Full);
         pp.tag = (float)(66 + (h >> 32) % 120) / 255.0f;
     }
-    // The world view on the back buffer may pass white (its float format), unless its
-    // blending weighs by colour (SRCCOLOR, INVSRCCOLOR, DESTCOLOR, INVDESTCOLOR), which
-    // takes 0 to 1 as D3D9 gives it. The view model and HUD (after post_apply's tone map)
-    // stay within white.
-    pp.out_max = 1;
-    if (view_state == 1 && !menu_frame && s->render_target[0] == s->back_buffer &&
-        target_texture(s->back_buffer).pixelFormat == MTLPixelFormatRGBA16Float) {
-        int by_colour = 0;
-        for (int i = 1; i <= 2 && k->blend[0]; i++) by_colour |= k->blend[i] == 3 || k->blend[i] == 4 || k->blend[i] == 9 || k->blend[i] == 10;
-        if (!by_colour) pp.out_max = 64;
-    }
+    // How far past white (world_float, hdr_lit above).
+    pp.out_max = world_float ? 64 : 1;
+    pp.stage_max = hdr_lit ? 64 : 1;
+    pp.out_gain = hdr_lit && added ? hdr_peak() : 1;
     memcpy(pp.i, s->ps_i, sizeof pp.i);
     memcpy(pp.b, s->ps_b, sizeof pp.b);
     for (int i = 0; i < ps->info.ndefis; i++)
@@ -5934,6 +7109,13 @@ static void lightmap_dirty(uint32_t d[4], int x0, int y0, int x1, int y1)
 
 // --- the lighting rebake in the game ------------------------------------------------
 //
+// With HDR on (and no BL_REBAKE), the same machinery keeps the map's light past white:
+// each matched face's own samples (its lighting lump), encoded as the game encodes them
+// but not scaled down where a channel passes 1 (rb_page, the page's size), less the same
+// encoded as the game has them (rb_old), added to the page. Texels the game did not
+// scale down come out as they were; the rest go past white by as much as the map's
+// light does, so lit surfaces near lamps give the tone map real highlights.
+//
 // Shelved (2026-10-26): the bake differs from the 2004 one too much luxel by luxel, so it
 // shows blotched in the game; only BL_REBAKE=1 turns it on, for working on it.
 // With BL_REBAKE=1, the map baked again four times as fine
@@ -6000,7 +7182,7 @@ static int rebake_vert_cmp(const void *a, const void *b)
 static int rebake_face_ok(const struct bl_rebake *rb, int fi)
 {
     const struct bl_bsp_face *f = &rb->world->faces[fi];
-    return rb->bake->faces[fi].offset >= 0 && f->nstyles == 1 && f->styles[0] == 0;
+    return (!rb->bake || rb->bake->faces[fi].offset >= 0) && f->nstyles == 1 && f->styles[0] == 0;
 }
 static void rebake_index(const struct bl_rebake *rb)
 {
@@ -6064,7 +7246,7 @@ static int rebake_match(const struct bl_rebake *rb, const struct lightmap_page *
         int rx = (int)lroundf(r[0][0]), ry = (int)lroundf(r[0][1]), ok = 1;
         for (int c = 0; c < 3; c++) ok &= fabsf(r[c][0] - (float)rx) < 0.05f && fabsf(r[c][1] - (float)ry) < 0.05f;
         if (!ok) {
-            if (why < 3 && rebake_told < 4) {
+            if (env_rebake && why < 3 && rebake_told < 4) {
                 rebake_told++;
                 fprintf(stderr, "[metal] rebake: surface at %.2f %.2f %.2f (texel %.3f %.3f) on face %d: off whole texels by"
                                 " %.3f %.3f, %.3f %.3f, %.3f %.3f\n",
@@ -6083,7 +7265,7 @@ static int rebake_match(const struct bl_rebake *rb, const struct lightmap_page *
         *out = (struct lightmap_match){fi, rx, ry, sx, sy, sf->copies};
         return 1;
     }
-    if (!why && rebake_told < 4) {
+    if (env_rebake && !why && rebake_told < 4) {
         rebake_told++;
         fprintf(stderr, "[metal] rebake: surface at %.3f %.3f %.3f, %.3f %.3f %.3f: no face has that corner\n",
                 sf->pos[0][0], sf->pos[0][1], sf->pos[0][2], sf->pos[1][0], sf->pos[1][1], sf->pos[1][2]);
@@ -6144,8 +7326,9 @@ static void rebake_learn_done(void)
     }
     rebake_learnt = 1;
     for (int ch = 0; ch < 3; ch++) free(rebake_seen[ch]), rebake_seen[ch] = NULL;
-    fprintf(stderr, "[metal] rebake: the lightmaps' encoding learnt from %ld samples: bytes 64, 128, 255 are %.3f %.3f %.3f\n",
-            rebake_pairs, rebake_lin[1][64], rebake_lin[1][128], rebake_lin[1][255]);
+    if (env_rebake)
+        fprintf(stderr, "[metal] rebake: the lightmaps' encoding learnt from %ld samples: bytes 64, 128, 255 are %.3f %.3f %.3f\n",
+                rebake_pairs, rebake_lin[1][64], rebake_lin[1][128], rebake_lin[1][255]);
 }
 
 // Linear light to the page's value (byte / 255, between bytes where it falls between),
@@ -6163,9 +7346,54 @@ static float rebake_encode(const float *l, float v)
     return ((float)lo + (v - l[lo]) / (l[hi] - l[lo])) / 255.0f;
 }
 
+// HDR: the face's own samples past white (rb_page) and as the game has them (rb_old),
+// both the page's size.
+static void rebake_fill_hdr(struct lightmap_page *p, const struct bl_rebake *rb, const struct lightmap_match *m)
+{
+    const struct bl_bsp_face *f = &rb->world->faces[m->face];
+    int w0 = f->size[0] + 1, h0 = f->size[1] + 1, n0 = w0 * h0;
+    if (!p->rb_page) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                                                                     width:p->w height:p->h mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModeShared;
+        p->rb_page = [mtl newTextureWithDescriptor:d];
+        p->rb_old = [mtl newTextureWithDescriptor:d];
+    }
+    if (!p->rb_rects) {
+        p->rb_rects = calloc((size_t)p->w * p->h * 4, sizeof *p->rb_rects);
+        p->rb_dirty[0] = p->rb_dirty[1] = 0, p->rb_dirty[2] = p->w, p->rb_dirty[3] = p->h;
+    }
+    __fp16 *hi = malloc(sizeof *hi * 8 * (size_t)n0), *lo = hi + 4 * (size_t)n0;
+    for (int c = 0; c < m->copies; c++) {
+        int x0 = m->rx + c * m->sx, y0 = m->ry + c * m->sy, k = f->bumped ? c : 0;
+        for (int i = 0; i < n0; i++) {
+            float lin[3], e[3], top = 1.0f;
+            bl_bake_rgbe(rb->world->lighting + 4 * ((size_t)f->lightofs + (size_t)k * n0 + (size_t)i), lin);
+            for (int ch = 0; ch < 3; ch++) e[ch] = rebake_encode(rebake_lin[ch], lin[ch]), top = fmaxf(top, e[ch]);
+            for (int ch = 0; ch < 3; ch++) hi[4 * i + ch] = (__fp16)e[ch], lo[4 * i + ch] = (__fp16)(e[ch] / top);
+            hi[4 * i + 3] = lo[4 * i + 3] = 1;
+        }
+        MTLRegion r2 = MTLRegionMake2D((NSUInteger)x0, (NSUInteger)y0, (NSUInteger)w0, (NSUInteger)h0);
+        [p->rb_page replaceRegion:r2 mipmapLevel:0 withBytes:hi bytesPerRow:(NSUInteger)w0 * 8];
+        [p->rb_old replaceRegion:r2 mipmapLevel:0 withBytes:lo bytesPerRow:(NSUInteger)w0 * 8];
+        uint16_t r[4] = {(uint16_t)(x0 + 0x8000), (uint16_t)y0, (uint16_t)(x0 + w0), (uint16_t)(y0 + h0)};
+        for (int y = y0; y < y0 + h0; y++)
+            for (int x = x0; x < x0 + w0; x++) memcpy(p->rb_rects + ((size_t)y * p->w + x) * 4, r, sizeof r);
+        lightmap_dirty(p->rb_dirty, x0, y0, x0 + w0, y0 + h0);
+        rebake_budget -= n0;
+    }
+    free(hi);
+    rebake_faces++;
+}
+
 static void rebake_fill(struct lightmap_page *p, const struct bl_rebake *rb, const struct lightmap_match *m,
                         const uint8_t *tx, uint32_t pitch)
 {
+    if (!rb->bake) {
+        rebake_fill_hdr(p, rb, m);
+        return;
+    }
     const struct bl_bsp_face *f = &rb->world->faces[m->face];
     const struct bl_bake_face *bf = &rb->bake->faces[m->face];
     int w0 = f->size[0] + 1, h0 = f->size[1] + 1, sc = rb->bake->scale;
@@ -6242,10 +7470,10 @@ static void lightmap_rebake_reset(struct lightmap_page *p, int gen)
 // done, and fills in what it can this frame. Returns whether to note surfaces.
 static int lightmap_rebake_begin(struct lightmap_page *p, struct obj *tex)
 {
-    if (!env_rebake) return 0;
+    if (!env_rebake && !env_hdr) return 0;
     if (rebake_frame != frames) {
         rebake_frame = frames;
-        rebake_now = bl_rebake_get(1), rebake_gen_now = bl_rebake_gen();
+        rebake_now = bl_rebake_get(1, env_rebake), rebake_gen_now = bl_rebake_gen();
         rebake_budget = 1 << 18;
     }
     if (p->rb_gen != rebake_gen_now) lightmap_rebake_reset(p, rebake_gen_now);
@@ -6292,7 +7520,7 @@ static void lightmap_rebake_note(struct lightmap_page *p, const uint16_t rect[4]
 
 static int lightmap_rebaked(struct lightmap_page *p)
 {
-    return env_rebake && p->nfilled && p->rb_gen == rebake_gen_now && p->rb_page;
+    return (env_rebake || env_hdr) && p->nfilled && p->rb_gen == rebake_gen_now && p->rb_page;
 }
 
 static id<MTLTexture> lightmap_rebake_page(struct lightmap_page *p, int old) { return old ? p->rb_old : p->rb_page; }
@@ -7156,9 +8384,21 @@ void d3d_render_read_back(struct obj *rt)
     // 16-bit float with BL_DEEP_COLOR), which read_target converts. Not the shadow atlas.
     id<MTLTexture> t = (__bridge id<MTLTexture>)rt->gpu;
     if (!t || !rt->mem || (rt->format != 21 && rt->format != 22) || rt == shadow_atlas || obj_scale(rt) > 1 ||
-        t.width != rt->width || t.height != rt->height || rt->pitch < rt->width * 4)
+        rt->pitch < rt->width * 4)
         return;
     end_pass();
+    if (t.width != rt->width || t.height != rt->height) {  // drawn at a resolution changed live
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t.pixelFormat
+                                                                                      width:rt->width
+                                                                                     height:rt->height
+                                                                                  mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> c = [mtl newTextureWithDescriptor:td];
+        uint32_t a[4] = {0, 0, (uint32_t)t.width, (uint32_t)t.height}, b[4] = {0, 0, rt->width, rt->height};
+        stretch_draw(t, a, c, b, 1);
+        t = c;
+    }
     id<MTLBuffer> b = read_target(t);
     for (uint32_t y = 0; y < rt->height; y++)
         memcpy((uint8_t *)bl_g2h(rt->mem) + y * rt->pitch, (uint8_t *)b.contents + y * rt->width * 4, rt->width * 4);
@@ -7301,6 +8541,35 @@ static void present(id<CAMetalDrawable> drawable)
     present_paced = paced_present();
 }
 
+// The quest compass (bl_compass.c) across the top of the screen, in play only: a world
+// drawn this frame, full width, and the game's pointer hidden (no dialogue, inventory or
+// menu open). Drawn on the back buffer over the HUD, as the HUD is.
+int bl_window_cursor_hidden(void);
+int bl_compass_draw(uint32_t w, uint32_t h, const float rows[3][4], void *bgra);
+static void compass_overlay(id<MTLTexture> t)
+{
+    if (!env_compass || !last_3d || frame_squeeze < 1 || !bl_window_cursor_hidden()) return;
+    uint32_t w = (uint32_t)(t.width * 0.34), h = (uint32_t)(w * 0.1);
+    if (w < 64 || h < 8) return;
+    static void *px;
+    static uint32_t pw, ph;
+    if (pw != w || ph != h) free(px), px = malloc((size_t)w * h * 4), pw = w, ph = h;
+    if (!px || !bl_compass_draw(w, h, (const float(*)[4])view_rows, px)) return;
+    static id<MTLTexture> ring[FRAMES_IN_FLIGHT];
+    id<MTLTexture> img = ring[frame_slot];
+    if (!img || img.width != w || img.height != h) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                     width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        img = ring[frame_slot] = [mtl newTextureWithDescriptor:td];
+    }
+    [img replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px bytesPerRow:w * 4];
+    end_pass();
+    uint32_t x0 = (uint32_t)(t.width - w) / 2, y0 = (uint32_t)(t.height * 0.02);
+    uint32_t sr[4] = {0, 0, w, h}, dr[4] = {x0, y0, x0 + w, y0 + h};
+    stretch_draw_ex(img, sr, t, dr, 0, 1);
+}
+
 // The gothic menus (runtime/bl_menu.c, the pause menu; runtime/bl_options.c, the options
 // dialog) have the game behind them, darkened and reddened, as in the mockups: the last
 // world view (hdr_world, without the view model and HUD), softened through a quarter-size
@@ -7323,6 +8592,7 @@ void bl_metal_backdrop(int style, int world, const int (*glows)[4], int n)
     if (pause_nglow > 0) memcpy(pause_glow, glows, sizeof pause_glow[0] * pause_nglow);
     struct d3d_state *s = pause_state;
     if (!s || !s->back_buffer || s->render_target[0] != s->back_buffer) return;
+    world_end_now(s);
     flush_clears(s);
     pause_backdrop(target_texture(s->back_buffer));
 }
@@ -7334,6 +8604,7 @@ void bl_metal_hud_image(int slot, const void *bgra, uint32_t w, uint32_t h, int 
     struct d3d_state *s = pause_state;
     if (slot < 0 || slot >= HUD_IMAGES || !w || !h || sw <= 0 || sh <= 0) return;
     if (!s || !s->back_buffer || s->render_target[0] != s->back_buffer) return;
+    world_end_now(s);
     id<MTLTexture> t = target_texture(s->back_buffer);
     double kx = (double)t.width / sw, ky = (double)t.height / sh;
     long x0 = lround(x * kx), y0 = lround(y * ky), x1 = lround((x + (double)w) * kx), y1 = lround((y + (double)h) * ky);
@@ -7377,11 +8648,13 @@ static void pause_overlay(uint8_t *px, uint32_t w, uint32_t h, uint32_t fw, uint
     static const float glow_for[2][9] = {{-200, 260, 900, 960, 240, 610, 933, 495, .3f},
                                          {0, 200, 1400, 960, 490, 580, 1287, 537, .26f}};
     const float(*stops)[5] = stops_for[pause_style != 0], *gl = glow_for[pause_style != 0];
+    int tint = pause_style != 2;  // 2: only the glows (the start-up menu, over its smoke)
     for (uint32_t j = 0; j < h; j++) {
         float y = (j + .5f) * fh / h;
         for (uint32_t i = 0; i < w; i++) {
             float x = (i + .5f) * fw / w, p[4] = {0, 0, 0, 0}, t = x / fw;
             int k = t < stops[1][0] ? 0 : t < stops[2][0] ? 1 : 2;
+            if (tint) {
             float f = (t - stops[k][0]) / (stops[k + 1][0] - stops[k][0]);
             over(p, stops[k][1] + (stops[k + 1][1] - stops[k][1]) * f, stops[k][2] + (stops[k + 1][2] - stops[k][2]) * f,
                  stops[k][3] + (stops[k + 1][3] - stops[k][3]) * f, stops[k][4] + (stops[k + 1][4] - stops[k][4]) * f);
@@ -7391,6 +8664,7 @@ static void pause_overlay(uint8_t *px, uint32_t w, uint32_t h, uint32_t fw, uint
             }
             float vx = (x - fw / 2.0f) / (fw * .7071f), vy = (y - fh / 2.0f) / (fh * .7071f), d = sqrtf(vx * vx + vy * vy);
             over(p, 5, 2, 3, d < .35f ? 0 : d < .7f ? .55f * (d - .35f) / .35f : .55f + .37f * fminf((d - .7f) / .3f, 1));
+            }
             for (int k = 0; k < pause_nglow; k++) {
                 const int *glow = pause_glow[k];
                 if (glow[2] <= glow[0]) continue;
@@ -7496,6 +8770,7 @@ void d3d_render_present(struct d3d_state *s)
         if ((ao_result || post_result || taa_pending) && s->render_target[0] == s->back_buffer) pass(s);
     }
     view_state = 0, ao_result = nil, post_result = 0;
+    world_finish();
     taa_frame_end();
     flush_clears(s);
     shadow_frame_start();
@@ -7512,7 +8787,14 @@ void d3d_render_present(struct d3d_state *s)
         fprintf(stderr, "[d3d9] frame %lu: %s\n", frames, frame_squeeze < 1 ? "menu at 4:3" : "full width");
     }
     last_3d = frame_has_3d;
+    if (back) compass_overlay(back);
     menu_frame = !frame_has_3d;
+    // Upscaling: the next frame's world view drawn smaller (`back` above stays the window's).
+    if (upscaler_next >= 0) upscaler = upscaler_next, upscaler_next = -1;
+    if (quality_next >= 0) upscaler_quality = quality_next, world_res = quality_res[quality_next], quality_next = -1;
+    world_bb = s->back_buffer, world_ds = s->auto_depth;
+    NSUInteger ww, wh;
+    world_low = !menu_frame && world_bb && world_size(target_full(world_bb), &ww, &wh);
     pause_frame = pause_seen, pause_seen = 0;
     pause_state = s;
     frame_has_3d = 0, frame_squeeze = 1;
@@ -7558,6 +8840,7 @@ void d3d_render_present(struct d3d_state *s)
     } else {
         next_frame();
     }
+    out_apply(s);
     if (layer && fps_max > 0) {
         // The game runs its loop flat out; with a window, wait out the rest of the frame
         // instead of burning a core on frames nobody sees.
@@ -7661,6 +8944,9 @@ void d3d_render_present_pixels(const void *pixels, uint32_t w, uint32_t h, int b
                  withBytes:(const uint8_t *)pixels + (size_t)(bottom_up ? h - 1 - y : y) * w * 4 bytesPerRow:w * 4];
     // Clip both rectangles to their images, scaling the source with the destination.
     int32_t s0[4] = {sr[0], sr[1], sr[2], sr[3]}, d0[4] = {dr[0], dr[1], dr[2], dr[3]};
+    if (resized_w && resized_h && (sw != resized_w || sh != resized_h))  // a resolution changed live
+        for (int i = 0; i < 4; i++)
+            d0[i] = (int32_t)lround(d0[i] * (double)(i & 1 ? sh : sw) / (i & 1 ? resized_h : resized_w));
     // A movie stretched over a whole window wider than 4:3 is shown at 4:3 with black
     // bars instead, which is how it looked on the 4:3 screens it was made for. That
     // includes the 720x480 one: DV-sized frames are 4:3 pictures with narrow pixels.
@@ -7718,13 +9004,14 @@ void d3d_render_stretch(struct obj *src, uint32_t src_rect, struct obj *dst, uin
         return;
     }
     uint32_t sr[4] = {0, 0, (uint32_t)a.width, (uint32_t)a.height}, dr[4] = {0, 0, (uint32_t)b.width, (uint32_t)b.height};
+    // The game's pixels taken to the textures' (drawn larger or smaller, as set_viewport).
     if (src_rect) {
         memcpy(sr, bl_g2h(src_rect), 16);
-        for (int i = 0; i < 4; i++) sr[i] *= (uint32_t)obj_scale(src);
+        for (int i = 0; i < 4; i++) sr[i] = (uint32_t)lround(sr[i] * (double)(i & 1 ? a.height : a.width) / (i & 1 ? src->height : src->width));
     }
     if (dst_rect) {
         memcpy(dr, bl_g2h(dst_rect), 16);
-        for (int i = 0; i < 4; i++) dr[i] *= (uint32_t)obj_scale(dst);
+        for (int i = 0; i < 4; i++) dr[i] = (uint32_t)lround(dr[i] * (double)(i & 1 ? b.height : b.width) / (i & 1 ? dst->height : dst->width));
     }
     if (sr[2] - sr[0] != dr[2] - dr[0] || sr[3] - sr[1] != dr[3] - dr[1]) {
         stretch_draw(a, sr, b, dr, filter != 1);  // D3DTEXF_POINT is 1; NONE and LINEAR filter

@@ -12,6 +12,8 @@ CAMetalLayer *bl_cocoa_open_window(uint32_t width, uint32_t height, const char *
 #endif
 
 void bl_cocoa_set_content_size(uint32_t width, uint32_t height);
+int bl_cocoa_image_pixels(uint32_t *width, uint32_t *height);
+void bl_cocoa_set_display_mode(int mode);  // 0 windowed, 1 borderless, 2 full screen
 // Handles pending AppKit events; returns nonzero if any arrived. Main thread only.
 int bl_cocoa_pump(void);
 void bl_cocoa_pump_if_idle(void);  // main thread, at most every 100 ms

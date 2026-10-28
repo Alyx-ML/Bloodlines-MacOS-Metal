@@ -16,8 +16,10 @@
 //     menu's +0x440) is brighter, with a blood drop to its left, an underline from red
 //     through gold, and a red glow behind it (drawn by the renderer). The game's own button
 //     paint is skipped.
-// At the start-up menu (no level loaded) all of them leave the game's look alone. The
-// drawing itself is in bl_gothic.c, shared with the options dialog (bl_options.c).
+// At the start-up menu (no level loaded) the layout, logo, divider and items are the same,
+// but the game's black fill and smoke stay behind them, and the divider and the hovered
+// item's glow (the renderer's, with no darkening) go on just before the logo is drawn.
+// The drawing itself is in bl_gothic.c, shared with the options dialog (bl_options.c).
 //
 // Menu fields: +0x170 the buttons, +0x17c their count, +0x2d8 the logo's fade and +0x2e0
 // the buttons' fade (both 0 to 255), +0x440 the button under the mouse. A button's +0xf0
@@ -35,7 +37,8 @@ extern char client_ScreenTall[], client_MenuState[], client_Surface[], client_Pa
 #define ffield gothic_ffield
 
 static uint32_t the_menu;  // the client's main menu panel, once seen
-static uint32_t cur_menu;  // the menu painting this frame in the new style, else 0
+static uint32_t cur_menu;  // the menu painting this frame
+static int cur_level;      // whether a level is loaded behind it
 static int glow[4];        // the hovered label's box, for the renderer
 
 static uint32_t call(void *cpu, const void *fn, uint32_t self, int n, const uint32_t *a)
@@ -53,6 +56,10 @@ static const char *label(int action)
     case 2: return "Reload";
     case 3: return "Save Game";
     case 4: return "Options";
+    case 5: return "Multiplayer";
+    case 6: return "Online Manual";
+    case 7: return "Play Tutorial";
+    case 8: return "View Intro";
     case 9: return "Main Menu";
     case 10: return "Quit";
     case 11: return "Continue";
@@ -165,9 +172,9 @@ static void answer(_cpu *cpu, uint32_t v) { *(uint32_t *)REG2PTR(esp) = v; }
 void bl_menu_Layout(_cpu *cpu)
 {
     uint32_t sa = eax, sc = ecx, sd = edx, menu = ecx;
-    the_menu = menu;
-    cur_menu = in_level(cpu, menu) ? menu : 0;
-    if (cur_menu) layout(cpu, menu);
+    the_menu = cur_menu = menu;
+    cur_level = in_level(cpu, menu);
+    layout(cpu, menu);
     eax = sa, ecx = sc, edx = sd;
 }
 
@@ -184,7 +191,7 @@ void bl_menu_Background(_cpu *cpu)
 void bl_menu_Smoke(_cpu *cpu)
 {
     uint32_t sa = eax, sc = ecx, sd = edx, skip = 0;
-    if (cur_menu == ecx) {
+    if (cur_menu == ecx && cur_level) {
         gothic_flush(cpu, surface(cpu));
         bl_metal_backdrop(0, 1, (const int (*)[4])glow, glow[2] > glow[0]);
         divider(cpu, ecx);
@@ -194,18 +201,39 @@ void bl_menu_Smoke(_cpu *cpu)
     answer(cpu, skip);
 }
 
-// The logo's draw call: x, y, width, height and alpha on the stack. In a level, the
-// mockup's place and size.
+// The logo's draw call: x, y, width, height and alpha on the stack: the mockup's place and
+// size. At the start-up menu the hovered item's glow and the divider go on first, over the
+// smoke.
 void bl_menu_Logo(_cpu *cpu)
 {
     if (!cur_menu) return;
     uint32_t sa = eax, sc = ecx, sd = edx;
+    if (!cur_level) {
+        gothic_flush(cpu, surface(cpu));
+        bl_metal_backdrop(2, 0, (const int (*)[4])glow, glow[2] > glow[0]);
+        divider(cpu, cur_menu);
+    }
     double u = unit(cpu);
     uint32_t *a = (uint32_t *)REG2PTR(esp);
     a[0] = (uint32_t)lround(COL_X * u), a[1] = (uint32_t)lround(LOGO_Y * u);
     a[2] = (uint32_t)lround(LOGO_W * u), a[3] = (uint32_t)lround(LOGO_H * u);
     eax = sa, ecx = sc, edx = sd;
 }
+
+// The loading screen's tip (CLoadingDiscPanel): its text box takes one of two fonts the
+// panel looks up when its scheme is applied, "PercolatorSmall" (+0x98, at 0x101672BC) and
+// "Dlg_Base" (+0x9c, at 0x101672DD), for small and large tips. Both become Cormorant
+// Garamond at the same height, so the tip keeps its place and wrapping.
+static void tip_font(_cpu *cpu, uint32_t off)
+{
+    uint32_t sa = eax, sc = ecx, sd = edx, panel = esi;
+    uint32_t f = gothic_like_font(cpu, surface(cpu), GOTHIC_BODY, sa);
+    *(uint32_t *)bl_g2h(panel + off) = f;
+    eax = sa, ecx = sc, edx = sd;
+}
+
+void bl_menu_TipFontSmall(_cpu *cpu) { tip_font(cpu, 0x98); }
+void bl_menu_TipFontLarge(_cpu *cpu) { tip_font(cpu, 0x9c); }
 
 // CVMenuButton::Paint's first instruction (ecx = the button).
 void bl_menu_ButtonPaint(_cpu *cpu)

@@ -55,6 +55,8 @@ funcv bl_menu_ButtonPaint $
 funcv bl_menu_Background $
 funcv bl_menu_Smoke $
 funcv bl_menu_Logo $
+funcv bl_menu_TipFontSmall $
+funcv bl_menu_TipFontLarge $
 funcv bl_dialog_Paint $
 funcv bl_dialog_Pos $
 funcv bl_dialog_Size $
@@ -80,3 +82,5 @@ funcv bl_options_ScrollBackground $
 funcv bl_options_MenuPaint $
 funcv bl_options_ComboPressed $
 funcv bl_options_KeyCapture $
+funcv bl_vgui_VideoApply $
+funcv bl_vgui_VideoNote $

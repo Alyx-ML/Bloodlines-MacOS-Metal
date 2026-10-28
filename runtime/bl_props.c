@@ -95,6 +95,51 @@ static void vpk_open(struct search *s, const char *path)
     qsort(v->files, (size_t)v->nfiles, sizeof *v->files, by_name);
 }
 
+// The map's own files (its pakfile lump, 40: a zip archive, stored): the compiler's patched
+// materials (maps/<map>/...) among them, read like an archive's.
+static void pak_open(struct search *s, const char *bsp_path)
+{
+    FILE *f = fopen(bsp_path, "rb");
+    if (!f) return;
+    uint8_t h[8 + 16 * 64];
+    int lofs = 0, llen = 0;
+    if (fread(h, 1, sizeof h, f) == sizeof h) lofs = rd32(h + 8 + 16 * 40), llen = rd32(h + 12 + 16 * 40);
+    uint8_t *d = lofs > 0 && llen >= 22 ? malloc((size_t)llen) : NULL;
+    int ok = d && !fseek(f, lofs, SEEK_SET) && fread(d, 1, (size_t)llen, f) == (size_t)llen;
+    fclose(f);
+    long e = ok ? llen - 22 : -1;
+    while (e >= 0 && rd32(d + e) != 0x06054b50) e--;
+    if (e < 0) {
+        free(d);
+        return;
+    }
+    int cnt = (uint16_t)rd16(d + e + 10);
+    long cd = (uint32_t)rd32(d + e + 16);
+    s->vpks = realloc(s->vpks, sizeof *s->vpks * (size_t)(s->nvpks + 1));
+    struct vpk *v = &s->vpks[s->nvpks++];
+    snprintf(v->path, sizeof v->path, "%s", bsp_path);
+    v->files = calloc((size_t)cnt + 1, sizeof *v->files);
+    v->nfiles = 0;
+    for (int i = 0; i < cnt && cd + 46 <= llen && rd32(d + cd) == 0x02014b50; i++) {
+        int method = (uint16_t)rd16(d + cd + 10), nl = (uint16_t)rd16(d + cd + 28);
+        int xl = (uint16_t)rd16(d + cd + 30), cl = (uint16_t)rd16(d + cd + 32);
+        long size = (uint32_t)rd32(d + cd + 20), local = (uint32_t)rd32(d + cd + 42);
+        if (cd + 46 + nl > llen || local + 30 > llen) break;
+        if (method == 0) {
+            long at = local + 30 + (uint16_t)rd16(d + local + 26) + (uint16_t)rd16(d + local + 28);
+            struct vpk_file *fe = &v->files[v->nfiles++];
+            fe->name = strndup((const char *)d + cd + 46, (size_t)nl);
+            fe->ofs = (uint32_t)(lofs + at), fe->size = (uint32_t)size;
+        } else {
+            fprintf(stderr, "[props] %s: %.*s in its pakfile is compressed (method %d), not read\n", bsp_path, nl,
+                    (const char *)d + cd + 46, method);
+        }
+        cd += 46 + nl + xl + cl;
+    }
+    free(d);
+    qsort(v->files, (size_t)v->nfiles, sizeof *v->files, by_name);
+}
+
 static int by_str(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
 // The mod's folder (the map's maps/ folder's parent) and the game's own (Vampire, beside
@@ -102,6 +147,7 @@ static int by_str(const void *a, const void *b) { return strcmp(*(char *const *)
 static void search_open(struct search *s, const char *bsp_path)
 {
     memset(s, 0, sizeof *s);
+    pak_open(s, bsp_path);
     char mod[1024];
     snprintf(mod, sizeof mod, "%s", bsp_path);
     for (int up = 0; up < 2; up++) {
@@ -369,7 +415,9 @@ static void angle_matrix(const float a[3], float m[3][3])
     m[0][2] = cr * sp * cy + sr * sy, m[1][2] = cr * sp * sy - sr * cy, m[2][2] = cr * cp;
 }
 
-struct bl_props *bl_props_load(const char *bsp_path, const uint8_t *d, long size, char *err, int errlen)
+// visible: each prop by its visible mesh where it has one (the object shadows, which should
+// match what is drawn), else as below.
+static struct bl_props *props_load(const char *bsp_path, const uint8_t *d, long size, int visible, char *err, int errlen)
 {
     int gofs = rd32(d + 8 + 16 * 35), glen = rd32(d + 12 + 16 * 35);
     if (gofs < 0 || glen < 4 || (long)gofs + glen > size) {
@@ -410,6 +458,7 @@ struct bl_props *bl_props_load(const char *bsp_path, const uint8_t *d, long size
     char *tried = calloc((size_t)nnames + 1, 1);
     float(*colour)[3] = calloc((size_t)nnames + 1, sizeof *colour);
     float(*refl)[3] = NULL;
+    int *owner = NULL;
     int refl_cap = 0;
     struct search s;
     search_open(&s, bsp_path);
@@ -453,7 +502,7 @@ struct bl_props *bl_props_load(const char *bsp_path, const uint8_t *d, long size
         // A box prop (solid 3) by its box, which the 2004 bake shows: the stage light's own
         // spot sits inside the model's box, open at its lens, and comes out blocked. Others
         // by their collision model, or by their visible mesh when they have none.
-        struct tris *model = solid == 3 ? &box[m] : phy[m].n ? &phy[m] : &mesh[m];
+        struct tris *model = visible && mesh[m].n ? &mesh[m] : solid == 3 ? &box[m] : phy[m].n ? &phy[m] : &mesh[m];
         if (!model->n) continue;
         out->nfound++;
         out->nbox += model == &box[m], out->nmesh += model == &mesh[m];
@@ -468,20 +517,32 @@ struct bl_props *bl_props_load(const char *bsp_path, const uint8_t *d, long size
                     v[c][k] = o[k] + r[k][0] * l[0] + r[k][1] * l[1] + r[k][2] * l[2];
                 }
             add_tri(&all, v[0], v[1], v[2]);
-            if (refl_cap < all.cap) refl_cap = all.cap, refl = realloc(refl, sizeof *refl * (size_t)refl_cap);
+            if (refl_cap < all.cap)
+                refl_cap = all.cap, refl = realloc(refl, sizeof *refl * (size_t)refl_cap), owner = realloc(owner, sizeof *owner * (size_t)refl_cap);
             memcpy(refl[all.n - 1], colour[m], 12);
+            owner[all.n - 1] = i;
         }
     }
     for (int i = 0; i < nnames; i++) free(phy[i].t), free(mesh[i].t), free(box[i].t);
     free(phy), free(mesh), free(box), free(tried), free(colour);
     search_close(&s);
-    out->tris = all.t, out->refl = refl, out->ntris = all.n;
+    out->tris = all.t, out->refl = refl, out->owner = owner, out->ntris = all.n;
     return out;
+}
+
+struct bl_props *bl_props_load(const char *bsp_path, const uint8_t *d, long size, char *err, int errlen)
+{
+    return props_load(bsp_path, d, size, 0, err, errlen);
+}
+
+struct bl_props *bl_props_load_visible(const char *bsp_path, const uint8_t *d, long size, char *err, int errlen)
+{
+    return props_load(bsp_path, d, size, 1, err, errlen);
 }
 
 void bl_props_free(struct bl_props *p)
 {
     if (!p) return;
-    free(p->tris), free(p->refl);
+    free(p->tris), free(p->refl), free(p->owner);
     free(p);
 }

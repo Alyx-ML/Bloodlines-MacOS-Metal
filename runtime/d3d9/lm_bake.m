@@ -537,7 +537,7 @@ int bl_rebake_gen(void)
     return g;
 }
 
-const struct bl_rebake *bl_rebake_get(int start)
+const struct bl_rebake *bl_rebake_get(int start, int bake)
 {
     pthread_mutex_lock(&rb_lock);
     struct bl_rebake *r = rb_ready && rb_ready->gen == rb_gen ? rb_ready : NULL;
@@ -548,13 +548,15 @@ const struct bl_rebake *bl_rebake_get(int start)
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             char err[256];
             id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-            struct bl_bsp_world *w = bl_bsp_world_load(path, err, sizeof err);
-            struct bl_bake *b = w ? bl_bake_map(dev, w, 4, 3, err, sizeof err) : NULL;
+            // the HDR lightmaps alone need only the faces and their lighting, not the props
+            struct bl_bsp_world *w = bake ? bl_bsp_world_load(path, err, sizeof err)
+                                          : bl_bsp_world_load_no_props(path, err, sizeof err);
+            struct bl_bake *b = w && bake ? bl_bake_map(dev, w, 4, 3, err, sizeof err) : NULL;
             if (b) fprintf(stderr, "[bake] %s\n", b->summary);
-            else fprintf(stderr, "[bake] %s: %s\n", path, err);
+            else if (!w || bake) fprintf(stderr, "[bake] %s: %s\n", path, err);
             free(path);
             pthread_mutex_lock(&rb_lock);
-            if (b && gen == rb_gen) {
+            if (w && (b || !bake) && gen == rb_gen) {
                 struct bl_rebake *n = calloc(1, sizeof *n);
                 n->gen = gen, n->world = w, n->bake = b;
                 rebake_free(rb_prev);

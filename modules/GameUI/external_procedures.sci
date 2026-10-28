@@ -2,3 +2,4 @@ loc_10029250,bl_vgui_GetCursorLine
 loc_1001BCD0,bl_vgui_VisualDestroy
 loc_1001BD30,bl_vgui_VisualReset
 loc_10024EB0,bl_vgui_AddPage
+loc_10038160,bl_vgui_ShowTooltip

@@ -18,7 +18,7 @@
 enum {
     S_SET_COLOR = 0x2c, S_FILLED_RECT = 0x30, S_TEXT_FONT = 0x44, S_TEXT_COLOR = 0x4c,
     S_TEXT_POS = 0x50, S_PRINT_TEXT = 0x54, S_SCREEN_SIZE = 0x9c, S_CREATE_FONT = 0xf4,
-    S_ADD_GLYPHS = 0xf8, S_CHAR_WIDTH = 0x104,
+    S_ADD_GLYPHS = 0xf8, S_FONT_TALL = 0xfc, S_CHAR_WIDTH = 0x104,
 };
 
 static uint32_t scratch;  // guest buffer: the screen size and one UTF-16 character
@@ -121,6 +121,13 @@ uint32_t gothic_face_font(void *cpu, uint32_t s, int face, double em)
 }
 
 uint32_t gothic_font(void *cpu, uint32_t s, double em) { return gothic_face_font(cpu, s, GOTHIC_CAPS, em); }
+
+uint32_t gothic_like_font(void *cpu, uint32_t s, int face, uint32_t font)
+{
+    uint32_t a[1] = { font };
+    int tall = (int)gothic_scall(cpu, s, S_FONT_TALL, 1, a);
+    return gothic_face_font(cpu, s, face, tall > 0 ? tall * 100.0 / gothic_face_tall(face, 100) : 16);
+}
 
 static int char_width(void *cpu, uint32_t s, uint32_t font, int c)
 {

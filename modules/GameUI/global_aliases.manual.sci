@@ -16,3 +16,4 @@ loc_1001FB70,GameUI_Surface
 loc_1001FB50,GameUI_Input
 loc_10023B50,GameUI_Label_GetText
 loc_1001FBA0,GameUI_IPanel
+loc_1000FE40,GameUI_LabeledCombo_ctor

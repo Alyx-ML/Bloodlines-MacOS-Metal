@@ -24,6 +24,8 @@ enum { GOTHIC_CAPS, GOTHIC_BODY };
 uint32_t gothic_face_font(void *cpu, uint32_t s, int face, double em);
 int gothic_face_tall(int face, double em);
 uint32_t gothic_font(void *cpu, uint32_t s, double em);
+// `face` at the height of the game's `font`.
+uint32_t gothic_like_font(void *cpu, uint32_t s, int face, uint32_t font);
 int gothic_tall(double em);
 // Text from x, y (the top of the cell), `track` pixels between letters.
 void gothic_text(void *cpu, uint32_t s, uint32_t font, const char *str, int x, int y, int track, int r, int g, int b,
@@ -45,8 +47,9 @@ void gothic_drop(void *cpu, uint32_t s, int cx, int top, int w, int h, double a)
 void gothic_flush(void *cpu, uint32_t s);
 
 // The renderer's backdrop (d3d9/metal_render.m): the last world view when `world`, under
-// the darkening overlay `style` (0 the pause menu, 1 the options dialog) with a red glow
-// behind each of `n` boxes, drawn now over everything so far. Its frames stay full width.
+// the darkening overlay `style` (0 the pause menu, 1 the options dialog, 2 none: the
+// start-up menu) with a red glow behind each of `n` boxes, drawn now over everything so
+// far. Its frames stay full width.
 void bl_metal_backdrop(int style, int world, const int (*glows)[4], int n);
 
 // An image of the HUD's (bl_hud.c), `slot` 0 or 1: w x h pixels of premultiplied BGRA,

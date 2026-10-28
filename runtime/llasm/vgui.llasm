@@ -27,3 +27,8 @@ proc bl_vgui_AddPage public
         call bl_vgui_AddPage_c $
         Call_Asm_Return 2
 endp
+
+; Tooltip::ShowTooltip(panel) (thiscall): nothing is shown.
+proc bl_vgui_ShowTooltip public
+        Call_Asm_Return 1
+endp

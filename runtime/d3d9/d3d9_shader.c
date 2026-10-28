@@ -553,10 +553,13 @@ static void ps1_coord(struct gen *g, uint32_t n, char *buf, size_t len)
 static const char *const header =
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
-    "struct BLVSParams { int4 i[16]; uint b[16]; float2 inv_viewport; float clip_y; float pad; };\n"
+    "struct BLVSParams { int4 i[16]; uint b[16]; float2 inv_viewport; float clip_y; float color_max; };\n"
     "struct BLPSParams { int4 i[16]; uint b[16]; float4 bumpenv[8]; float4 bumpenv_l[8]; float4 fog_color;\n"
     "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float gloss, pbr; float4 view;\n"
-    "    float bump, metal, spec, pom; float pom_dist, tag, out_max, pad5; };\n"
+    "    float bump, metal, spec, pom; float pom_dist, tag, out_max, stage_max; float out_gain, pad6, pad7, pad8; };\n"
+    // A glow's bright parts times up to g (p.out_gain), its dim parts as drawn.
+    "static float3 bl_gain(float3 c, float g) {\n"
+    "    return g > 1.0 ? c * mix(1.0, g, smoothstep(0.5, 1.0, max(max(c.x, c.y), c.z))) : c; }\n"
     "struct BLVSOut {\n"
     "    float4 pos [[position]]; float psize [[point_size]];\n"
     "    float4 d0 [[user(d0)]]; float4 d1 [[user(d1)]];\n"
@@ -615,8 +618,9 @@ static const char *const lightmap_msl =
     "    return bl_lightmap_cubic(t, p, r);\n"
     "}\n"
     // Where the rectangle says so (x0 + 0x8000), the game's page changed by the rebake: the
-    // new light (h, 4 times the size) less the old (o, the map's own samples encoded), so
-    // what the game adds to its page as it runs (dynamic lights) stays.
+    // new light (h: a bake, 4 times the size, or with HDR the map's own samples past white,
+    // the page's size) less the old (o, the map's own samples encoded), so what the game
+    // adds to its page as it runs (dynamic lights) stays.
     "static float4 bl_lightmap_rebaked(texture2d<float> t, sampler s, texture2d<ushort> lr, float2 uv, texture2d<float> h,\n"
     "                                  texture2d<float> o) {\n"
     "    float2 sz = float2(t.get_width(), t.get_height()), p = uv * sz;\n"
@@ -624,7 +628,7 @@ static const char *const lightmap_msl =
     "    if (r.x < 32768) return r.z <= r.x ? t.sample(s, uv) : bl_lightmap_cubic(t, p, r);\n"
     "    r.x -= 32768;\n"
     "    float4 g = bl_lightmap_cubic(t, p, r);\n"
-    "    float3 n = bl_lightmap_cubic(h, uv * float2(h.get_width(), h.get_height()), r * 4).rgb;\n"
+    "    float3 n = bl_lightmap_cubic(h, uv * float2(h.get_width(), h.get_height()), r * int(h.get_width() / t.get_width())).rgb;\n"
     "    return float4(max(g.rgb + n - bl_lightmap_cubic(o, p, r).rgb, 0.0), g.a);\n"
     "}\n";
 
@@ -1437,7 +1441,8 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
             line(o, "}");
         }
         if (tess) {
-            line(o, "BLVSRaw r = {_p1, _p2, saturate(od0), saturate(od1), ot0, ot1, ot2, ot3, ot4, ot5, ot6, ot7, ofog, opts};");
+            line(o, "BLVSRaw r = {_p1, _p2, float4(clamp(od0.xyz, 0.0, p.color_max), saturate(od0.w)),");
+            line(o, "             float4(clamp(od1.xyz, 0.0, p.color_max), saturate(od1.w)), ot0, ot1, ot2, ot3, ot4, ot5, ot6, ot7, ofog, opts};");
             line(o, "return r;");
             put(o, "}\n");
             put(o, "%s", tess_main);
@@ -1450,7 +1455,10 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         line(o, "out.pos.y *= p.clip_y;");
         line(o, "out.pos.xy += float2(p.inv_viewport.x, -p.inv_viewport.y) * opos.w;");
         line(o, "out.psize = opts.x;");
-        line(o, "out.d0 = saturate(od0); out.d1 = saturate(od1);");
+        // The colours within 0 and 1 as D3D9 has them, but for the world view with HDR
+        // (p.color_max), whose lighting may pass white.
+        line(o, "out.d0 = float4(clamp(od0.xyz, 0.0, p.color_max), saturate(od0.w));");
+        line(o, "out.d1 = float4(clamp(od1.xyz, 0.0, p.color_max), saturate(od1.w));");
         line(o, "out.t0 = ot0; out.t1 = ot1; out.t2 = ot2; out.t3 = ot3;");
         line(o, "out.t4 = ot4; out.t5 = ot5; out.t6 = ot6; out.t7 = ot7;");
         line(o, "out.fog = ofog.x; out.fogz = opos.w;");
@@ -1559,8 +1567,9 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (v && v->shadow_caster) line(o, v->shadow_caster == 2 ? "oc0.w = in.pos.z;" : "oc0.w = 1.0 - in.pos.z;");
         line(o, "BLPSOut out;");
         // The colour as an 8-bit target would take it (0 to 1, alpha too), except that the
-        // world view may go past white on the back buffer (p.out_max), which holds more.
-        if (g.info.color_outputs & 1) line(o, "out.c0 = float4(clamp(oc0.xyz, 0.0, p.out_max), saturate(oc0.w));");
+        // world view may go past white on the back buffer (p.out_max), which holds more, and
+        // its glows go brighter with HDR (bl_gain).
+        if (g.info.color_outputs & 1) line(o, "out.c0 = float4(clamp(bl_gain(oc0.xyz, p.out_gain), 0.0, p.out_max), saturate(oc0.w));");
         for (int i = 1; i < 4; i++)
             if (g.info.color_outputs & (1u << i)) line(o, "out.c%d = oc%d;", i, i);
         // -1.25: shone here (ps_detail), so the skin pass does not add its own shine; -1.4:
@@ -1704,15 +1713,17 @@ char *d3d_ff_ps_msl(const struct d3d_ff_ps *k, const struct d3d_shader_variant *
             snprintf(alpha, sizeof alpha, "cur");
         }
         const char *dst = k->resultarg[i] == 5 ? "tmp" : "cur";  // RESULTARG: TEMP or CURRENT
-        line(o, "%s = saturate(float4((%s).xyz, (%s).w));", dst, rgb, alpha);
+        // Within 0 and 1 as D3D9 has it, but the colour for the world view with HDR
+        // (p.stage_max), whose lighting may pass white.
+        line(o, "%s = float4(clamp((%s).xyz, 0.0, p.stage_max), saturate((%s).w));", dst, rgb, alpha);
     }
-    if (k->specular) line(o, "cur.xyz = saturate(cur.xyz + in.d1.xyz);");
+    if (k->specular) line(o, "cur.xyz = clamp(cur.xyz + in.d1.xyz, 0.0, p.stage_max);");
     if (getenv("BL_FF_HIGHLIGHT")) line(o, "cur.xyz = float3(1.0, 0.0, 1.0);");  // debugging: show these draws
     line(o, "float4 oc0 = cur;");
     ps_alpha_and_fog(o);
     if (v && v->shadow_caster) line(o, v->shadow_caster == 2 ? "oc0.w = in.pos.z;" : "oc0.w = 1.0 - in.pos.z;");
     line(o, "BLPSOut out;");
-    line(o, "out.c0 = oc0;");
+    line(o, "out.c0 = float4(clamp(bl_gain(oc0.xyz, p.out_gain), 0.0, p.out_max), oc0.w);");
     if (info) line(o, v->skin == 3 ? "out.c1 = float4(0.0, 0.0, 0.0, -3.0);" : v->skin ? "out.c1 = float4(0.0, 0.0, 0.0, -2.0);" : "out.c1 = float4(0.0, 0.0, 0.0, p.gloss * _fog);");
     if (albedo)
         line(o, "out.c2 = float4(%s, %s);", alb[0] ? alb : "float3(0.5)",

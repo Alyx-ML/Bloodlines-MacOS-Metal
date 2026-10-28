@@ -32,9 +32,13 @@ Write hand-made fixes here; the pipeline generates the rest.
   "Enhanced" tab (a plain `PropertyPage`).
 - `0x1001BD30` `COptionsSubVisual::OnResetData` (75 bytes), replaced by
   `bl_vgui_VisualReset`: does the original's resets, then the first time adds the
-  renderer's effects as check boxes on the Enhanced tab.
+  renderer's effects as check boxes on the Enhanced tab, and a fifth choice,
+  "Enhanced", in the Shadows drop-down.
 - `0x1001BCD0` `COptionsSubVisual`'s destructor body (11 bytes), replaced by
   `bl_vgui_VisualDestroy`, which forgets those boxes.
+- `0x10038160` vgui `Tooltip::ShowTooltip` (107 bytes), replaced by
+  `bl_vgui_ShowTooltip`, which shows nothing: GameUI's only tooltips are the options
+  pages' hints, which the gothic options screen drew as loose text by the setting.
 - `global_aliases.manual.sci` gives the routines those replacements call global names
   (`GameUI_<name>`): the check box constructor, Panel position and size, and the page
   controls' reset methods, and the PropertyPage constructor.
@@ -123,14 +127,17 @@ Console Pause Fix 1.1.0 (Unofficial Patch's loader plugin), with `runtime/bl_con
 - `instruction_replacements.manual.sci`: vtmb-tweaks' bNoTracers, the `test eax, eax; je` at
   `0x10040998` that skips drawing a bullet tracer always jumps
   (`global_aliases.manual.sci` keeps its target `0x10040A4F` as code).
-- `instruction_replacements.manual.sci`: the gothic pause menu (`runtime/bl_menu.c`), in a
-  level only (menu state `0x10067850`, `client_MenuState`, not 0); the start-up menu is
-  unchanged. `CVMainMenu::Paint` (`0x10065AF0`) first calls `bl_menu_Layout`, which moves
+- `instruction_replacements.manual.sci`: the gothic pause menu and start-up menu
+  (`runtime/bl_menu.c`; menu state `0x10067850`, `client_MenuState`, not 0 in a level, where
+  the game is put behind the menu; at the start-up menu its smoke stays). `CVMainMenu::Paint` (`0x10065AF0`) first calls `bl_menu_Layout`, which moves
   the buttons under the logo. `PaintBackground` (`0x10065C40`) skips its black fill, and the
   smoke's call at `0x10065BDC` (`client_MenuSmoke`) is replaced by `bl_menu_Smoke`, which
   draws the gold divider and tells the renderer to put the darkened game behind the menu
   (`pause_backdrop` in `runtime/d3d9/metal_render.m`). The logo's draw at `0x10065C15`
   (`client_ImageDraw`) gets the mockup's place and size from `bl_menu_Logo`.
+  The loading screen's tip box takes its two fonts at `0x101672BC` and `0x101672DD`
+  (`CLoadingDiscPanel`'s scheme setup); `bl_menu_TipFontSmall` and `bl_menu_TipFontLarge`
+  store Cormorant Garamond fonts of the same height instead.
   `CVMenuButton::Paint` (`0x100653B0`) asks `bl_menu_ButtonPaint`, which draws the item in
   Cinzel capitals (a blood drop and an underline when hovered) and returns 1 to skip the
   game's paint. `global_aliases.manual.sci` also names the surface getter `0x101AC8D0` and

@@ -83,12 +83,27 @@ static double became_key_at;      // when the window last became key (system upt
 - (CALayer *)makeBackingLayer { return metal_layer; }
 @end
 
+// Key and main also without a frame (borderless, bl_cocoa_set_display_mode).
+@interface BLWindow : NSWindow
+@end
+
+@implementation BLWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+@end
+
 @interface BLWindowDelegate : NSObject <NSWindowDelegate>
 @end
 
 static void release_all(void);
+static void display_mode_after_full_screen(void);
 
 @implementation BLWindowDelegate
+- (void)windowDidExitFullScreen:(NSNotification *)n
+{
+    (void)n;
+    display_mode_after_full_screen();
+}
 - (BOOL)windowShouldClose:(NSWindow *)sender
 {
     (void)sender;
@@ -116,12 +131,12 @@ static void release_all(void);
 
 static BLWindowDelegate *delegate;
 
-// Window content size for a game resolution: one point per pixel, shrunk to fit the
-// screen for modes bigger than it (a Retina display's native size, say).
+// Window content size for a game resolution: as big as the screen allows at its shape,
+// whatever the resolution, so a lower one is not a smaller window (with smaller menus).
 static NSSize fit_size(uint32_t width, uint32_t height)
 {
     NSRect avail = NSScreen.mainScreen.visibleFrame;
-    double k = fmin(1.0, fmin((avail.size.width - 16) / width, (avail.size.height - 48) / height));
+    double k = fmin((avail.size.width - 16) / width, (avail.size.height - 48) / height);
     return NSMakeSize(floor(width * k), floor(height * k));
 }
 
@@ -138,12 +153,11 @@ CAMetalLayer *bl_cocoa_open_window(uint32_t width, uint32_t height, const char *
     metal_layer = [CAMetalLayer layer];
     metal_layer.opaque = YES;
     // The drawable keeps the game's resolution; a bigger window or full screen scales
-    // it up with black bars instead of stretching it.
-    metal_layer.contentsGravity = kCAGravityResizeAspect;
+    // it up with black bars instead of stretching it (layerContentsPlacement below).
     metal_layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
     NSSize size = fit_size(width, height);
     NSRect frame = NSMakeRect(0, 0, size.width, size.height);
-    window = [[NSWindow alloc] initWithContentRect:frame
+    window = [[BLWindow alloc] initWithContentRect:frame
                                          styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                                    NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                            backing:NSBackingStoreBuffered
@@ -151,6 +165,9 @@ CAMetalLayer *bl_cocoa_open_window(uint32_t width, uint32_t height, const char *
     window.title = [NSString stringWithUTF8String:title];
     BLView *view = [[BLView alloc] initWithFrame:frame];
     view.wantsLayer = YES;
+    // AppKit sets the backing layer's contentsGravity from this (its default stretches
+    // the picture to the view, which squashed it in full screen on a 16:10 screen).
+    view.layerContentsPlacement = NSViewLayerContentsPlacementScaleProportionallyToFit;
     window.contentView = view;
     delegate = [BLWindowDelegate new];
     window.delegate = delegate;
@@ -173,11 +190,12 @@ void bl_cocoa_set_content_size(uint32_t width, uint32_t height)
     client_w = width, client_h = height;
     if (!window) return;
     window.contentAspectRatio = NSMakeSize(width, height);
-    if (!fullscreen()) {
+    if (!fullscreen() && (window.styleMask & NSWindowStyleMaskTitled)) {  // not full screen or borderless
         [window setContentSize:fit_size(width, height)];
         [window center];
     }
 }
+
 
 // The highest refresh rate of the screen the window is on (120 on ProMotion), 0 without
 // a window.
@@ -202,12 +220,69 @@ void bl_cocoa_set_fullscreen(int on)
     if (window && fullscreen() != (on != 0)) [window toggleFullScreen:nil];
 }
 
+// Display Mode (metal_render.m): 0 a window, 1 borderless (a window without a frame over
+// the whole screen, on the desktop's Space, the menu bar and Dock hidden), 2 full screen
+// (macOS's own, a Space of its own). Leaving full screen animates: the mode is set once
+// the window is out (windowDidExitFullScreen).
+static int display_next = -1;
+static const NSWindowStyleMask framed = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                        NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
+static int borderless(void) { return window && !(window.styleMask & NSWindowStyleMaskTitled); }
+
+static void set_framed(int on)
+{
+    if (on == !borderless()) return;
+    window.styleMask = on ? framed : NSWindowStyleMaskBorderless;
+    NSApp.presentationOptions = on ? NSApplicationPresentationDefault
+                                   : NSApplicationPresentationAutoHideMenuBar | NSApplicationPresentationAutoHideDock;
+    window.contentAspectRatio = NSMakeSize(client_w, client_h);
+    if (on) {
+        [window setContentSize:fit_size(client_w, client_h)];
+        [window center];
+    } else {
+        [window setFrame:window.screen.frame display:YES];
+    }
+    [window makeKeyAndOrderFront:nil];
+}
+
+void bl_cocoa_set_display_mode(int mode)
+{
+    if (!window) return;
+    if (fullscreen()) {
+        if (mode != 2) display_next = mode, [window toggleFullScreen:nil];
+        return;
+    }
+    if (mode == 2) {
+        set_framed(1);  // full screen goes from a framed window
+        [window toggleFullScreen:nil];
+    } else {
+        set_framed(mode == 0);
+    }
+}
+
+static void display_mode_after_full_screen(void)
+{
+    int m = display_next;
+    display_next = -1;
+    if (m >= 0) bl_cocoa_set_display_mode(m);
+}
+
 // Where the game image sits in the view: scaled to fit, centred (contentsGravity).
 static NSRect image_rect(void)
 {
     NSSize v = window.contentView.bounds.size;
     double k = fmin(v.width / client_w, v.height / client_h), w = client_w * k, h = client_h * k;
     return NSMakeRect((v.width - w) / 2, (v.height - h) / 2, w, h);
+}
+
+// The drawn image's size in the screen's pixels (metal_render.m draws the menus and HUD
+// at it). 0 without a window.
+int bl_cocoa_image_pixels(uint32_t *width, uint32_t *height)
+{
+    if (!window || !client_w || !client_h) return 0;
+    NSRect r = [window.contentView convertRectToBacking:image_rect()];
+    *width = (uint32_t)lround(r.size.width), *height = (uint32_t)lround(r.size.height);
+    return *width && *height;
 }
 
 // Game x for a position in the drawn image, and back, with the menu squeeze.
@@ -538,7 +613,7 @@ int bl_cocoa_pump(void)
                 if ((e.modifierFlags & NSEventModifierFlagCommand) &&
                     (e.keyCode == kVK_Return ||
                      (e.keyCode == kVK_ANSI_F && (e.modifierFlags & NSEventModifierFlagControl)))) {
-                    if (!e.isARepeat) [window toggleFullScreen:nil];
+                    if (!e.isARepeat) set_framed(1), [window toggleFullScreen:nil];
                     continue;
                 }
                 if (e.modifierFlags & NSEventModifierFlagCommand) break;  // Cmd+Q etc. go to AppKit

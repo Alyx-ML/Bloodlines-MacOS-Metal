@@ -10,9 +10,10 @@ static uint32_t screen_w = 1024, screen_h = 768;
 static uint32_t modes[64][2];
 static int nmodes;
 
+// Only wide shapes, 3:2 and wider: no Mac screen is 4:3 or 5:4.
 static void add_mode(uint32_t w, uint32_t h)
 {
-    if (w < 640 || h < 480 || w > screen_w || h > screen_h) return;
+    if (w < 640 || h < 480 || w > screen_w || h > screen_h || w * 2 < h * 3) return;
     for (int i = 0; i < nmodes; i++)
         if (modes[i][0] == w && modes[i][1] == h) return;
     if (nmodes < 64) modes[nmodes][0] = w, modes[nmodes][1] = h, nmodes++;
@@ -50,10 +51,9 @@ static void init(void)
         add_mode((uint32_t)CGDisplayModeGetWidth(m), (uint32_t)CGDisplayModeGetHeight(m));
     }
     if (all) CFRelease(all);
-    // The usual 4:3, 16:10 and 16:9 sizes that fit.
+    // The usual 16:10 and 16:9 sizes that fit.
     static const uint32_t common[][2] = {
-        {640, 480},   {800, 600},   {1024, 768},  {1152, 864},  {1280, 720},  {1280, 800},  {1280, 960},
-        {1280, 1024}, {1366, 768},  {1440, 900},  {1600, 900},  {1600, 1000}, {1600, 1200}, {1680, 1050},
+        {1280, 720},  {1280, 800},  {1366, 768},  {1440, 900},  {1600, 900},  {1600, 1000}, {1680, 1050},
         {1920, 1080}, {1920, 1200}, {2560, 1440}, {2560, 1600},
     };
     for (size_t i = 0; i < sizeof common / sizeof common[0]; i++) add_mode(common[i][0], common[i][1]);

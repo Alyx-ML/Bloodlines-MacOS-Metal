@@ -134,7 +134,8 @@ struct d3d_vs_params {
     uint32_t b[16];
     float inv_viewport[2];  // 1/width, 1/height: D3D9's half-pixel offset
     float clip_y;           // scale of the output y (widescreen correction; 1 = none)
-    float pad;
+    float color_max;        // the most od0 and od1's colours may be (1 as D3D9; more for the
+                            // world view with HDR: metal_render.m setup_draw)
 };
 
 struct d3d_ps_params {
@@ -160,7 +161,11 @@ struct d3d_ps_params {
                               // (0.26 to 0.73, metal_render.m setup_draw)
     float out_max;            // the most oc0's colour may be (1, or more for the world view on the
                               // back buffer, which holds light above white: metal_render.m setup_draw)
-    float pad3[1];
+    float stage_max;          // the most the fixed-function stages' colour may be (1 as D3D9; more
+                              // for the world view with HDR)
+    float out_gain;           // oc0's bright parts times up to this (1; more for the world view's
+                              // glows with HDR: bl_gain)
+    float pad3[3];
 };
 
 // Fixed-function pixel stages (draws with no pixel shader): the texture stage states

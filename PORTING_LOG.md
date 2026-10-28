@@ -3163,6 +3163,28 @@ Not verified: GT7 HDR in game (builds, links and the post shader compiles only),
 much brighter the bloom is now, and draws that use DESTCOLOR factors on light past white
 (they now see it). The baked lightmaps still stop at the game's 2x overbright.
 
+## 2026-10-27: More colour in HDR highlights; HDR sliders tried and removed
+
+- **No toe on HDR:** testers preferred HDR off for its detail; GT7's toe darkened the
+  shadows, most of this game's picture. `gt7_full` is now straight below the shoulder, so
+  the darks and mid-tones match HDR off and only the highlights go further.
+- **HDR highlights keep more colour:** `gt7_full` weighs the ICtCp result 0.8 against the
+  per-channel curve (GT7's own 0.6), so neon and lamps fade less towards white.
+- **Two HDR sliders on the Enhanced tab tried and removed.** "Peak brightness" (how much
+  of the screen's headroom the tone map uses) and "game brightness" (the light scaled
+  before the curve) were plain vgui::Sliders made from GameUI's own (constructor
+  `0x10035C30`, SetValue `0x10035D20`, SetRange `0x10036620`, caption `0x100363E0`; the
+  knob is placed from the value by vtable +0x1d8, which Panel::SetSize skips). In game they
+  seemed to do nothing and went back when the options opened again; the user then decided
+  two sliders only confuse players. Gone with their aliases; HDR uses the screen's whole
+  headroom, the picture's brightness as drawn.
+- **Not done:** the eye adaptation seeing light past white. The highlights past white come
+  from the tone map, after the metering, so it would change nothing; the bloom already
+  sees the real values. Lightmaps past the game's 2x overbright are a separate, bigger job.
+
+Verified: GameUI rebuilt without the aliases, the runtime builds and links, the post
+shader compiles. Not verified in game: the highlight colour change.
+
 ## 2026-10-27: Bounced light, ReShade-RTGI style
 
 The screen-space bounced light (BL_SSIL) reworked towards ReShade's RTGI, which cannot
@@ -3203,3 +3225,222 @@ Options boxes: a box the player clicks now always takes effect. Before, an effec
 in the environment (BL_SSIL=1 and the like) kept it on whatever the box said: the click
 was saved but the effect stayed, and the box came back ticked. The environment still
 sets an effect at start.
+
+## 2026-10-28: stronger ambient occlusion; object shadows, step 1
+
+### Ambient occlusion
+The occlusion is now raised to a power before it is applied, as XeGTAO does
+(`BL_AO_POWER`, default 2.2), and applied at full strength (`BL_AO_STRENGTH` default 1,
+was 0.6). Before, a floor-to-wall corner came out about 10% darker; now corners,
+skirting, stool bases and the bar's edge read clearly. Checked headless on sm_asylum_1,
+still and turning: no streaks or halos at the doorway. The contact shadows share the
+apply pass and keep a power of 1.
+
+### Object shadows (step 1)
+The 2004 lightmaps hold the static props' shadows only blurred and faint. New, under the
+Enhanced shadows setting (`BL_PROP_SHADOWS`, default on; the "object shadows" section of
+metal_render.m):
+- Casters: the map's own faces and its static props by their visible meshes
+  (`bl_props_load_visible`, new in bl_props.c, with each triangle's prop), read when the
+  map opens (`bl_shadow_note_map`, called from bl_bsp.c). sm_asylum_1: 5,558 map
+  triangles, 38,956 from 80 props.
+- For the 4 brightest lights the camera can see, six views round each light (512 texels
+  across, `BL_PROP_SHADOWS_RES`) hold the distance to the map's faces and to the faces
+  and props. They are drawn once per light and kept, at most one light a frame. A pixel
+  is in an object's shadow where the light gets past the map but not past the props, so
+  the map's own (baked) shadows are not darkened twice. Props whose bounds hold the light
+  (its fitting) are left out.
+- Each such light's share of all the lights on the pixel is taken off (at most
+  `BL_PROP_SHADOWS_STRENGTH`, 0.7), filtered like the occlusion. Bright pixels are left
+  alone.
+- Debugging: `BL_PROP_SHADOWS=show`, `BL_PROP_SHADOWS_DEBUG` (10 x light + 1, 2 or 3),
+  `BL_PROP_SHADOWS_LOG`.
+
+Checked headless on sm_asylum_1 from the start: a light's views show the stools'
+shadows on the floor where they should be, and turning shows no artifacts. Fixed on the
+way: the parameters' view-to-world rows were 8 bytes off the shader's layout.
+
+Not yet: moving props, characters casting from the map's lights, flickering lights,
+neon (glowing surfaces are not in the light list, so a prop lit mostly by neon is
+darkened too much). Not seen in a window; the upstairs table room was not reached
+headless (the console's setpos does not work in this build).
+
+## 2026-10-28: Upscaling with MetalFX, step 1 (BL_UPSCALER_QUALITY)
+
+The world view can now be drawn at a lower resolution and brought up to the window's by
+MetalFX's temporal scaler, the one that already did the anti-aliasing. The view model, HUD
+and menus stay at the window's size.
+
+- `BL_UPSCALER_QUALITY=native|quality|balanced|performance|ultra`: 100% (the default, as
+  before), 67%, 59%, 50%, 33% of the window's width and height. Anything else stops with
+  a message.
+- How (metal_render.m, `world_res`): for a frame after one with a world view, the back
+  buffer and its depth buffer stand for smaller textures of their own (`world_texture`,
+  returned by `target_texture`). Everything that draws to them takes the game's pixels to
+  the texture's from the texture's size against the surface's: viewport and scissor
+  (`set_viewport`, which also covers the shadow atlas's larger scale it handled before),
+  partial clears, D3D9's half pixel and the TAA offset, and StretchRect's rectangles. The
+  world view's effects (occlusion, reflections, bounced light, shadows, haze, bloom, eye)
+  size themselves from the target, so they run at the lower resolution too.
+- The pass that ends the world view (`world_up`, from `pass`) runs the scaler from the
+  smaller picture into the back buffer's window-sized texture (`taa_resolve` now takes
+  both; `taa_setup` makes input and output sizes apart), copies the depth up (nearest,
+  `taa_depth_up`) for the view model, and reopens the pass on the full-size targets. A
+  frame with no camera to go by stretches the picture up instead, and one whose world
+  view no pass brought up (`world_finish`, from present) likewise. The pause backdrop and
+  the HUD's images bring it up first (`world_end_now`).
+- With upscaling the TAA offset spans the whole pixel and the pattern has 8 / scale²
+  steps (32 at 50%), as MetalFX asks for. `BL_TAA_JITTER` still overrides the span.
+- Another target drawn with the depth buffer while the world view is smaller gets the
+  window-sized depth; the world view drawn with any other depth buffer stops with a
+  message (not seen; Bloodlines draws it with the device's own).
+
+Verified: the runtime compiles and the game links; the TAA shaders (with the new depth
+pass) compile on the GPU. Not verified: anything on screen. Not done yet: the options'
+dropdowns (step 2) and FSR 4 (step 3).
+
+### Steps 2 and 3: the options' drop-downs and AMD FSR 4
+- The Visual tab has two new drop-downs under Shadows (`runtime/bl_vgui.c`,
+  `make_upscale_combos`): "Upscaler" (MetalFX, FSR 4) and "Upscaling Quality" (Native,
+  Quality 67%, Balanced 59%, Performance 50%, Ultra Performance 33%). They are GameUI's own
+  CLabeledCommandComboBox (constructor 0x1000fe40, newly aliased `GameUI_LabeledCombo_ctor`
+  in `modules/GameUI/global_aliases.manual.sci`, so GameUI was re-translated), with empty
+  commands; `bl_vgui_poll` reads the chosen text each frame and calls `bl_upscaler_set`.
+  The choice is saved in the registry next to the effects ("Upscaler", "UpscalerQuality")
+  and takes effect at the next frame (`d3d_render_present`), never in the middle of one.
+- `BL_UPSCALER=metalfx|fsr4` and `BL_UPSCALER_QUALITY` still override the menu.
+- FSR 4 (`fsr4_load`, `fsr4_setup`, `taa_resolve`): `libFSR4Metal.dylib` and its model
+  (`fsr4_assets`) are loaded with dlopen from the FSR4Metal folder next to the game's
+  folder, or `BL_FSR4_DIR`. Nothing of it is in this repository (GPL code, and a model
+  under AMD's licence). It stands in for MetalFX's temporal scaler with the same inputs:
+  colour, depth, motion and the jitter; at Native it is anti-aliasing only. A missing
+  library or model, or a window over 3840x2160 (FSR4Metal's limit), stops with a message.
+
+- Drop-downs no longer open their list (it was hard to read): a click on either half of
+  the box steps back or forward (`bl_options_ComboPressed`), and the box's own list button
+  under the ">" is shrunk to nothing (`layout_combo_set`), since a click on ">" opened the
+  list through it.
+
+Verified: GameUI re-translates (13 s), the runtime builds with no warnings and the game
+links; the user saw both boxes on the Visual tab. Not verified: the arrows-only change, either scaler in a level, FSR 4 at all in
+the game.
+
+### Options: "Enhanced" shadows choice; no loose tooltip text
+- The renderer's shadows are now "Enhanced", a fifth choice after "Soft" in the Visual
+  tab's Shadows drop-down (it runs `cl_v_shadows 3`, like Soft), in place of the Shadows
+  box on the Enhanced tab (`runtime/bl_vgui.c`). With any other choice they are off.
+- GameUI's `Tooltip::ShowTooltip` (0x10038160) now shows nothing (`bl_vgui_ShowTooltip`):
+  the options pages' hints, such as "Shadow Type", appeared as loose text in the gothic
+  options screen.
+- Verified headlessly: the Visual tab shows "Enhanced" and the Enhanced tab no longer has
+  a Shadows box. Not verified: stepping through the choices with the arrows in a window.
+- Softer object shadows: strength 0.5 (was 0.7), and soft edges as a light 6 units in
+  radius casts them, wider the further the shadow falls from its prop
+  (`BL_PROP_SHADOWS_SOFT`). Not yet compared side by side in a window.
+- The options screen's choice settings no longer open a list: a click on the left half
+  steps to the previous choice, on the right half to the next (`bl_options.c`).
+  Verified headlessly: Soft, then Enhanced.
+
+## 2026-10-28: Resolution applied without starting the game again
+
+The Video tab's resolution used to need the game started again ("Changes to video settings
+will take effect after relaunching the game"): the engine's `_setvideomode`
+(0x20090990, setter 0x200fd210) only writes ScreenWidth, ScreenHeight and ScreenBPP to the
+registry, and the menus, HUD and fonts are laid out at start-up for that size.
+
+- A new resolution of the same shape as the game's (within 1%, such as 1920x1080 to
+  2560x1440) is now drawn live from the next frame (`bl_render_live_mode`,
+  `out_apply` in metal_render.m). The game keeps its own start-up size, which its menus
+  and HUD are laid out for; the back buffer and its depth buffer get textures of the new
+  size (`target_full`, `out_w`/`out_h`), and every draw reaches them through the
+  texture-over-surface scaling the upscaling work made generic. The drawable and the
+  window follow (`bl_cocoa_set_window_size`; the mouse still goes by the game's size).
+  Movies are scaled to it, and reads of the back buffer (GetRenderTargetData) are shrunk
+  to the game's size first.
+- GameUI (re-translated): the Video tab's ApplyChanges (0x1001b7c0) compares the chosen
+  mode with the size the screen is drawn at now (`bl_vgui_VideoApply`), and the restart
+  note (0x1001b8a5) is left out when the change is live (`bl_vgui_VideoNote`). Another
+  shape (4:3 to 16:9) still saves the size and shows the note.
+- The engine still saves the size, so the next start is at it natively. Until then, text
+  and HUD images drawn at the old size are scaled.
+
+Verified: GameUI re-translates, the runtime builds, the game links. Not verified: any of
+it on screen. Known: the Video tab shows the start-up resolution again when reopened
+(it reads the engine's mode).
+
+### Display Mode, wide resolutions only, window size, quality order
+- Video tab: a "Display Mode" drop-down under Resolution (Windowed, Borderless,
+  Fullscreen), made in `bl_vgui_AddPage_c` for "#GameUI_Video" with the same
+  CLabeledCommandComboBox as the upscaling ones (`make_combo`). Saved in the registry
+  (Native\DisplayMode) and applied at once (`bl_display_mode_set`,
+  `bl_cocoa_set_display_mode`): Borderless is a window without a frame over the whole
+  screen on the desktop's Space with the menu bar and Dock hidden; Fullscreen is macOS's
+  own full screen. Leaving full screen waits for its animation (windowDidExitFullScreen).
+  Until one is picked, the game's own setting and BL_FULLSCREEN decide as before. The
+  window is a BLWindow, which can be key without a frame.
+- The resolution list has only shapes 3:2 and wider (`bl_display.c`): no 4:3 or 5:4.
+- A window's size no longer follows the resolution (`fit_size`): it is as big as the
+  screen allows at the game's shape, so a lower resolution is not a smaller window with
+  smaller menus.
+- Upscaling Quality runs low to high like the game's other settings (Ultra Performance
+  first, Native last; `combo_get`/`combo_set` map to the renderer's order).
+
+Verified: the runtime builds, the game links. Not verified: any of it on screen.
+
+### Contact shadows: Bend Studio's screen-space shadows
+
+The contact shadows (`metal_render.m`, contact shadows section) are now Bend Studio's
+screen-space shadows from Days Gone (`bend_sss_gpu.h`/`bend_sss_cpu.h`, Apache 2.0, Sony
+Interactive Entertainment 2023) in place of our own 16-step march; the old trace is gone.
+
+- Up to 4 lights a frame (the brightest at the camera among the haze's lights), each
+  traced at half resolution into its own slice of an R8 array: wavefronts of 64 pixels run
+  towards the light's point on the screen, sharing depths in threadgroup memory, 60
+  samples each (4 hard, 8 fading), Bend's defaults (thickness 0.005, edge threshold 0.02,
+  contrast 4). `contact_bend_list` is Bend's BuildDispatchList in C.
+- Depth for it is reversed, `(1 - alpha) - beta / w`, so it stays precise far away.
+- The old caster rules stay: characters cast on and take from everything, props cast on
+  all but themselves, the map not on itself (its lightmaps have those), hair takes none.
+- A small kernel (`contact_main`, its own encoder) weighs each light's shadow by its share
+  of all the lights on the pixel, then the occlusion's filter, upsample and multiply as
+  before. `BL_CONTACT_LENGTH` is gone; `BL_CONTACT_STRENGTH` (0.5) and `BL_CONTACT=show`
+  remain.
+
+Verified: the shader compiles with `xcrun metal`, the runtime builds, the game links. Not
+verified: any of it on screen.
+
+## 2026-10-28: Full screen no longer stretches the picture
+
+The user saw the picture squashed in full screen at resolutions below 1920x1080 (the game at
+1280x720, 16:9, on a 16:10 screen). The Metal layer asked for `kCAGravityResizeAspect`, but
+it is the view's backing layer, and AppKit sets a backing layer's `contentsGravity` from the
+view's `layerContentsPlacement`, whose default stretches. A small Cocoa test showed the
+gravity already back to `resize` right after `wantsLayer`. `bl_cocoa.m` now sets
+`layerContentsPlacement = NSViewLayerContentsPlacementScaleProportionallyToFit`, which the
+same test showed gives `resizeAspect`. The picture now keeps its shape with black bars, which
+is also what the mouse mapping (`image_rect`) already assumed. Built; not yet checked on
+screen by the user.
+
+## 2026-10-28: Menus and HUD at the screen's own detail
+
+At low resolutions the menus, HUD and text looked blurry and blocky, because the whole frame was
+drawn at the game's resolution and then scaled up to the screen. Now the back buffer always
+matches the window's own pixels (the picture's part of it, at the game's shape, capped at
+3840x2160 so FSR 4 can still make it). `out_follow_window` checks this every frame in present, so
+resizing the window and switching Display Mode follow it. Only the world view is drawn at the
+resolution (`world_size`: the resolution times the Upscaling Quality share) and brought up by the
+upscaler. Everything the game draws after that (view model, HUD, menus, text) is rasterised at
+the screen's size through the texture-over-surface scaling. Post effects still run at the world
+view's size, before the upscale.
+
+What this changes:
+- Resolution now sets the 3D detail and the UI layout. The UI is always sharp.
+- "Native" quality means the world view is drawn at the resolution itself and upscaled from
+  there to the screen.
+- A live resolution change from the Video tab now changes the world view's size (`view_w`),
+  not the window. `bl_cocoa_set_window_size` is gone, and the window keeps the game's shape.
+- The jitter pattern in `taa_frame_end` goes by the world view's real share of the back buffer
+  instead of the quality preset.
+
+Built; not yet checked on screen by the user. To watch: GPU cost of the full-size back buffer
+(the view model, HUD and the final copies are now at up to 3840x2160).

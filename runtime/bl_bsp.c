@@ -115,6 +115,8 @@ static struct map *load(const char *path)
 
 // The quest compass (bl_compass.c) learns the map too, where it is linked in.
 __attribute__((weak)) void bl_compass_note_map(const char *host_path);
+// The object shadows (metal_render.m) take the map's surfaces as casters, where linked in.
+__attribute__((weak)) void bl_shadow_note_map(const struct bl_bsp_world *w, const char *host_path);
 
 void bl_bsp_note_open(const char *host_path)
 {
@@ -141,8 +143,12 @@ void bl_bsp_note_open(const char *host_path)
     }
     int bad = bl_bsp_world_check(w, summary, sizeof summary);
     fprintf(stderr, "[bsp] %s%s\n", summary, bad ? " -- LAYOUT NOT AS EXPECTED" : "");
-    if (bad) bl_bsp_world_free(w);
-    else bl_map_note(w, host_path);
+    if (bad) {
+        bl_bsp_world_free(w);
+        return;
+    }
+    if (bl_shadow_note_map) bl_shadow_note_map(w, host_path);
+    bl_map_note(w, host_path);
 }
 
 // For tools built without the renderer (tests/bsp_check): the surfaces are not kept.
