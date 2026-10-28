@@ -97,8 +97,15 @@ static double became_key_at;      // when the window last became key (system upt
 
 static void release_all(void);
 static void display_mode_after_full_screen(void);
+static void display_mode_full_screen_entered(void);
+void bl_display_mode_note(int mode);
 
 @implementation BLWindowDelegate
+- (void)windowDidEnterFullScreen:(NSNotification *)n
+{
+    (void)n;
+    display_mode_full_screen_entered();
+}
 - (void)windowDidExitFullScreen:(NSNotification *)n
 {
     (void)n;
@@ -225,6 +232,7 @@ void bl_cocoa_set_fullscreen(int on)
 // (macOS's own, a Space of its own). Leaving full screen animates: the mode is set once
 // the window is out (windowDidExitFullScreen).
 static int display_next = -1;
+static int display_entering;  // full screen asked for here, not by the player's keys or button
 static const NSWindowStyleMask framed = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                         NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
 static int borderless(void) { return window && !(window.styleMask & NSWindowStyleMaskTitled); }
@@ -254,10 +262,19 @@ void bl_cocoa_set_display_mode(int mode)
     }
     if (mode == 2) {
         set_framed(1);  // full screen goes from a framed window
+        display_entering = 1;
         [window toggleFullScreen:nil];
     } else {
         set_framed(mode == 0);
     }
+}
+
+// Full screen entered or left with Cmd+Return, Cmd+Ctrl+F or the window's green button:
+// Display Mode follows (saved, as if picked in the options).
+static void display_mode_full_screen_entered(void)
+{
+    if (!display_entering) bl_display_mode_note(2);
+    display_entering = 0;
 }
 
 static void display_mode_after_full_screen(void)
@@ -265,6 +282,7 @@ static void display_mode_after_full_screen(void)
     int m = display_next;
     display_next = -1;
     if (m >= 0) bl_cocoa_set_display_mode(m);
+    else bl_display_mode_note(0);
 }
 
 // Where the game image sits in the view: scaled to fit, centred (contentsGravity).
@@ -284,12 +302,6 @@ int bl_cocoa_image_pixels(uint32_t *width, uint32_t *height)
     *width = (uint32_t)lround(r.size.width), *height = (uint32_t)lround(r.size.height);
     return *width && *height;
 }
-
-// Game x for a position in the drawn image, and back, with the menu squeeze.
-static float squeeze = 1;
-void bl_cocoa_set_squeeze(float s) { squeeze = s > 0 && s <= 1 ? s : 1; }
-static double unsqueeze_x(double x) { return client_w / 2.0 + (x - client_w / 2.0) / squeeze; }
-static double squeeze_x(double x) { return client_w / 2.0 + (x - client_w / 2.0) * squeeze; }
 
 void bl_cocoa_capture_mouse(int on)
 {
@@ -493,7 +505,7 @@ void bl_cocoa_motion(int dx, int dy)
         int32_t x, y;
         bl_window_get_cursor(game_hwnd, &x, &y);
         NSRect r = image_rect();
-        NSPoint p = NSMakePoint(r.origin.x + squeeze_x(x + 0.5) * r.size.width / client_w,
+        NSPoint p = NSMakePoint(r.origin.x + (x + 0.5) * r.size.width / client_w,
                                 NSMaxY(r) - (y + 0.5) * r.size.height / client_h);
         p = [window convertPointToScreen:[window.contentView convertPoint:p toView:nil]];
         CGWarpMouseCursorPosition(CGPointMake(p.x, NSMaxY(NSScreen.screens[0].frame) - p.y));
@@ -524,7 +536,7 @@ static void mouse(NSEvent *e)
         }
         bl_window_get_cursor(game_hwnd, &x, &y);
     } else {
-        x = (int32_t)unsqueeze_x((p.x - r.origin.x) * client_w / r.size.width);
+        x = (int32_t)((p.x - r.origin.x) * client_w / r.size.width);
         y = (int32_t)((NSMaxY(r) - p.y) * client_h / r.size.height);
         x = x < 0 ? 0 : x >= (int32_t)client_w ? (int32_t)client_w - 1 : x;
         y = y < 0 ? 0 : y >= (int32_t)client_h ? (int32_t)client_h - 1 : y;

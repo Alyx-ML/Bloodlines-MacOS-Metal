@@ -17,3 +17,7 @@ loc_1001FB50,GameUI_Input
 loc_10023B50,GameUI_Label_GetText
 loc_1001FBA0,GameUI_IPanel
 loc_1000FE40,GameUI_LabeledCombo_ctor
+loc_10035C30,GameUI_Slider_ctor
+loc_10036620,GameUI_Slider_SetRange
+loc_100363E0,GameUI_Slider_SetCaption
+loc_10035D90,GameUI_Slider_RecomputeNob

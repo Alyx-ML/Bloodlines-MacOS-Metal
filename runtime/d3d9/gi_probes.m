@@ -878,14 +878,6 @@ void bl_map_note(struct bl_bsp_world *w, const char *host_path)
     bl_rebake_note_path(host_path);
 }
 
-int bl_gi_gen(void)
-{
-    pthread_mutex_lock(&gi_lock);
-    int g = gi_gen;
-    pthread_mutex_unlock(&gi_lock);
-    return g;
-}
-
 const struct bl_gi *bl_gi_get(int start)
 {
     pthread_mutex_lock(&gi_lock);

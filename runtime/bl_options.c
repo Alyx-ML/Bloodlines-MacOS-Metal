@@ -64,6 +64,7 @@
 
 extern char GameUI_Surface[], GameUI_Input[], GameUI_IPanel[], GameUI_Label_GetText[], GameUI_Panel_SetPos[],
     GameUI_Panel_SetSize[], GameUI_Panel_GetPos[], GameUI_Panel_GetSize[], GameUI_OptionsVtable[];
+int bl_vgui_slider_in_units(uint32_t p);  // bl_vgui.c: the Field of View slider, shown in degrees
 
 #define field gothic_field
 
@@ -311,7 +312,7 @@ static int label_track(void) { return px(SET_LABEL_EM * 0.3); }
 static int control_y(void) { return px(SET_LABEL_EM * 1.35 + SET_GAP); }
 
 // Words wrapped to `width`, into up to `max` lines.
-static int wrap(void *cpu, uint32_t s, uint32_t font, const char *t, int width, char lines[][160], int max)
+static int wrap_measure(void *cpu, uint32_t s, uint32_t font, const char *t, int width, char lines[][160], int max)
 {
     int n = 0;
     char line[160] = "";
@@ -339,6 +340,31 @@ static int wrap(void *cpu, uint32_t s, uint32_t font, const char *t, int width, 
     return n;
 }
 
+// wrap_measure's last results: the same texts (the description, the notes) are wrapped
+// every frame, and measuring them takes a call into the game per character.
+#define WRAP_KEEP 8
+#define WRAP_LINES 16
+static struct { uint32_t font; int width, max, n; char *text; char lines[WRAP_LINES][160]; } wrapped[WRAP_KEEP];
+static int wrap_next;
+
+static int wrap(void *cpu, uint32_t s, uint32_t font, const char *t, int width, char lines[][160], int max)
+{
+    if (max > WRAP_LINES) return wrap_measure(cpu, s, font, t, width, lines, max);
+    for (int i = 0; i < WRAP_KEEP; i++)
+        if (wrapped[i].text && wrapped[i].font == font && wrapped[i].width == width && wrapped[i].max == max &&
+            !strcmp(wrapped[i].text, t)) {
+            memcpy(lines, wrapped[i].lines, sizeof(char[160]) * (size_t)wrapped[i].n);
+            return wrapped[i].n;
+        }
+    int i = wrap_next, n = wrap_measure(cpu, s, font, t, width, wrapped[i].lines, max);
+    wrap_next = (wrap_next + 1) % WRAP_KEEP;
+    free(wrapped[i].text);
+    wrapped[i].text = strdup(t), wrapped[i].font = font, wrapped[i].width = width, wrapped[i].max = max;
+    wrapped[i].n = n;
+    memcpy(lines, wrapped[i].lines, sizeof(char[160]) * (size_t)n);
+    return n;
+}
+
 // ---- Layout ----
 
 // Glows behind the chosen tab and the tab or button under the mouse, for the renderer;
@@ -358,9 +384,20 @@ static char desc_name[128];
 static uint32_t desc_page;
 static int desc_x, desc_y, desc_w;
 // Where each graphics setting was when first seen (the .res's place, before the rows moved
-// it), which keeps the rows in the .res's order.
+// it), which keeps the rows in the .res's order. Kept while one dialog (`home_owner`) is
+// laid out, and forgotten when another is or it has not been for a second (closed: a
+// dialog opened again is built anew, and its settings may take the old ones' addresses).
 static struct { uint32_t p, vt; int x, y; } home[128];
 static int nhome;
+static uint32_t home_owner;
+static double home_seen;
+
+static void home_begin(uint32_t owner)
+{
+    double t = now();
+    if (owner != home_owner || t - home_seen > 1.0) nhome = 0, home_owner = owner;
+    home_seen = t;
+}
 
 static void home_pos(uint32_t p, int *x, int *y)
 {
@@ -485,23 +522,24 @@ static const char *const descriptions[][2] = {
                   "only." },
     { "Upscaling Quality", "How big the picture is drawn before it is enlarged. Native draws it at full "
                            "size; the lower settings are faster but softer. Not used with no upscaler." },
-    { "Image Quality", "How detailed the textures are. Lower uses less memory." },
+    { "Image Quality", "The game's own edge smoothing and texture filtering. Here the upscaler smooths "
+                       "the edges and textures are always filtered at their sharpest, so it changes "
+                       "little." },
     { "Lighting", "How the world is lit. Higher looks better and costs more." },
     { "Bump Mapping", "Relief on walls, floors and characters from their surface maps." },
-    { "Widescreen", "The picture at a wide shape." },
     { "Shadows", "How characters and objects cast shadows. Enhanced gives sharp shadows with soft edges "
                  "from the lamps around them." },
     { "Shadow Count", "How many shadows are drawn at once." },
     { "Particles", "How much smoke, sparks, dust and blood the effects throw." },
     { "Geometric Detail", "How far away models keep their full detail." },
     { "Gamma", "How bright the darker shades are. Raise it if the night is too dark to see." },
-    { "Brightness", "How bright the picture is." },
     { "Combat Effects", "The flashes and blood of hits in a fight." },
     { "Global Illumination", "Light from the lamps in the scene filling the shadows, on top of the game's "
                              "own lighting." },
     { "Bounced Light", "Light thrown back off nearby walls and floors, taking on their colour." },
     { "Ambient Occlusion", "Soft shade in corners, in creases and where objects meet the ground." },
-    { "Volumetric Light", "Haze and shafts in the light of lamps and windows." },
+    { "Volumetric Light", "Haze in the light of lamps and windows, with beams where walls, pillars and "
+                          "railings cut it." },
     { "HDR", "Brighter lights and richer colour on a screen that shows high dynamic range." },
     { "Bloom", "A soft glow around bright lights." },
     { "Eye Adaptation", "The picture brightens in dark places and dims in bright ones, the way eyes "
@@ -514,13 +552,20 @@ static const char *const descriptions[][2] = {
     { "Rain Effects", "Where it rains, streets and pavements turn dark and shiny, with puddles that "
                      "reflect the lights and ripple in the rain. Grass, dirt and sand stay as they are." },
     { "Lens Glare", "Bright lamps streak and glow at night, as through a camera's lens." },
+    { "Depth of Field", "The picture focuses on what you look at, as a camera's lens does: what is near "
+                        "stays sharp and the distance goes soft. In conversations the one you talk to "
+                        "stays sharp and the background goes soft, as in a film's close-up." },
+    { "Motion Blur", "Moving people and things blur along their motion, as through a film camera. The view "
+                     "itself blurs only when you turn quickly." },
     { "Auto Renew Disciplines", "A discipline starts again by itself when it runs out, while you have "
                                 "the blood for it." },
     { "Show Damage Floaters", "Numbers rise from those you hit, showing the damage." },
     { "Quest Compass", "A marker at the top of the screen pointing the way to your quest." },
+    { "Skip Intro Movies", "Starts the game at the main menu, without the company logos first." },
+    { "First-person Body", "Look down to see your own body, legs and feet." },
+    { "Field of View", "How wide you see, in degrees. The game's own is 75; higher shows more at the "
+                       "sides." },
     { "Volume", "How loud the sound effects are." },
-    { "Music", "How loud the music is." },
-    { "Sound Quality", "The quality of the game's sound." },
     { "High Quality Audio", "Better sound, at a little more work for the computer." },
     { "Environmental Effects", "Echoes and the sound of the room around you." },
     { "View Subtitles", "What is said shown as text." },
@@ -626,6 +671,7 @@ static void layout_page(void *cpu, uint32_t s, uint32_t pg)
 {
     struct { uint32_t p; int kind, x, y, w, h; } it[40];
     int n = 0, pw, ph, x0, y0;
+    home_begin(dialog);
     page_bounds(&x0, &y0, &pw, &ph);
     uint32_t vp = field(pg, 4), ip = ipanel(cpu);
     int count = (int)vcall(cpu, ip, IP_CHILD_COUNT, 1, &vp), has_list = 0;
@@ -786,7 +832,7 @@ static void paint_dialog(void *cpu, uint32_t s)
         text3(cpu, s, gothic_font(cpu, s, SET_LABEL_EM * unit()), c, x + px(ROW_PAD),
               y + (h - gothic_tall(SET_LABEL_EM * unit())) / 2, label_track(), on ? GOLD_HI : GOLD, 1);
         int lo = (int)field(p, 0x78), hi = (int)field(p, 0x7c), v = (int)field(p, 0x80);
-        snprintf(num, sizeof num, "%d", hi > lo ? (int)lround(100.0 * (v - lo) / (hi - lo)) : 0);
+        snprintf(num, sizeof num, "%d", bl_vgui_slider_in_units(p) ? v : hi > lo ? (int)lround(100.0 * (v - lo) / (hi - lo)) : 0);
         uint32_t nf = gothic_font(cpu, s, 18 * unit());
         text3(cpu, s, nf, num, x + w - px(ROW_PAD) - gothic_text_width(cpu, s, nf, num, px(2)),
               y + (h - gothic_tall(18 * unit())) / 2, px(2), IVORY, enabled(p) ? 1 : 0.35);
@@ -890,7 +936,7 @@ static void paint_slider(void *cpu, uint32_t p)
         image_text(cpu, field(p, 0x98), t, sizeof t);
         paint_setting_label(cpu, s, t, hovered(cpu, p), h);
         int lo = (int)field(p, 0x78), hi = (int)field(p, 0x7c), v = (int)field(p, 0x80);
-        snprintf(num, sizeof num, "%d", hi > lo ? (int)lround(100.0 * (v - lo) / (hi - lo)) : 0);
+        snprintf(num, sizeof num, "%d", bl_vgui_slider_in_units(p) ? v : hi > lo ? (int)lround(100.0 * (v - lo) / (hi - lo)) : 0);
         uint32_t nf = gothic_font(cpu, s, 18 * unit());
         text3(cpu, s, nf, num, w - gothic_text_width(cpu, s, nf, num, px(2)), 0, px(2), IVORY, a);
     }
@@ -1035,6 +1081,7 @@ enum { GAMES_W = 1500, GAMES_H = 860, GAMES_PAD = 48, GAMES_TOP = 100, GAMES_ROW
 
 static void layout_games(void *cpu, uint32_t s, uint32_t f)
 {
+    home_begin(f);
     int w = px(GAMES_W) < screen_w - px(80) ? px(GAMES_W) : screen_w - px(80);
     int h = px(GAMES_H) < screen_h - px(80) ? px(GAMES_H) : screen_h - px(80);
     set_bounds(cpu, f, (screen_w - w) / 2, (screen_h - h) / 2, w, h);

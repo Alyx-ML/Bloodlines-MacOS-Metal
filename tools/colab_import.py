@@ -22,7 +22,15 @@ import zipfile
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TEXTURES = os.path.join(HERE, "..", "build", "textures")
+TEXTURES = os.path.realpath(os.path.join(HERE, "..", "build", "textures"))
+
+
+def inside(dst):
+    """dst, if it lies under TEXTURES (a zip's names could lead anywhere with ..)."""
+    real = os.path.realpath(dst)
+    if os.path.commonpath([real, TEXTURES]) != TEXTURES:
+        raise SystemExit(f"colab_import: refusing to write outside {TEXTURES}: {dst}")
+    return real
 
 
 def place(path, data):
@@ -30,21 +38,24 @@ def place(path, data):
     parts = path.replace("\\", "/").split("/")
     for i, p in enumerate(parts):
         if p in ("world", "characters") and i + 1 < len(parts):
-            rel = "/".join(parts[i + 1:])
+            rest = parts[i + 1:]
+            if any(q in ("", ".", "..") for q in rest):
+                return False  # not a plain path below world/ or characters/
+            rel = "/".join(rest)
             if ".tmp." in rel:
                 return False  # cut off while being written
             if p == "world" and rel.endswith(("_n.webp", "_r.webp")):
-                dst = os.path.join(TEXTURES, "maps", "all", rel[:-5] + ".png")
+                dst = inside(os.path.join(TEXTURES, "maps", "all", rel[:-5] + ".png"))
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 img = Image.open(io.BytesIO(data()))
                 img.convert("L" if rel.endswith("_r.webp") else "RGB").save(dst)
             elif p == "world":
-                dst = os.path.join(TEXTURES, "maps", "all", rel)
+                dst = inside(os.path.join(TEXTURES, "maps", "all", rel))
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 with open(dst, "wb") as f:
                     f.write(data())
             elif rel.endswith("_u.webp"):
-                dst = os.path.join(TEXTURES, "characters", rel[:-5] + ".png")
+                dst = inside(os.path.join(TEXTURES, "characters", rel[:-5] + ".png"))
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 Image.open(io.BytesIO(data())).save(dst)
             else:

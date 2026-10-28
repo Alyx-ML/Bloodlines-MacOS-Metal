@@ -46,6 +46,9 @@ funcv bl_vampire_WarformShadow $
 funcv bl_vampire_WarformSame $
 funcv bl_vampire_WarformTarget $
 funcv bl_client_FilterSame $
+funcv bl_client_BodyShown $
+funcv bl_client_BodyOrigin $
+funcv bl_client_BodyBones $
 funcv bl_engine_ShowConsole $
 funcv bl_engine_ClientCmd $
 funcv bl_GameUI_FrameVisible $

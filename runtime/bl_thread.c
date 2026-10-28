@@ -506,6 +506,18 @@ static void thread_start(struct waitable *t)
     pthread_attr_destroy(&a);
 }
 
+uint32_t bl_thread_current_handle(void)
+{
+    // Threads the game did not create (the main one) get theirs when first asked: running,
+    // never signaled.
+    if (!current_thread) {
+        current_thread = waitable_new(1, 0);
+        current_thread->id = bl_k32_GetCurrentThreadId_c();
+        current_thread->started = 1;
+    }
+    return bl_handle_new(BL_H_THREAD, current_thread);
+}
+
 uint32_t bl_k32_CreateThread_c(uint32_t sec, uint32_t stack, uint32_t start, uint32_t param, uint32_t flags,
                                uint32_t tid)
 {

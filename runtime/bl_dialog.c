@@ -63,6 +63,7 @@ static uint32_t row_answer[MAX_ANSWERS];
 static int chosen, last_x = -1, last_y = -1;  // the bright answer; where the mouse was
 static uint32_t answers_seen;                // which answers are up, to start again at the first
 static volatile uint64_t asking_ns;          // when answers to choose were last painted
+static volatile uint64_t talking_ns;         // when the screen was last painted with its fade up
 
 static uint32_t surface(void *cpu) { return gothic_call(cpu, bl_h2g(client_Surface), 0, 0, NULL); }
 static double unit(void) { return screen_h / 1080.0; }
@@ -163,6 +164,10 @@ static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 // the gamepad's dialogue buttons.
 int bl_dialog_active(void) { return now_ns() - asking_ns < 300000000ull; }
 
+// Whether a conversation is on screen (painted in the last third of a second), for the
+// renderer's depth of field (dof_step in metal_render.m): 1 or 0.
+float bl_dialog_focus(void) { return now_ns() - talking_ns < 300000000ull ? 1.0f : 0.0f; }
+
 // The answer under the mouse, from the last paint, or -1; `moved` says whether the mouse
 // moved since the last look.
 static int hovered_row(void *cpu, int *moved)
@@ -187,6 +192,7 @@ static void paint(void *cpu, uint32_t dlg)
     double a_answers = fade(dlg, 0x1a8), a_shade = fade(dlg, 0x1a4), a_line = a_shade;
     nrows = 0;
     if (a_shade <= 0) return;
+    talking_ns = now_ns();
 
     // The fade: clear at its top, near black at the bottom.
     int sh = px(SHADE_H), band = px(6) > 1 ? px(6) : 1;

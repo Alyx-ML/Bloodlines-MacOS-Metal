@@ -372,6 +372,7 @@ struct bl_bake *bl_bake_map(id<MTLDevice> dev, const struct bl_bsp_world *w, int
     BLJob *job = [[BLJob alloc] initWithDevice:dev];
     if (!job) {
         snprintf(err, (size_t)errlen, "no Metal 4 queue");
+        free(gf);
         bl_bake_free(b);
         return NULL;
     }

@@ -15,7 +15,7 @@
 #define GI_VIS 8  // how far each probe sees: cells across each of its six views
 
 struct bl_gi {
-    int gen;              // the map it is for (bl_gi_gen)
+    int gen;              // the map it is for (bl_map_note's count)
     float origin[3];      // the grid's first point
     float step;           // between points, world units
     int n[3];             // points along x, y, z
@@ -50,4 +50,3 @@ float bl_gi_seen(const struct bl_gi *g, int i, const float d[3]);
 // of their own. NULL until done; good until the map after next opens.
 void bl_map_note(struct bl_bsp_world *w, const char *host_path);
 const struct bl_gi *bl_gi_get(int start);
-int bl_gi_gen(void);

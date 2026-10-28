@@ -9,7 +9,7 @@
 // last 9 bytes; per file its name's length, the name, offset and size.
 //
 // A .phy: a 16-byte header (its size, an id, the number of solids, a checksum), then per
-// solid its size and an IVP compact surface, the old Havok format without Half-Life 2's
+// solid its size and an IVP compact surface, the old Havok format without later Source versions'
 // "VPHY" header. The surface's ledge tree leads to its convex pieces (ledges), each a list
 // of triangles over a point array, in metres with Y and Z swapped and Y negated.
 //
@@ -24,7 +24,7 @@
 // minimum (its first three floats) by its step size (the last three). The .vtx: a 36-byte
 // header (body parts' count and offset at 28), then body parts, models (LOD count and
 // offset), LODs (mesh count and offset, switch point), meshes (strip group count and
-// offset), all as in Half-Life 2 but for the strip groups: 20 bytes, the vertex and index
+// offset), all as in later Source versions but for the strip groups: 20 bytes, the vertex and index
 // counts as 16 bits, flags, and the offsets of a vertex table (16-bit vertex numbers in
 // the mesh), the indices (triangle lists) and the strips.
 //
@@ -328,7 +328,7 @@ static void ledge_tree(const uint8_t *surf, long len, long node, int depth, stru
                 ok = 0;
                 break;
             }
-            // Metres to inches; Havok's Y is down and its Z is Half-Life's Y.
+            // Metres to inches; Havok's Y is down and its Z is the engine's Y.
             const float k = 1.0f / 0.0254f;
             v[e][0] = rdf(surf + p) * k, v[e][1] = rdf(surf + p + 8) * k, v[e][2] = -rdf(surf + p + 4) * k;
         }
@@ -447,7 +447,7 @@ static int remodel_tris(const char *model, struct tris *o)
     return o->n > before;
 }
 
-// Half-Life's AngleMatrix: pitch, yaw, roll in degrees.
+// The Source engine's AngleMatrix: pitch, yaw, roll in degrees.
 static void angle_matrix(const float a[3], float m[3][3])
 {
     const float r = 3.14159265f / 180.0f;

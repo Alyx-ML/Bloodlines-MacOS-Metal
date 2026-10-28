@@ -1,7 +1,7 @@
 // Reads each .bsp given (the player's own maps) as the lighting rebake will
 // (bl_bsp_world_load) and prints bl_bsp_world_check's summary; exits 1 when any map's
 // lightmap layout is not as expected.
-//   clang -std=c2x -O2 -Iruntime tests/bsp_check.c runtime/bl_bsp.c runtime/bl_props.c -o build/tests/bsp_check
+//   (built by tools/build_tests.sh into build/tests/)
 //   build/tests/bsp_check <game>/Vampire/maps/*.bsp
 #include "bl_bsp.h"
 #include <stdio.h>

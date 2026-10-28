@@ -86,11 +86,12 @@ static void load(void)
     loaded = 1;
     const char *t = getenv("BL_REG_TRACE");
     trace = t && t[0] == '1';
-    char path[1100], line[8192];
+    char path[1100], *line = NULL;
+    size_t line_cap = 0;
     file_path(path, sizeof path);
     FILE *f = path[0] ? fopen(path, "r") : NULL;
     if (!f) return;
-    while (fgets(line, sizeof line, f)) {
+    while (getline(&line, &line_cap, f) > 0) {  // any length: a value's hex may be long
         line[strcspn(line, "\n")] = 0;
         if (!strncmp(line, "K\t", 2)) add_key(line + 2);
         if (!strncmp(line, "V\t", 2)) {
@@ -115,6 +116,7 @@ static void load(void)
             for (uint32_t j = 0; j < v->size; j++) sscanf(hex + 2 * j, "%2hhx", &v->data[j]);
         }
     }
+    free(line);
     fclose(f);
 }
 
@@ -191,13 +193,14 @@ uint32_t bl_adv_RegCreateKeyExA_c(uint32_t key, uint32_t sub, uint32_t res, uint
 
 uint32_t bl_adv_RegCloseKey_c(uint32_t key)
 {
+    if (key >= 0x80000000u && key <= 0x80000006u) return BL_ERROR_SUCCESS;  // HKEY_CLASSES_ROOT etc.
     uint32_t i = (key - 0x710000u) / 4;
-    if (key >= 0x710000u && i < 256) {
-        pthread_mutex_lock(&lock);
-        open_keys[i][0] = 0;
-        pthread_mutex_unlock(&lock);
-    }
-    return BL_ERROR_SUCCESS;
+    if (key < 0x710000u || (key & 3) || i >= 256) return BL_ERROR_INVALID_HANDLE;
+    pthread_mutex_lock(&lock);
+    uint32_t r = open_keys[i][0] ? BL_ERROR_SUCCESS : BL_ERROR_INVALID_HANDLE;
+    open_keys[i][0] = 0;
+    pthread_mutex_unlock(&lock);
+    return r;
 }
 
 // Copies value `v` out the way RegQueryValueEx does: the size alone when there is no
@@ -242,10 +245,13 @@ uint32_t bl_adv_RegQueryValueA_c(uint32_t key, uint32_t sub, uint32_t data, uint
     struct value *v = NULL;
     if (!resolve(key, sub, path, sizeof path)) r = BL_ERROR_INVALID_HANDLE;
     else if (!key_exists(path)) r = BL_ERROR_FILE_NOT_FOUND;
-    else if (!(v = find_value(path, ""))) {
+    else if (!(v = find_value(path, ""))) {  // an empty string
+        uint32_t room = size ? U32(size) : 0;
         if (size) U32(size) = 1;
-        if (data) *(char *)bl_g2h(data) = 0;
-        r = BL_ERROR_SUCCESS;
+        if (!data) r = BL_ERROR_SUCCESS;
+        else if (!size) r = BL_ERROR_INVALID_PARAMETER;
+        else if (room < 1) r = ERROR_MORE_DATA;
+        else *(char *)bl_g2h(data) = 0, r = BL_ERROR_SUCCESS;
     } else {
         r = copy_out(v, 0, data, size);
     }

@@ -426,18 +426,19 @@ uint32_t bl_gdi_CreateDIBSection_c(uint32_t dc, uint32_t bmi, uint32_t usage, ui
 {
     (void)dc, (void)usage, (void)section, (void)offset;
     int w = I32(bmi + 4), h = I32(bmi + 8), bpp = *(uint16_t *)G(bmi + 14);
-    if (w <= 0 || h == 0 || bpp != 32) {
+    uint64_t rows = h < 0 ? (uint64_t)-(int64_t)h : (uint64_t)h, size64 = (uint64_t)(w > 0 ? w : 0) * rows * 4;
+    if (w <= 0 || h == 0 || bpp != 32 || size64 > 0x40000000) {  // at most 1 GB of guest memory
         fprintf(stderr, "[gdi] CreateDIBSection %dx%d %d bpp not supported\n", w, h, bpp);
         if (bits_out) U32(bits_out) = 0;
         return 0;
     }
-    uint32_t size = (uint32_t)w * (uint32_t)(h < 0 ? -h : h) * 4;
+    uint32_t size = (uint32_t)size64;
     uint32_t bits = bl_guest_calloc(1, size);
     if (!bits) return 0;
     pthread_mutex_lock(&lock);
     uint32_t handle = new_object(K_BITMAP);
     struct bitmap *b = &object(handle, K_BITMAP)->bitmap;
-    b->bits = bits, b->width = w, b->height = h < 0 ? -h : h, b->top_down = h < 0, b->bpp = bpp;
+    b->bits = bits, b->width = w, b->height = (int)rows, b->top_down = h < 0, b->bpp = bpp;
     pthread_mutex_unlock(&lock);
     if (bits_out) U32(bits_out) = bits;
     return handle;

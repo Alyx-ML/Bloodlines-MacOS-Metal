@@ -5,9 +5,7 @@
 // compares, face by face.
 //   bake_view <map.bsp> <out dir> [scale (4)] [bounces (3)] [x y z yaw pitch]...
 // With no cameras: four, from the player's start, facing 0, 90, 180 and 270 degrees.
-//   clang -std=c2x -O2 -Wall -fobjc-arc -Iruntime -Iruntime/d3d9 tests/bake_view.m runtime/d3d9/lm_bake.m
-//     runtime/bl_bsp.c runtime/bl_props.c -framework Metal -framework Foundation -framework CoreGraphics
-//     -framework ImageIO -o build/tests/bake_view
+//   (built by tools/build_tests.sh into build/tests/)
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <ImageIO/ImageIO.h>

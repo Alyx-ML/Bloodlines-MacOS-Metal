@@ -36,7 +36,7 @@ import tex_extract  # noqa: E402
 
 
 def angle_matrix(a):
-    """Half-Life's AngleMatrix: pitch, yaw, roll in degrees; columns forward, left, up."""
+    """The Source engine's AngleMatrix: pitch, yaw, roll in degrees; columns forward, left, up."""
     p, y, r = np.radians(a)
     sp, cp, sy, cy, sr, cr = np.sin(p), np.cos(p), np.sin(y), np.cos(y), np.sin(r), np.cos(r)
     return np.array([[cp * cy, sr * sp * cy - cr * sy, cr * sp * cy + sr * sy],

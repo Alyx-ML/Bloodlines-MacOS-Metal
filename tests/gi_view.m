@@ -4,9 +4,7 @@
 // tell which points they can see (bl_gi_seen against a line test through the map's solid
 // space: a probe that light reaches through a wall leaks).
 //   gi_view <map.bsp>
-//   clang -std=c2x -O2 -Wall -fobjc-arc -Iruntime -Iruntime/d3d9 tests/gi_view.m runtime/d3d9/gi_probes.m
-//     runtime/d3d9/lm_bake.m runtime/bl_bsp.c runtime/bl_props.c -framework Metal -framework Foundation
-//     -o build/tests/gi_view
+//   (built by tools/build_tests.sh into build/tests/)
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <stdio.h>

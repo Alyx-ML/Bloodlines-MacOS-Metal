@@ -1365,7 +1365,7 @@ All in `runtime/d3d9/metal_render.m` unless named; each effect has an environmen
 variable (documented at the top of that file) and, apart from the tone maps, a check box in
 the Visual options (`bl_vgui.c`: "HDR", "Volumetric Light", "Skin Scattering").
 
-- **Tone map tests.** `BL_TONEMAP=gt7|gt7x|pbr|pbrx` tries Gran Turismo 7's curve and
+- **Tone map tests.** `BL_TONEMAP=filmic|filmicx|pbr|pbrx` tries a published filmic curve and
   Khronos PBR Neutral on the world view in `post_apply`, with `BL_TONEMAP_EXPAND`. Off by
   default and not in the options: kept for comparison only.
 - **HDR.** On a screen with extended dynamic range, `hdr_present` lifts bright parts above
@@ -1909,13 +1909,13 @@ what that needs; nothing is baked or drawn differently yet.
   lighting lump; the texture names and reflectivity (the mean colours the map compiler
   bounced light with); every world light (point, spot, glowing surfaces, sun, sky); and
   the lighting lump itself.
-- Bloodlines' VBSP 17 faces are 104 bytes: Half-Life 2's fields plus eight light styles
+- Bloodlines' VBSP 17 faces are 104 bytes: later Source versions' fields plus eight light styles
   and eight day and eight night bytes, and a mean colour per style. Found by the face
   lump's size (3193 x 104 in sm_asylum_1) and confirmed by the lightmaps: every lit
   face's samples, (w + 1) x (h + 1) x styles, x 4 for bump-mapped faces, tile the
   lighting lump exactly.
 - Two layouts: the maps the Unofficial Patch compiled again (27 of 209) hold each face's
-  mean colour per style just before its samples, as Half-Life 2's do; the original maps
+  mean colour per style just before its samples, as later Source versions' do; the original maps
   do not. The reader tells them apart by which one fills the lump exactly
   (`world->means`).
 - `bl_bsp_world_check`, also run at each map's load ("[bsp] ..." in the log), and
@@ -1979,7 +1979,7 @@ Nothing in the game uses it yet (step 3).
   in the last 9 bytes). The .phy is the old IVP format: a 16-byte header, then per solid
   its size and a compact surface ("IVPS" at 44, the ledge tree's offset at 32); the tree's
   leaves are convex ledges, triangles over 16-byte points in metres with Havok's Y and Z
-  swapped and Y negated. Placed with Half-Life's AngleMatrix.
+  swapped and Y negated. Placed with the Source engine's AngleMatrix.
 - Checked against the old bake: the painting in Jeanette's room comes out 192 tall and 140
   wide, 2.4 units off the wall, and its edges land within two units of the sharp dark
   patch the 2004 lightmap has there.
@@ -2000,7 +2000,7 @@ Nothing in the game uses it yet (step 3).
 - `bl_props.c` now also reads Bloodlines' own models: .mdl version 2531 (names 128 bytes,
   the vertices inside the .mdl in one of three formats: 44 bytes with float positions,
   or 12 or 8 bytes with positions as 16-bit steps from the model's minimum) and
-  .dx80.vtx version 107 (Half-Life 2's layout but for 20-byte strip groups: a table of
+  .dx80.vtx version 107 (later Source versions' layout but for 20-byte strip groups: a table of
   16-bit vertex numbers and triangle lists). Checked: the painting's mesh has the same
   bounds as its .phy and its .mdl hull; the stage light's mesh is 37 x 28 x 36 units
   round its spot light.
@@ -3001,8 +3001,8 @@ Light probes (gi_probes.m, bl_props.c, bl_bsp.c):
   texture's mean colour at 0x20. Read for 73 of the asylum's 80 shadow-casting props, 615
   of the hub's 714, 130 of the pier's 147 (the rest keep the map's mean). Corners of props
   of different colours are kept apart.
-- Displacements (terrain) are in the capture now; they were holes before. Read as Half-Life
-  2's (176-byte records, 20-byte points); rows of 2^power + 1 points from the face's corner
+- Displacements (terrain) are in the capture now; they were holes before. Read as later Source
+  versions' (176-byte records, 20-byte points); rows of 2^power + 1 points from the face's corner
   at the start position. Their lightmap is laid over the grid with s from corner 0 to 3 and
   t from 0 to 1: worked out from three faces whose lightmap sizes do not match the
   texinfo's projection the other way round (sm_pier_1 4695 and 4705, sm_hub_1 11898). 9 in
@@ -3144,32 +3144,32 @@ HDR looked no different on or off: only 0.11% of the asylum club's picture is pa
 1.02x white (0.02% past 1.3x, at most 2.5x), bits of the green neon strips. The game
 draws almost nothing above white.
 
-- **GT7's tone map for HDR** (`gt7_hdr`, in place of the shoulder above). A first try,
+- **the filmic tone map for HDR** (`filmic_hdr`, in place of the shoulder above). A first try,
   the glows (additive draws) multiplied by the peak, raised the part past white only
   from 0.054% to 0.11% and was taken out (`out_gain` gone). Now the game's picture is
-  taken as GT7's normal-screen output (peak 2.5) and inverted back to the light it would
+  taken as the filmic map's normal-screen output (peak 2.5) and inverted back to the light it would
   have been, then put through the same curve at the screen's peak (2.5 times the
   headroom), as HDR mods do for old games (RenoDX). Below where the curve bends (0.444 of
   white, linear) nothing changes, so the darks and mid-tones stay as approved; above it
   highlights spread out past white: 0.6 goes to 0.62, 0.8 to 0.93, white to 1.45, 1.5 to
   1.98 (headroom 2.67). By the brightest channel. The normal-screen path is unchanged.
-- **Then GT7's whole tone map** (`gt7_full`, replacing that highlights-only `gt7_hdr`):
+- **Then the whole filmic tone map** (`filmic_full`, replacing that highlights-only `filmic_hdr`):
   in the club almost nothing is above the bend, so the user saw no change. Now, after
-  the same highlight inversion, the full GT7 map runs at the screen's peak: the toe on
-  the darks, the curve on each channel, the chroma kept in ICtCp (`gt7_curve` takes the
+  the same highlight inversion, the full filmic map runs at the screen's peak: the toe on
+  the darks, the curve on each channel, the chroma kept in ICtCp (`filmic_curve` takes the
   peak). With HDR only, by the user's choice; the normal screen is unchanged.
 
-Not verified: GT7 HDR in game (builds, links and the post shader compiles only), how
+Not verified: filmic HDR in game (builds, links and the post shader compiles only), how
 much brighter the bloom is now, and draws that use DESTCOLOR factors on light past white
 (they now see it). The baked lightmaps still stop at the game's 2x overbright.
 
 ## 2026-10-27: More colour in HDR highlights; HDR sliders tried and removed
 
-- **No toe on HDR:** testers preferred HDR off for its detail; GT7's toe darkened the
-  shadows, most of this game's picture. `gt7_full` is now straight below the shoulder, so
+- **No toe on HDR:** testers preferred HDR off for its detail; the filmic toe darkened the
+  shadows, most of this game's picture. `filmic_full` is now straight below the shoulder, so
   the darks and mid-tones match HDR off and only the highlights go further.
-- **HDR highlights keep more colour:** `gt7_full` weighs the ICtCp result 0.8 against the
-  per-channel curve (GT7's own 0.6), so neon and lamps fade less towards white.
+- **HDR highlights keep more colour:** `filmic_full` weighs the ICtCp result 0.8 against the
+  per-channel curve (the filmic own 0.6), so neon and lamps fade less towards white.
 - **Two HDR sliders on the Enhanced tab tried and removed.** "Peak brightness" (how much
   of the screen's headroom the tone map uses) and "game brightness" (the light scaled
   before the curve) were plain vgui::Sliders made from GameUI's own (constructor
@@ -3899,3 +3899,538 @@ frame's smaller size. A new MetalFX scaler, or FSR 4 context, is that slow to st
   turned out to be 2 shaders and 23 pipelines here.
 
 Verified: the runtime builds and the game links. Not verified in the game.
+
+## 2026-10-28: The pier's smooth sand matches the supplied beach sand
+
+On the pier the beach sand (`ground/piersand`, the user's 2048×2048 picture with surface
+maps) met the smooth packed sand (`ground/piersandc`) and its wet edge
+(`ground/piersandcwet`), which had neither, so the seam showed. Both now have a 2048×2048
+`-replace.png` made from the user's piersand picture. Its fine detail (the picture less a
+48-pixel wrapping blur) is laid over each original's own broad colour, so the lighter dry
+and darker wet tones stay. They also have the piersand bump and height maps. The wet one's
+roughness is 0.6 times as rough, and it keeps its own alpha for the blend. tex_pack packed
+both as BC7.
+
+Not verified: in the game (handed to the user).
+
+The smooth grey strip along the shore was a third texture, `blends/blend_pierc` (512×2048:
+piersandc four times down, correlation 0.96 per block, with an alpha mask). It now has a
+2048×8192 `-replace.png`: piersandc's new detail four times down, laid over the strip's own
+broad colour, with its alpha upscaled. Colour and alpha were resized apart, because
+resizing them together premultiplied the clear parts dark. The bump, roughness and height
+maps are piersandc's, four times down. It is packed as BC7. Not verified in the game.
+
+The line was still there once the textures matched, now as light: warmer on the beach
+side, running straight from the fire pit along where the surfaces meet. `blend_pierc` and
+`piersandcwet` are `$translucent` (their .vmt files), and alpha-blended draws were never
+given the surface variant. So they had no bumps and no added light from the frame's lights
+(the fire among them), while the opaque `piersand` beside them had both. Now a
+see-through lightmapped draw (`metal_render.m`, `k->psv.surface`) gets the variant for its
+lighting too. Its facing attachment stays unwritten (`k->surface` 1), so the reflections
+read what is under it as before. Verified: the runtime builds and boot links. Not verified:
+in the game (handed to the user).
+
+The user found the line went away only with Ambient Occlusion off. The occlusion reads the
+depth buffer, and the see-through surfaces write none (`$translucent`). So it shaded the
+shore as whatever lay under it, and that step showed as a line along the edge of the
+opaque beach. In the world view, a see-through lightmapped draw with ordinary alpha
+blending, the depth test on and depth writes off is now drawn a second time for its depth
+alone (`overlay_depth`: no colour or blending, alpha test at half). The occlusion, haze and
+reflections then see the surface that shows. Not verified: in the game.
+
+## 2026-10-28: Audit fixes (renderer, options, Windows layer, tools)
+
+Fixes for the whole-repo audit's findings, risks and loose ends.
+
+Renderer (`metal_render.m`, `d3d9_adapter.c`, `d3d9_resources.c`, `lm_bake.m`):
+- **Sharpening box and FSR 4:** with the box off, FSR 4's own sharpening is off too.
+  With it on, both sharpen as before (the look that was approved).
+- **Clears:** a stencil-only Clear no longer clears depth (depth and stencil are tracked
+  apart). A clear still waiting on one target now runs before a clear of another
+  replaces it, and before the target is sampled, copied (StretchRect) or read back
+  (GetRenderTargetData). Before, it could be lost or land on top of the copy.
+- **Rewritten textures:** a texture the game rewrites after drawing with it now reuses
+  a spare one the GPU has finished with (more than 3 frames old, up to 64 kept), not a
+  new one every time.
+- **Formats:** G16R16, R16F and G16R16F are made as real two- and one-channel formats
+  (the missing channels read as 1, as in D3D9). Depth formats are no longer offered as
+  textures, which the renderer cannot sample; a log line says if the game asks.
+- **Rain held for after the upscaler** keeps a reference to every object its draw
+  uses, so a release by the game in between cannot free them.
+- **Zero-size textures** are refused (D3DERR_INVALIDCALL). **Shader length** is found
+  by walking the instructions (comments and constants skipped), not by searching for
+  the end token. Checked against all 898 dumped game shaders: every length matches.
+- A leak in the lighting rebake's error path.
+
+Options (`bl_options.c`, `bl_vgui.c`, `bl_cocoa.m`):
+- The row-order cache is forgotten when a dialog is opened again or another one is laid
+  out, so a new control at an old address cannot take an old place.
+- Opening Options no longer turns Enhanced shadows off by itself; only the player's pick
+  changes it.
+- Display Mode follows Cmd+Return, Cmd+Ctrl+F and the green button: entering full screen
+  that way saves Fullscreen, leaving it saves Windowed.
+- Image Quality's description says what it does here. Descriptions for controls that do
+  not exist (Widescreen, Brightness, Music, Sound Quality) are gone.
+- Wrapped description text is cached; it was measured again every frame, one call into
+  the game per character.
+
+Windows layer: negative Get/SetWindowLong indices, 64-bit DIB size math, registry lines
+of any length, RegQueryValueA with a zero-size buffer, RegCloseKey on bad handles,
+DuplicateHandle of GetCurrentThread()/GetCurrentProcess() and of thread and event
+handles, error codes for a full disk, a non-empty folder, another volume and a long
+name, last-error set on bad paths, and a lock on the environment table.
+
+Tools and repo:
+- `tools/colab_import.py` refuses zip entries that would write outside build/textures.
+- `tools/build_lock.sh` takes over a dead build's lock by renaming it first, so of two
+  builds only one takes it; a lock with no process number is taken after 30 seconds.
+- `tools/movie_upscale.sh` writes the .sig with the .mov, upscales each different frame
+  once, writes under a temporary name until each step is whole (a stopped run goes on
+  where it was), checks the frame counts match, and takes `--game <dir>`. The stopped
+  nvidiabloodlogo run's 369 upscaled frames were checked whole and are reused.
+- `tools/build_tests.sh` builds shader_test, bsp_check, bake_view, gi_view, zlib_pilot
+  and fs_smoke. `bl_gi_gen` (no callers) removed.
+- `.gitignore` covers movies, signatures, frames, meshes and packs.
+- Other games' names removed from comments and docs; the test tone map is now
+  `BL_TONEMAP=filmic` / `filmicx`.
+- The 14 switches with no menu control (`BL_PCSS`, `BL_TESS` and the rest) are developer
+  tuning, listed with the others in the README.
+
+Verified: the runtime builds, boot links, `runtime_unit` passes 85 of 85, and all six
+tests build. Not verified in game: everything above. The options
+(shadows, display mode, descriptions) and the movies need a look in a window.
+
+That fixed the line at the beach's edge. But the alpha test at half drew a new hard line
+where the wet sand (`piersandcwet`, its alpha a 15-second sine) washes in. The depth pass
+now keeps a pixel where its alpha beats a 4x4 ordered dither (`d3d_shader_variant`
+`dither`, alpha test off). The occlusion, which works at half resolution and filters 4x4,
+then sees the surface in proportion to how much of it shows. Verified: the runtime builds
+and boot links. Not verified: in the game.
+
+## 2026-10-28: Skip intro movies (Gameplay tab)
+
+A new box on the Gameplay tab, under Quest compass: **Skip intro movies** (off by
+default, saved as `SkipIntroMovies` beside the renderer's settings). The engine plays the
+four movies one after another from one function (engine.dll 0x200fb52c-0x200fb553), and
+each play ends at once when BinkOpen returns nothing (0x200fbd8a). With the box ticked,
+CreateFileA refuses `.bik` files in the game's `media` folder (the four intro movies are
+the only movies there), so Bink cannot open them and the game goes straight to the menu.
+The change applies at the next start.
+
+Verified: builds, links, `runtime_unit` 85 of 85. Not verified in game: the box, and a
+start with it ticked.
+
+## 2026-10-28: No 4:3 menus
+
+The user wants no 4:3 anywhere. The main menu and loading screens are no longer narrowed
+to a centred 4:3 area with black bars: they fill the window's width, as the pause menu
+already did. Removed: the squeeze in `set_viewport` and `hair_capture`, `frame_squeeze`,
+`menu_bars`, the pause-frame flag that only served it, and the mouse mapping for it
+(`bl_cocoa_set_squeeze`). The world view's widescreen correction is unchanged. The intro
+movies keep their own shape (centred, with bars) so the logos are not stretched.
+
+Verified: builds, links, `runtime_unit` 85 of 85. Not verified in game.
+
+## 2026-10-28: Traffic light rounded
+
+`models/scenery/street/streetlight/streetlight.mdl` (the traffic light with its street
+lamp, in 15 maps) is remodelled by the new `tools/blender/prop_round.py` (recipe
+`tools/props/streetlight.json`, method "round"). The game's split triangles are joined back
+into quads. Edges meeting at under 70 degrees (a tube's facets) are smoothed. Sharper ones
+(box corners) keep a 0.8 crease, so they are only slightly rounded. One Catmull-Clark
+level follows, then flat faces are merged again.
+
+The pole and its fluted base are left as they were (`"keep": ["pole_green_base"]`): with
+two levels they melted into a smooth taper.
+
+Result: the arms curve instead of kinking, the lenses and hoods are near-round instead of
+octagonal, and the housings' corners are softened. 1011 triangles become 3186, all wound
+the game's way. The red, yellow and green lens meshes share one key and are told apart by
+their positions. Not verified in game.
+
+## 2026-10-28: Road going black, steadier ambient occlusion
+
+**Black road.** On a downtown street the road went pure black when the camera looked
+along it, and came back when it looked down. The cause was the screen-space reflections
+in `post_apply`. They take out the game's cubemap share of each pixel (the info target's
+rgb) and put the traced reflection in its place. Where the game later drew over the road
+without writing the info target (a decal), that share could be more than the pixel still
+held. The pixel then went below zero and was clamped to black. Looking down, the trace
+finds nothing, so nothing was taken out and the road looked normal. The share taken out
+is now capped at what the pixel holds. Nothing changes where it was already within that.
+
+**Ambient occlusion flicker.** Under TAA the occlusion's pattern turns each frame, and
+`ao_history` blends the result with last frame's. Last frame's value was clamped to the
+range of the filtered result's 3x3 neighbours. The filtered result changes from frame to
+frame by more than neighbours differ from each other, so last frame's value was mostly
+thrown away and the occlusion flickered. The allowed range now also covers this frame's
+own noise: the spread of the unfiltered occlusion over the filter's 4x4 tile. The new
+frame's weight goes from 0.15 to 0.1. Pixels whose depth changed still drop last frame's
+value.
+
+Verified: builds and links, `runtime_unit` 85 of 85, and both shader sources compile
+offline with `metal`. Not verified in game.
+
+## 2026-10-28: Lens glare without ghost copies
+
+In the rain on `sm_hub_1`, the rounded traffic light's wet arm is lit past white by the
+street lamp above it. The Lens Glare (`glare_run`) then drew faint copies of the arm above
+and below it. The sideways streak's reads were 16 quarter-size pixels apart, wider than the
+streak before them, so a long bright thing came out as copies a step apart. The steps are
+now 1, 3, 9 and 27 sideways, and 1 and 3 up and down: each step's reads are no further apart
+than the streak before them is wide, so the streak is smooth. One more quarter-size pass.
+The threshold, strength and fade are unchanged. Not verified in game.
+
+## 2026-10-28: Road textures exported; the user's pictures for eight of them
+
+All 36 road and street textures (asphalt, streets, kerbs, pavements, crossings, manholes)
+are exported to `build/textures/maps/roads` (`tex_extract.py --list ... --out`). The user
+supplied pictures in `roads/ground/NewTex`. Eight went in as `<name>-replace.png` at their
+own size: ground/streeta, streetb, streetc, streete, ohstreeta (2048x2048), streetd
+(3072x1536), sidewalka (1440x2880) and ocemanholea (2048x2048; the file was spelt
+`oceamanholea`).
+- streetd's picture was 2752x1536, 10% short of the original's 2:1 with the same layout,
+  so it was stretched to 3072x1536.
+- streetb keeps the game's alpha, resized.
+- sidewalka's old PBRify upscale (sm_asylum_1) was removed, since tex_pack refuses two
+  upscales of one texture.
+- curbbred was left out: its picture is 2752x1536 and shows only part of the 8:1 strip.
+
+The bump, roughness and height maps already made for sidewalka, streetb and streetc are
+from the old pictures. The layout is the same, so they still line up. Not verified in game.
+
+## 2026-10-28: The user's pictures for the bus stop bench and sign
+
+The textures of Santa Monica's street props are exported to `build/textures/maps/street_props`:
+the bench (`structural/santamonica/sanbench`), the bus stop sign (`sanbusstop`) and the
+lamp post beside each bus stop (`street/pierlightb/pierlightbsuper`). An exported
+`street/lamppost` turned out to be a different lamp. The user's 2048x2048 pictures for the
+bench and sign match the originals' layout and went in as `-replace`, packed at 2048x2048
+BC7. The bump and roughness maps from the pawnshop export are from the old pictures, in
+the same layout. Not verified in game.
+
+## 2026-10-28: The user's pictures for the outside of the diner
+
+The diner's 16 outside textures are exported to `build/textures/maps/diner`. The user's
+pictures for six of them went in as `-replace` at their own size and are packed as BC7:
+dinbasea, dintrimb and dinbmpr (4128x1024), dinwlla and the model roof (2048x2048, the
+original's alpha kept) and the model pillar (1440x2912). The picture for dintrima
+(2752x1536) is not the original's 4:1 strip shape, so it was left out. Not verified in game.
+The diner entrance's other textures followed (steps, door plate and handle, ceiling, porch
+light). The user's pictures for the steps, cemstepsa and cemstepsbtop (2912x1440, both 2:1
+like the originals), went in as `-replace`, packed as BC7. These steps are used on other
+maps too, so they change there as well. Not verified in game.
+
+## 2026-10-28: PBRify maps from the user's road and street pictures
+
+Normal (`_n`) and roughness (`_r`) maps were made with PBRify_Remix's models from the
+user's `-replace` pictures, scaled to the game texture's size as before:
+- roads/ground streeta, streetb, streetc, streetd, streete, ohstreeta, sidewalka and
+  ocemanholea, read as a tile so they repeat without a seam (sidewalka's height map too,
+  as it had one);
+- street_props sanbench and sanbusstop.
+
+The renderer takes the last `<name>_n.png` it finds under build/textures/maps, so the old
+maps of these names (made from the old pictures, in sm_asylum_1, sm_pawnshop_1 and
+sp_tutorial_1) were removed. Each now has one map, and it is the new one. About 7 s in all
+(a scratch script on chaiNNer's Python). Not verified in game.
+
+## 2026-10-28: more of the user's pictures for the diner entrance
+
+The user's pictures went in as `-replace`, packed as BC7:
+- `decals/damage/dinbrickb`, 4128x1024, with the original's alpha;
+- `metal/blackpaint_clr`, 2048x2048;
+- `plaster/ceilinga`, 2048x2048;
+- the model `doorknoboffice`, 1440x2912;
+- `metal/doorplate`, 516x4128. The picture (1024x4128) has the original's layout
+  stretched to twice its width, so it was narrowed back to the original's 1:8.
+
+The old PBRify upscales of doorplate and ceilinga were removed, because tex_pack refuses
+two upscales of one texture. dintrima's picture is still not the original's strip shape, so
+it was left out. Not verified in game.
+
+PBRify normal and roughness maps were then made from all 13 of the user's diner pictures,
+at the game textures' sizes, the same way as for the roads. Brush textures were read as a
+tile; models and the decal were not. The 26 old maps of the same names in other map
+folders, made from the old pictures, were removed.
+
+## 2026-10-28: Shadowed light shafts and depth of field in conversations
+
+Both are in `runtime/d3d9/metal_render.m`.
+
+- **Shadowed light shafts.** The haze (volumetric light, `fog_at`) is now cut by what
+  stands between a lamp and the air. It uses the object shadows' six views round each
+  shadow light (`pshadow_views`). These hold the distance from the light to the nearest
+  surface, map or prop. Up to four of the haze's lights have views at a time: the
+  brightest the camera sees, the same lights the object shadows pick.
+  - Each of those lights gets 24 steps of its own over the stretch of the view ray inside
+    its reach, instead of the shared 16 over the whole ray. A step is dropped where the
+    views see something nearer the light.
+  - The other lights keep the old unshadowed haze.
+  - `post_run` now prepares the views whenever the haze is on, even with the Enhanced
+    shadows off. `pshadow_prepare` hands them to the haze (`fog_views`).
+  - With the temporal scaler on, the steps' start moves each frame (`sframe`), so the
+    scaler smooths the beams' edges.
+  - Not yet: see-through textures (chain-link, glass) block light as solid or not at all,
+    depending on how the map marks them.
+- **Depth of field in conversations** (`BL_DOF`, the Enhanced tab's "Depth of Field" under
+  Camera, default on).
+  - While the dialogue screen paints, the background goes soft. `bl_dialog_focus` in
+    `bl_dialog.c` reports the dialogue screen, and `dof_step` fades the effect in and out
+    over 20 frames.
+  - The focus is the nearest depth over the middle of the picture, eased over frames
+    (`dof_focus`).
+  - Each pixel's blur grows with how far behind the focus it lies, up to 0.9% of the
+    picture's height, with a little for what is well in front. 40 taps on a golden-angle
+    disc, turned per pixel and frame.
+  - A tap counts only where its own blur reaches the pixel, so the sharp face does not
+    smear into the background. Bright taps count more, so lamps open into discs.
+  - `dof_run` runs from `pass()` on the finished world view, before the scaler, view model
+    and HUD.
+  - The options box is in `bl_vgui.c` and its hint in `bl_options.c`. The Volumetric Light
+    hint now mentions the beams.
+- Verified: builds and links. Not yet seen on screen. The user checks it in a window run
+  (the pier and Santa Monica's streets for the shafts, any conversation for the depth of
+  field).
+
+## 2026-10-28: Field of View slider and idle breathing (Gameplay tab)
+
+**Field of View.** The Gameplay tab has a "Field of View" slider, from 75 to 120 degrees
+with a tick every 5. The game's own is 90. It is a plain vgui::Slider (GameUI 0x10035C30;
+SetRange 0x10036620, caption 0x100363E0, knob placement 0x10035D90, named in
+`modules/GameUI/global_aliases.manual.sci`). The options screen shows its value in
+degrees (`bl_vgui_slider_in_units`), not as a share of the range like the game's sliders.
+It takes effect as it moves and is saved as `FieldOfView` under the native settings key.
+It is applied in `bl_client_HorPlus` to the player's own view, the one the game sets at
+exactly 90. Zooms, dialogue cameras and the first-person hands keep theirs, and the Hor+
+widening follows as before. This replaces the `BL_FOV` environment variable.
+
+**Idle breathing.** An "Idle breathing" box sits under "Skip intro movies", on by
+default (`IdleBreathing`). While the player stands still (under 4 units a second), the
+player's view rises and falls with a slow breath every 4.2 seconds, in a little quicker
+than out. It also drifts very slightly from side to side. The most it ever moves is
+about 0.15 degrees, plus 0.3 units up and down. It fades in over about a second of
+standing and out within a fraction of a second of moving. It holds still while a menu is
+up (the cursor is shown). Only the renderer's copy of the view setup is moved (angles at
++0x60, origin at +0x48, read just after by AngleVectors), so the aim is unchanged.
+
+Verified: GameUI re-translates (14 s), the runtime builds with no warnings, the game
+links, and `runtime_unit` passes 85 of 85. Not verified in game.
+
+## 2026-10-28: dintrima built in code
+
+The user's picture for the diner's trim band `concrete/dintrima` never had the original's 4:1
+shape, so the texture is now built in code instead: `tools/tex_dintrima.py` (about 3 s)
+works from the original's layout at 8x (4096x1024).
+- The mouldings come from the original's median colour per row, sharpened.
+- The stains are the original's, blurred and enlarged.
+- The carved frieze is the original enlarged, sharpened and lit as relief from its own shading.
+- The block joints are drawn as clean cuts.
+- Tiling noise adds limestone grain, light mottling and pits.
+
+It tiles left to right. It went in as `-replace`, packed as BC7, with PBRify normal and
+roughness maps. The old maps (sm_pawnshop_1, sp_tutorial_1) were removed. An image-model route
+(gpt-image-2 through Codex) was tried first and made nothing: the Codex models on the account
+do not offer its image tool. Not verified in game.
+
+## 2026-10-28: Depth of field in play
+
+The Depth of Field box (`BL_DOF`, `dof_run` in `metal_render.m`) now works all the time,
+not only in conversations.
+
+- **The lens.** In play the blur is that of a thin lens like the eye's at night:
+  - The focal length matches the game's vertical field of view on a 24 mm high frame
+    (`12 * p11` mm), at f/2 (`DOF_FNUMBER`).
+  - The blur is `f² / N * |1 - S/D| / (S - f)`, taking a world unit as an inch.
+  - It is capped at 0.6% of the picture's height (`DOF_PLAY_MOST`).
+  - With the game's wide view this keeps nearly everything sharp down a street. What lies
+    behind something close goes a little soft.
+- **The focus in play.** It is the mean, in dioptres, of 5 x 5 depths over the middle of
+  the screen, eased each frame as an eye or an autofocus refocuses (`dof_focus`, the
+  focus buffer's second float).
+- **Conversations are unchanged.** As before, the close-up's focus and blur fade in over
+  20 frames, now from the play blur instead of from none.
+- **Running cost.** The pass now runs every frame while the box is ticked. Pixels with
+  less than half a pixel of blur are passed through untouched.
+- The box's hint in `bl_options.c` describes both.
+- Verified: the shader compiles offline, and the build links. Not yet seen on screen.
+- **Changed after the user's run.** The lens blurred close objects whenever the focus was
+  far, and did little in the distance. Play now blurs only what lies behind the focus:
+  - Nothing out to twice the focus distance, then more up to ten times as far.
+  - The most is 0.4% of the picture's height (`DOF_PLAY_MOST`), doubled while the focus
+    is within 100 units.
+  - The focus goes no further than 800 units (`DOF_FAR`), so the distance always softens
+    a little.
+  - Nothing in front of the focus blurs.
+  - Conversations are unchanged.
+
+## 2026-10-28: the diner's window walls built in code
+
+`tools/tex_crisp.py` (about 4 s each) enlarges a painted texture 4x in code and keeps its
+layout:
+- Lanczos, wrapping at the edges.
+- Strong sharpening only along the large edges, found on a smoothed copy so the plaster's
+  speckle is left alone (a first version, which pulled every pixel to its local max or min,
+  turned the plaster into pebbly cells), and light sharpening everywhere else.
+- Tiling grain, bumps and pits, less on saturated colours (the curtains).
+- Alpha enlarged and kept.
+
+It made `plaster/dinwndwa` (the two windows with teal curtains and the stained ledge below)
+and `plaster/dinwndwb` (the arched window) at 2048x2048. Both went in as `-replace`, packed
+as BC7, with PBRify normal and roughness maps. Not verified in game.
+
+## 2026-10-28: First-person body (Gameplay tab)
+
+A "First-person body" box sits on the Gameplay tab, on by default (`FirstPersonBody`).
+With it on, the player's own model is drawn in first person, so looking down shows the
+chest, legs and feet.
+
+- **Drawing it.** `C_BasePlayer::ShouldDraw` (client `0x100A7A50`) draws the local
+  player only when `input->CAM_IsThirdPerson()` is true (the melee camera). The test at
+  `0x100A7AA0` now asks `bl_client_BodyShown`, which also answers "draw" in first person
+  and notes which entity is the player.
+- **Keeping the head out of view.** `C_BaseAnimating::GetRenderOrigin` (`0x10094040`)
+  starts with `bl_client_BodyOrigin`. For that player in first person, it returns a point
+  6 units behind where the player stands, along the way the model faces. The bones are
+  built from it (`SetupBones` calls `AngleMatrix(GetRenderAngles(), GetRenderOrigin())`),
+  so the camera at the eyes is in front of the face. The held weapon and the shadow
+  follow the model.
+- **Other cameras.** While the view is not at the player's eyes (a scripted camera,
+  judged from the view setup's origin noted in `bl_client_HorPlus`), the model is put
+  10000 units below, out of sight, as the game left it undrawn there.
+- The `input` pointer (`0x1027BA58`) is pushed by the replacement for the native to read.
+
+Not verified in game. Things to look at: whether the neck or head shows at the bottom
+of the view when looking down, the body's arms beside the first-person hands, scripted
+scenes and the melee camera.
+
+Verified: client re-translates (107 s), the runtime builds, the game links, and
+`runtime_unit` passes 85 of 85.
+
+## 2026-10-28: Field of View fixed; first-person body placed under the camera
+
+**Field of View.** The slider did nothing, and neither did idle breathing: both looked
+for the player's view at exactly 90 degrees. This game's own is 75 (`default_fov`'s
+default, client `0x102CCDA8`), so the old `BL_FOV` never worked either. The player's view
+is now the one at 75. The slider runs from 65 to 110 (default 75), still a tick every
+5 degrees.
+
+**First-person body.** In the user's test, the back of the head and a shoulder showed
+while moving, and looking down showed through the body. Two changes:
+- The model is now placed under the camera, not at the player's interpolated origin,
+  which trails the camera by a step while moving. It is set back along the view's yaw,
+  not the model's.
+- It is set back 10 units looking level, rising to 20 looking straight down. The camera
+  then looks at the chest and legs from in front, not from inside the shoulders.
+- A scripted camera is now judged within 64 units of the player, not 24, so a running
+  player is not mistaken for one.
+
+Verified: the runtime builds, the game links, and `runtime_unit` passes 85 of 85.
+Not verified in game.
+
+## 2026-10-28: Body's head hidden in first person; idle breathing always on
+
+**Idle breathing** is no longer a setting: the user did not want a box for it. The
+Gameplay tab's "Idle breathing" box and its `IdleBreathing` value are gone. The breathing
+always runs on the player's own view. The Field of View slider moves up to where the box
+was.
+
+**Head hidden.** Set back 10 units, the body still leaned its head, teeth showing, into
+the view when running. In `C_BaseAnimating::SetupBones`, right after
+`BuildTransformations` (vtable +0x1ec) has filled the entity's bone-to-world matrices,
+`0x10091C64` now calls `bl_client_BodyBones`. Registers there: esi is the entity, ebx its
+studio header. The matrices are at entity +0x6e8, 0x30 bytes each.
+
+For the first-person body, it shrinks the head bone, and every bone under it, to the
+point where the head meets the neck. That covers the jaw, teeth, eyes and hair. Nothing
+of the head is drawn however far an animation leans.
+
+- **Finding the head bone.** It is the first whose name has "head" in it (not a "nub"),
+  found once per model and logged as `[body]`.
+- **Studio header layout:** +0xf0 is the bone count, +0xf4 where the bones are. Each bone
+  is 0xa0 bytes: +0 its name's offset, +4 its parent.
+- **Only when placed under the camera.** It applies only while `bl_client_BodyOrigin`
+  last placed the body under the camera, so the melee camera and other views still show
+  the whole head.
+- **Side effect:** the player's own shadow is headless in first person.
+
+Verified: the client re-translates (109 s), the runtime builds, the game links, and
+`runtime_unit` passes 85 of 85. Not verified in game; look for the `[body]` line.
+
+## 2026-10-28: Light through windows, and motion blur
+
+Both are in `runtime/d3d9/metal_render.m`.
+
+**Light through windows.** This is part of Volumetric Light (`fog_windows`,
+`windows_note_map`).
+- **Which faces count.** When a map opens, its window faces are listed: upright faces whose
+  material names a window ("wndw", "window") or glass, at least 8 units across. Each must
+  have a ceiling within 400 units over the room it faces, so a street's shop fronts are
+  left out.
+- **The beams.** Each frame the 8 nearest within 1500 units light the haze in a beam the
+  window's shape. Each beam slants into the room and down, and fades over 260 units.
+  - Its colour is a cool night light, tinted by the material's mean colour and brighter
+    for a brighter material.
+  - In the haze shader each step is taken back along the beam to the window's plane. It
+    is lit where it lands inside the window, softened over 3 units at the edges.
+  - The beams end where the view ray meets a surface, so they stop at floors and walls.
+    Things in the room do not shadow them.
+- `BL_FOG_WINDOWS` scales them (default 1, 0 none).
+- The log line `volumetric light: N windows into rooms in <map>` gives the count at load.
+
+**Motion blur.** `BL_MBLUR`, the Enhanced tab's "Motion Blur" under Camera, default on
+(`mblur_run`).
+- **What blurs.** It reads the temporal scaler's motion vectors, so it needs MetalFX or
+  FSR 4. Each pixel's motion is split into the view's part and its own:
+  - The view's part is the depth taken back through the last frame's camera, as
+    `taa_motion` does.
+  - Its own part is the rest: the characters' drawn motion.
+  - A pixel's own motion blurs in full. The view's blurs only once it passes 1.5% of the
+    picture's height, fully by 5%, so walking and looking round stay sharp and only quick
+    turns blur.
+- **The shutter.** Both are scaled to a shutter open 1/120 s at any frame rate, and kept
+  under 3% of the height.
+- **The filter.** As the published reconstruction filter does it:
+  - The blur per pixel, then the largest over 16-pixel tiles and their neighbours, so a
+    moving arm smears over the still wall beside it.
+  - Then 12 taps along that motion. A tap counts where its own blur reaches the pixel when
+    it lies in front, and the pixel's blur when it lies behind.
+- It runs after the depth of field, before the scaler, view model and HUD.
+- The options box is in `bl_vgui.c`, Camera column, seventh, and its hint in `bl_options.c`.
+- Verified: both shaders compile offline, and the build links. Not yet seen on screen.
+- **Black flickers with motion blur (user's run).**
+  - The likely cause was single pixels that are not a number (from earlier effects).
+    Alone they are invisible; the blur's taps smeared them into black streaks.
+  - The motion blur and the depth of field now skip any tap whose colour is not finite.
+  - A pixel whose motion is not finite gets none.
+  - A pixel that is itself broken is left as it is.
+- **The hint.** The temporal scaler always runs (MetalFX's temporal scaler at native
+  resolution with no upscaler), so the hint no longer says the blur needs an upscaler.
+- Verified: shaders compile, build links. The flicker fix is not yet seen on screen.
+
+## 2026-10-28 — Whole-picture black flicker: the haze's settings 8 bytes off
+
+**What it was.** The world view went fully black for one frame at a time while moving
+(the HUD stayed), with motion blur off too.
+- Found with headless runs in `sm_diner_1`, turning and walking through `BL_KEYS`, and a
+  new `BL_DARK_LOG=1`: each frame's picture is shrunk to 64 x 36 and read back, and one
+  under a third of the last one's brightness is logged (the first ten written to
+  `BL_DUMP_DIR/dark_<n>.png`). About one frame in a hundred went black.
+- Every effect off: none. Volumetric Light on alone (window beams off too): still black.
+- On the black frames every pixel of the haze was NaN, while every input (lights,
+  settings) was a number.
+- **The cause.** The haze's settings (`struct fx_params`) had 18 floats (72 bytes) before
+  the shadowed beams' `sidx`. The shader's `float4 sidx` starts on 16 bytes (80). So:
+  - The shader read the shadowed beams' lights, slices and rotation 8 bytes off.
+  - It read the window count from past the end of the data, which held whatever the
+    upload space had there. On some frames that was a large number, and the beams' loop
+    ran over junk until the haze was NaN everywhere, so `col * f.w + f.rgb` made the world
+    black.
+- **The fix.** `fx_params` gains `align[2]` (and the shader's `FP` a matching `float2
+  align`), and a `_Static_assert` checks `sidx` starts on 16 bytes. The shadowed beams
+  now read their real settings for the first time, so they may look different.
+- Also new: with `BL_GPU_STATS=2`, a frame over 100 ms on the GPU logs its slowest passes
+  at once.
+- An earlier black frame in a headless run was the frame dump itself: each saved frame
+  made a new 64 MB copy of the shadow atlas, and the GPU ran out of time
+  (`MTL4CommandQueueErrorDomain error 1`). Not a game fault.

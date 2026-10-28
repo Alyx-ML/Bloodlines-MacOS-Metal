@@ -103,6 +103,17 @@ struct d3d_shader_variant {
     // the pixel, scales and tints the colour before the fog, so drops shine in front of
     // lamps and neon and all but go in the dark.
     uint8_t rain;
+    // Hair strands (tex_detail.h bl_hair_mesh strand), drawn as points to capture them for
+    // the renderer's own strand drawing (metal_render.m hair_run). Vertex: its clip
+    // position as drawn and its smooth normal's clip step (BLVSOut.bln) to [[buffer(24)]]
+    // (two float4 a vertex, by vertex id), a point one pixel big, the vertex id in
+    // BLVSOut.bls.x. Pixel: its colour as lit and fogged to [[buffer(5)]] at that id, and
+    // nothing drawn.
+    uint8_t strand;
+    // Pixel: drawn for its depth alone (metal_render.m overlay_depth), kept where its alpha
+    // is over a 4x4 ordered dither's threshold, so the effects that read the depth see a
+    // see-through surface in proportion to how much of it shows.
+    uint8_t dither;
 };
 
 // Soft shadows from the atlas (variant shadow_receiver): the atlas is seen as 8x8 cells

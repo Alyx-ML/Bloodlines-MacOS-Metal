@@ -16,6 +16,8 @@
 //   BL_DUMP_FRAME=n[,m...]   write frame n's back buffer to BL_DUMP_DIR/frame_<n>.png, and the last
 //                            offscreen target (e.g. the shadow atlas) to frame_<n>_rt.png
 //   BL_DUMP_DIR=dir          (default: current directory)
+//   BL_DARK_LOG=1            log frames much darker than the one before (and write the first
+//                            ten to BL_DUMP_DIR/dark_<n>.png)
 //   BL_DRAW_STATS=n[+k]      log the draws of frame n (and the k-1 frames after it)
 //   BL_DRAW_DUMP=n[,m...]    log the vertices, constants and shaders of draws n, m...; with "p<count>[:k]",
 //                            of the k-th (default first) draw in frame BL_DRAW_STATS with that many primitives
@@ -54,6 +56,12 @@
 //   BL_FOG=0|1               volumetric light: the map's lights in a thin haze (see fog_run), over
 //                            the options' check box; BL_FOG_DENSITY (default 0.0002 a world unit)
 //                            and BL_FOG_DIST (how far it is traced, default 2000)
+//   BL_DOF=0|1               depth of field (see dof_run), over the options' check box: what lies
+//                            far behind the focus soft; in conversations, the one spoken to sharp
+//                            and what lies behind soft
+//   BL_MBLUR=0|1             motion blur (see mblur_run), over the options' check box: moving
+//                            characters and things by their own motion, the view only when it
+//                            turns or moves fast
 //   BL_SSS=0|1               light scattered under the skin of characters (see skin_run), over the
 //                            options' check box ("show": the characters' pixels in red); BL_SSS_WIDTH (world units, default 0.8) and
 //                            BL_SSS_STRENGTH (0..1, default 0.8); BL_SSS_SHEEN the skin's shine
@@ -126,6 +134,7 @@
 #import "mtl4.h"
 #import <objc/runtime.h>
 
+#include <ctype.h>
 #include <dlfcn.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -215,7 +224,7 @@ static struct obj *clear_color_target, *clear_depth_target;
 static MTLClearColor clear_color;
 static double clear_depth;
 static uint32_t clear_stencil;
-static int clear_has_stencil;
+static int clear_has_depth, clear_has_stencil;
 
 static uint32_t resized_w, resized_h;  // back buffer size (resize comes before init)
 // The size the device's own surfaces (back buffer, depth) are drawn at: the window's own
@@ -257,7 +266,6 @@ static int env_aniso;   // forced anisotropy (BL_ANISO, default 16)
 static int env_widescreen;  // correct the 4:3 projection on wider modes (BL_WIDESCREEN, default on)
 static int frame_has_3d, menu_frame;  // a perspective draw to the back buffer: this frame, the last
 static int last_3d;
-static float frame_squeeze = 1;       // menu draws this frame were narrowed to this share of the width
 static int deep_color;  // 16-bit back buffer, 10-bit window (BL_DEEP_COLOR, default on)
 
 // Effects at the end of the world view, before the view model and HUD (post_run):
@@ -328,6 +336,12 @@ static struct obj *world_bb, *world_ds;
 static id<MTLTexture> world_color, world_depth;
 static id<MTLTexture> target_full(struct obj *o);
 static void world_up(struct d3d_state *s, MTL4RenderPassDescriptor *d);
+static int dof_now;  // post_run: the depth of field is due at the next pass on the back buffer
+static void dof_run(id<MTLTexture> color, id<MTLTexture> depth, MTL4RenderPassDescriptor *d);
+static void dof_step(void);
+static int mblur_now;  // likewise for the motion blur
+static void mblur_run(id<MTLTexture> color, id<MTLTexture> depth, MTL4RenderPassDescriptor *d);
+static void mblur_step(void);
 static void rain_draw_held(void);
 @class BLRainDraw;
 static BLRainDraw *rain_now;  // the held rain draw render_draw is drawing again
@@ -339,8 +353,10 @@ static id<MTLTexture> rain_sheet_hires(struct obj *sheet);
 #define EFFECT_KEY "HKCU\\Software\\Troika\\Vampire\\Native"
 enum { BL_EFFECT_AO, BL_EFFECT_SSR, BL_EFFECT_HDR, BL_EFFECT_FOG, BL_EFFECT_SSS, BL_EFFECT_SHADOWS,
        BL_EFFECT_BLOOM, BL_EFFECT_EXPOSURE, BL_EFFECT_SSIL, BL_EFFECT_GI, BL_EFFECT_ROUND, BL_EFFECT_SHARPEN,
-       BL_EFFECT_SKIN_DETAIL, BL_EFFECT_COMPASS, BL_EFFECT_WET, BL_EFFECT_GLARE,
-       BL_EFFECTS };
+       BL_EFFECT_SKIN_DETAIL, BL_EFFECT_COMPASS, BL_EFFECT_WET, BL_EFFECT_GLARE, BL_EFFECT_DOF,
+       BL_EFFECT_MBLUR, BL_EFFECTS };
+static int env_mblur;    // motion blur (mblur_run)
+static int env_dof;      // depth of field (dof_run)
 static int env_shadows;  // the shadows section's switch
 static int env_compass;  // the quest compass (compass_overlay)
 static int env_wet;      // wet surfaces where it rains (the rain effects section)
@@ -382,6 +398,8 @@ static const struct { const char *env, *value; int *on, *show, def; } effects[BL
     {"BL_COMPASS", "QuestCompass", &env_compass, NULL, 1},  // a box on the Gameplay tab, not Enhanced
     {"BL_WET", "RainEffects", &env_wet, NULL, 1},
     {"BL_GLARE", "LensGlare", &env_glare, NULL, 1},
+    {"BL_DOF", "DepthOfField", &env_dof, NULL, 1},
+    {"BL_MBLUR", "MotionBlur", &env_mblur, NULL, 1},
 };
 static int effects_loaded;
 static int builds_background;  // shader variants and pipelines built in the background (shader_function)
@@ -518,6 +536,7 @@ static MTLPixelFormat target_format(uint32_t f)
     switch (f) {
     case 113: return MTLPixelFormatRGBA16Float;  // A16B16G16R16F
     case 36: return MTLPixelFormatRGBA16Unorm;   // A16B16G16R16
+    case 34: return MTLPixelFormatRG16Unorm;     // G16R16
     case 114: return MTLPixelFormatR32Float;     // R32F
     case 116: return MTLPixelFormatRGBA32Float;  // A32B32G32R32F
     default: return MTLPixelFormatBGRA8Unorm;    // A8R8G8B8, X8R8G8B8 and the 16-bit RGB formats
@@ -541,6 +560,10 @@ static struct texfmt texture_format(uint32_t f)
                                                                   MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
     MTLTextureSwizzleChannels rgb1 = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
                                                                     MTLTextureSwizzleBlue, MTLTextureSwizzleOne);
+    MTLTextureSwizzleChannels rg11 = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+                                                                    MTLTextureSwizzleOne, MTLTextureSwizzleOne);
+    MTLTextureSwizzleChannels r111 = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleOne,
+                                                                    MTLTextureSwizzleOne, MTLTextureSwizzleOne);
     switch (f) {
     case 21: return (struct texfmt){MTLPixelFormatBGRA8Unorm, id, 0, 0};
     case 22: return (struct texfmt){MTLPixelFormatBGRA8Unorm, rgb1, 0, 0};
@@ -561,6 +584,10 @@ static struct texfmt texture_format(uint32_t f)
                                                              MTLTextureSwizzleOne, MTLTextureSwizzleOne), 0, 0};
     case 63: return (struct texfmt){MTLPixelFormatRGBA8Snorm, id, 0, 0};  // Q8W8V8U8
     case 36: return (struct texfmt){MTLPixelFormatRGBA16Unorm, id, 0, 0};
+    // Two- and one-channel formats read the missing channels as 1, as in D3D9.
+    case 34: return (struct texfmt){MTLPixelFormatRG16Unorm, rg11, 0, 0};    // G16R16
+    case 111: return (struct texfmt){MTLPixelFormatR16Float, r111, 0, 0};    // R16F
+    case 112: return (struct texfmt){MTLPixelFormatRG16Float, rg11, 0, 0};   // G16R16F
     case 113: return (struct texfmt){MTLPixelFormatRGBA16Float, id, 0, 0};
     case 114: return (struct texfmt){MTLPixelFormatR32Float, id, 0, 0};
     case 116: return (struct texfmt){MTLPixelFormatRGBA32Float, id, 0, 0};
@@ -811,6 +838,43 @@ static void pbr_prefetch(uint32_t w, uint32_t h, uint32_t format, const uint8_t 
     });
 }
 
+// Textures given up by rewrites (texture_of), with the frame they were given up in, taken
+// again for a texture of the same kind once the GPU is surely done with them: a texture
+// the game rewrites every frame cycles through a few instead of a new one each time.
+#define SPARE_MAX 64
+static struct spare { void *t; unsigned long frame; } spare[SPARE_MAX];
+static int nspare;
+
+static id<MTLTexture> spare_take(MTLTextureDescriptor *d)
+{
+    for (int i = 0; i < nspare; i++) {
+        id<MTLTexture> t = (__bridge id<MTLTexture>)spare[i].t;
+        MTLTextureSwizzleChannels a = t.swizzle, b = d.swizzle;
+        if (frames - spare[i].frame <= FRAMES_IN_FLIGHT || t.textureType != d.textureType ||
+            t.pixelFormat != d.pixelFormat || t.width != d.width || t.height != d.height || t.depth != d.depth ||
+            t.mipmapLevelCount != d.mipmapLevelCount || t.usage != d.usage || t.storageMode != d.storageMode ||
+            memcmp(&a, &b, sizeof a))
+            continue;
+        void *p = spare[i].t;
+        spare[i] = spare[--nspare];
+        return (__bridge_transfer id<MTLTexture>)p;
+    }
+    return [mtl newTextureWithDescriptor:d];
+}
+
+// Takes over the reference `t`; the oldest spare goes when there are too many.
+static void spare_give(void *t)
+{
+    if (nspare == SPARE_MAX) {
+        int o = 0;
+        for (int i = 1; i < nspare; i++)
+            if (spare[i].frame < spare[o].frame) o = i;
+        CFRelease(spare[o].t);
+        spare[o] = spare[--nspare];
+    }
+    spare[nspare++] = (struct spare){t, frames};
+}
+
 // The Metal texture of a D3D texture object, created and refreshed from guest memory.
 static id<MTLTexture> texture_of(struct obj *tex)
 {
@@ -844,17 +908,17 @@ static id<MTLTexture> texture_of(struct obj *tex)
     }
     if (tex->dirty && !rt && tex->used) {
         // Rewritten after draws used it, which may still be encoded in this frame or running
-        // on the GPU: those keep the old texture (command buffers retain it) and the new
-        // contents go to a new one. The main menu's particle systems share a few textures
+        // on the GPU: those keep the old texture (it waits among the spares) and the new
+        // contents go to another. The main menu's particle systems share a few textures
         // and rewrite them between draws within a frame; uploading in place showed every
         // system the last image written.
         MTLTextureDescriptor *d = [MTLTextureDescriptor new];
         d.textureType = t.textureType, d.pixelFormat = t.pixelFormat;
         d.width = t.width, d.height = t.height, d.depth = t.depth, d.mipmapLevelCount = t.mipmapLevelCount;
         d.usage = t.usage, d.storageMode = t.storageMode, d.swizzle = t.swizzle;
-        id<MTLTexture> n = [mtl newTextureWithDescriptor:d];
+        id<MTLTexture> n = spare_take(d);
         if (n) {
-            CFRelease(tex->gpu);
+            spare_give(tex->gpu);
             tex->gpu = (__bridge_retained void *)n;
             t = n;
             for (uint32_t i = 0; i < tex->nsubs; i++) tex->subs[i]->dirty = 1;
@@ -1590,13 +1654,21 @@ static unsigned long motion_shown;
 // thin edges fade smoothly instead of being cut out.
 static int hair_pass;
 
+// The map's see-through lightmapped surfaces (a shore's sand laid over the beach) write no
+// depth, so the occlusion and the other effects that read the depth saw what is under
+// them and shaded them as that, a line along where they meet the opaque ground. In the
+// world view each is drawn a second time for its depth alone, dithered by its alpha
+// (variant dither), so a wave's edge fading in shades gradually rather than as a line
+// (1 while setup_draw sets up that one).
+static int overlay_depth;
+
 static id<MTLDepthStencilState> depth_state(struct d3d_state *s, int has_depth)
 {
     const uint32_t *rs = s->rs;
     uint32_t k[16] = {0};
     if (has_depth) {
         k[0] = rs[7] ? 1 : 0;           // ZENABLE
-        k[1] = rs[14] && hair_pass < 2;  // ZWRITEENABLE; not hair's blended passes
+        k[1] = (rs[14] && hair_pass < 2) || overlay_depth;  // ZWRITEENABLE; not hair's blended passes
         k[2] = rs[23];                  // ZFUNC
         k[3] = rs[52];                  // STENCILENABLE
         if (k[3]) {
@@ -1760,8 +1832,8 @@ static void ensure_device(void)
     env_ssr_blur = getenv("BL_SSR_BLUR") ? (float)atof(getenv("BL_SSR_BLUR")) : 0.02f;
     const char *tm = getenv("BL_TONEMAP");
     env_tonemap = !tm                   ? 0
-                  : !strcmp(tm, "gt7")  ? 1
-                  : !strcmp(tm, "gt7x") ? 2
+                  : !strcmp(tm, "filmic")  ? 1
+                  : !strcmp(tm, "filmicx") ? 2
                   : !strcmp(tm, "pbr")  ? 3
                   : !strcmp(tm, "pbrx") ? 4
                                         : 0;
@@ -1912,13 +1984,24 @@ static void pass_stats_done(int slot, unsigned long frame)
     // each is charged from the end of the one before it (or its own start, after a gap)
     // to its end: the parts add up to the frame.
     uint64_t prev_end = 0;
+    double ms[512], total = 0;
     for (int i = 0; t && i < n; i++) {
         uint64_t lo = t[2 * i].timestamp, hi = t[2 * i + 1].timestamp;
+        ms[i] = 0;
         if (!lo || hi <= lo) continue;
         if (prev_end > lo) lo = prev_end < hi ? prev_end : hi;
         prev_end = hi > prev_end ? hi : prev_end;
+        ms[i] = (double)(hi - lo) * gpu_tick_ns / 1e6, total += ms[i];
         NSString *k = @(pass_names[slot][i]);
-        sum[k] = @(sum[k].doubleValue + (double)(hi - lo) * gpu_tick_ns / 1e6);
+        sum[k] = @(sum[k].doubleValue + ms[i]);
+    }
+    // A frame over 100 ms on the GPU: its slowest passes at once (the system stops a
+    // command buffer that runs for seconds, and that frame comes out black).
+    if (total > 100) {
+        fprintf(stderr, "[gpu] frame %lu took %.0f ms:", frame, total);
+        for (int i = 0; i < n; i++)
+            if (ms[i] > 5) fprintf(stderr, " %s(#%d) %.1f", pass_names[slot][i], i, ms[i]);
+        fprintf(stderr, "\n");
     }
     if (++nframes == 100) {
         NSArray *keys = [sum keysSortedByValueUsingComparator:^(NSNumber *a, NSNumber *b) { return [b compare:a]; }];
@@ -2002,7 +2085,6 @@ static id<MTLTexture> surface_texture(id<MTLTexture> color)
 
 static id<MTLTexture> hdr_world;
 static unsigned long hdr_world_frame;  // the frame hdr_world was copied in
-static int pause_seen, pause_frame;  // the pause menu painted this frame, the last
 
 static BLRender *pass(struct d3d_state *s)
 {
@@ -2036,8 +2118,10 @@ static BLRender *pass(struct d3d_state *s)
         d.depthAttachment.storeAction = d.stencilAttachment.storeAction = MTLStoreActionStore;
         d.depthAttachment.loadAction = d.stencilAttachment.loadAction = MTLLoadActionLoad;
         if (clear_depth_target == depth) {
-            d.depthAttachment.loadAction = MTLLoadActionClear;
-            d.depthAttachment.clearDepth = clear_depth;
+            if (clear_has_depth) {
+                d.depthAttachment.loadAction = MTLLoadActionClear;
+                d.depthAttachment.clearDepth = clear_depth;
+            }
             if (clear_has_stencil) {
                 d.stencilAttachment.loadAction = MTLLoadActionClear;
                 d.stencilAttachment.clearStencil = clear_stencil;
@@ -2093,6 +2177,14 @@ static BLRender *pass(struct d3d_state *s)
         contact_apply(enc, target_texture(color), depth != NULL);
     if (pshadow_result && color && color == s->back_buffer)
         pshadow_apply(enc, target_texture(color), depth != NULL);
+    if (dof_now && view_state == 2 && color && color == s->back_buffer && depth) {
+        dof_now = 0;
+        dof_run(target_texture(color), target_texture(depth), d);
+    }
+    if (mblur_now && view_state == 2 && color && color == s->back_buffer && depth) {
+        mblur_now = 0;
+        mblur_run(target_texture(color), target_texture(depth), d);
+    }
     // The world view with its effects drawn in, before the view model and HUD: through
     // the temporal scaler (and up to the window's size when upscaling).
     if ((taa_pending || world_low) && view_state == 2 && color && color == s->back_buffer) world_up(s, d);
@@ -2113,6 +2205,35 @@ static BLRender *pass(struct d3d_state *s)
     }
     if (view_state == 2 && color && color == s->back_buffer) rain_draw_held();
     return enc;
+}
+
+// Runs a clear of the surface `o` still waiting for a pass, before it is read, copied
+// to or replaced by a clear of another surface.
+static void flush_clear_of(struct obj *o)
+{
+    if (!o || (o != clear_color_target && o != clear_depth_target)) return;
+    struct d3d_state tmp;
+    memset(&tmp, 0, sizeof tmp);
+    if (o == clear_color_target) tmp.render_target[0] = o;
+    if (o == clear_depth_target) {
+        tmp.depth_stencil = o;
+        // The world view's smaller depth buffer goes with its own picture (pass).
+        if (world_low && o == world_ds) tmp.render_target[0] = world_bb;
+    }
+    end_pass();
+    pass(&tmp);
+    end_pass();
+}
+
+// Clears waiting on render targets a draw samples (as textures) run before it.
+static void flush_sampled_clears(const struct d3d_state *s)
+{
+    if (!clear_color_target && !clear_depth_target) return;
+    for (int i = 0; i < 20; i++) {
+        struct obj *t = s->texture[i];
+        if (t && (t->usage & 3) && t->nsubs)  // D3DUSAGE_RENDERTARGET, D3DUSAGE_DEPTHSTENCIL
+            for (uint32_t j = 0; j < t->nsubs; j++) flush_clear_of(t->subs[j]);
+    }
 }
 
 // Runs clears that no draw picked up.
@@ -2173,6 +2294,15 @@ int bl_display_mode_get(void)
 {
     uint32_t v = bl_reg_get_dword(EFFECT_KEY, DISPLAY_KEY_VALUE, 3);
     return v <= 2 ? (int)v : full_screen() ? 2 : 0;
+}
+
+// The window changed mode by itself (bl_cocoa.m: the player's keys or the green button):
+// saved without moving it again.
+void bl_display_mode_note(int mode)
+{
+    if (mode < 0 || mode > 2 || (int)bl_reg_get_dword(EFFECT_KEY, DISPLAY_KEY_VALUE, 3) == mode) return;
+    bl_reg_set_dword(EFFECT_KEY, DISPLAY_KEY_VALUE, (uint32_t)mode);
+    fprintf(stderr, "[metal] display mode: %s (from the window)\n", mode == 2 ? "full screen" : "windowed");
 }
 
 void bl_display_mode_set(int mode)
@@ -2315,8 +2445,7 @@ static void out_apply(struct d3d_state *s)
 }
 
 // Viewport and scissor for the bound target.
-// `squeeze` < 1 narrows everything horizontally about the target's centre (menus at 4:3).
-static void set_viewport(struct d3d_state *s, BLRender *e, uint32_t tw, uint32_t th, float squeeze)
+static void set_viewport(struct d3d_state *s, BLRender *e, uint32_t tw, uint32_t th)
 {
     const uint32_t *vp = s->viewport;
     static uint32_t full[6];
@@ -2326,9 +2455,6 @@ static void set_viewport(struct d3d_state *s, BLRender *e, uint32_t tw, uint32_t
         full[2] = tw, full[3] = th, full[4] = vp[4], full[5] = vp[5];
         vp = full;
     }
-    double cx = tw / 2.0;
-#define SQUEEZE(x) (squeeze < 1 ? cx + ((x) - cx) * squeeze : (x))
-    [e setViewport:(MTLViewport){SQUEEZE(vp[0]), vp[1], vp[2] * (squeeze < 1 ? squeeze : 1), vp[3], u2f(vp[4]), u2f(vp[5])}];
     int32_t x0 = (int32_t)vp[0], y0 = (int32_t)vp[1], x1 = x0 + (int32_t)vp[2], y1 = y0 + (int32_t)vp[3];
     if (s->rs[174]) {  // SCISSORTESTENABLE
         const int32_t *r = (const int32_t *)s->scissor;
@@ -2341,13 +2467,11 @@ static void set_viewport(struct d3d_state *s, BLRender *e, uint32_t tw, uint32_t
     // world view smaller when upscaling): the game's pixels taken to the texture's.
     const struct obj *rt = s->render_target[0];
     double sx = rt && rt->width ? (double)tw / rt->width : 1, sy = rt && rt->height ? (double)th / rt->height : 1;
+    [e setViewport:(MTLViewport){vp[0] * sx, vp[1] * sy, vp[2] * sx, vp[3] * sy, u2f(vp[4]), u2f(vp[5])}];
     if (sx != 1 || sy != 1) {
-        [e setViewport:(MTLViewport){vp[0] * sx, vp[1] * sy, vp[2] * sx, vp[3] * sy, u2f(vp[4]), u2f(vp[5])}];
         x0 = (int32_t)lround(x0 * sx), y0 = (int32_t)lround(y0 * sy), x1 = (int32_t)lround(x1 * sx),
         y1 = (int32_t)lround(y1 * sy);
     }
-    if (squeeze < 1) x0 = (int32_t)floor(SQUEEZE(x0)), x1 = (int32_t)ceil(SQUEEZE(x1));
-#undef SQUEEZE
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > (int32_t)tw) x1 = (int32_t)tw;
@@ -2378,11 +2502,14 @@ void d3d_render_clear(struct d3d_state *s, uint32_t count, uint32_t rects, uint3
                                          (color & 255) / 255.0, (color >> 24) / 255.0);
     if (full) {
         end_pass();
+        // A clear still waiting on another surface runs first, not lost.
+        if ((flags & 1) && clear_color_target != rt) flush_clear_of(clear_color_target);
+        if ((flags & 6) && ds && clear_depth_target != ds) flush_clear_of(clear_depth_target);
         if (flags & 1) clear_color_target = rt, clear_color = cc;  // D3DCLEAR_TARGET
         if ((flags & 6) && ds) {                                    // D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL
-            if (clear_depth_target != ds) clear_has_stencil = 0;
+            if (clear_depth_target != ds) clear_has_depth = clear_has_stencil = 0;
             clear_depth_target = ds;
-            if (flags & 2) clear_depth = z;
+            if (flags & 2) clear_depth = z, clear_has_depth = 1;
             if (flags & 4) clear_stencil = stencil, clear_has_stencil = 1;
         }
         return;
@@ -3014,10 +3141,14 @@ static NSString *const ao_source =
      "    return float2(sum / wsum, z); }\n"
      // Under TAA: blended with last frame's (hist, followed back along the camera's motion
      // vectors mv, full resolution), kept within the 3x3 neighbourhood's range (a little
-     // wider); last frame's is dropped where its depth there differs (something moved in
-     // or out from behind). Output: occlusion, depth.
+     // wider), and at least within this frame's noise: the spread of the unfiltered
+     // occlusion (raw) over the filter's 4x4 tile. The filtered result moves with the
+     // turning pattern by more than its neighbours differ, so the range alone threw last
+     // frame's away and the occlusion flickered. Last frame's is dropped where its depth
+     // there differs (something moved in or out from behind). Output: occlusion, depth.
      "fragment float2 ao_history(V in [[stage_in]], texture2d<float> cur [[texture(0)]], texture2d<float> hist [[texture(1)]],\n"
-     "                           texture2d<float> mv [[texture(2)]], constant AOP &a [[buffer(0)]]) {\n"
+     "                           texture2d<float> mv [[texture(2)]], texture2d<float> raw [[texture(3)]],\n"
+     "                           constant AOP &a [[buffer(0)]]) {\n"
      "    int2 p = int2(in.pos.xy), hs = int2(a.hsize) - 1;\n"
      "    float2 c = cur.read(uint2(p)).xy;\n"
      "    if (c.y <= 0.0) return c;\n"
@@ -3027,13 +3158,22 @@ static NSString *const ao_source =
      "            float v = cur.read(uint2(clamp(p + int2(i, j), int2(0), hs))).x;\n"
      "            lo = min(lo, v), hi = max(hi, v);\n"
      "        }\n"
+     "    float m1 = 0.0, m2 = 0.0;\n"
+     "    for (int j = -2; j < 2; j++)\n"
+     "        for (int i = -2; i < 2; i++) {\n"
+     "            float v = raw.read(uint2(clamp(p + int2(i, j), int2(0), hs))).x;\n"
+     "            m1 += v, m2 += v * v;\n"
+     "        }\n"
+     "    m1 /= 16.0;\n"
+     "    float sd = sqrt(max(m2 / 16.0 - m1 * m1, 0.0));\n"
+     "    lo = min(lo, c.x - sd), hi = max(hi, c.x + sd);\n"
      "    float2 m = mv.read(uint2(min(p * 2, int2(mv.get_width(), mv.get_height()) - 1))).xy;\n"
      "    float2 q = (in.pos.xy / a.hsize + m) * a.hsize;\n"
      "    if (any(q < 0.0) || any(q >= a.hsize)) return c;\n"
      "    float2 h = hist.read(uint2(q)).xy;\n"
      "    if (abs(h.y - c.y) > 0.1 * c.y) return c;\n"
      "    float ext = (hi - lo) * 0.25;\n"
-     "    return float2(mix(clamp(h.x, lo - ext, hi + ext), c.x, 0.15), c.y); }\n"
+     "    return float2(mix(clamp(h.x, lo - ext, hi + ext), c.x, 0.1), c.y); }\n"
      // To full resolution: the four half-resolution pixels around (occlusion, depth), each
      // weighted by how close its depth is to this pixel's (dt, the depth buffer), as the
      // bounced light's ssil_upscale, so a wall's occlusion does not spill onto the outline
@@ -3150,7 +3290,7 @@ static void note_projection(const float r8[4], const float r9[4], const float r1
 // world view).
 static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h)
 {
-    static id<MTLTexture> t[28];
+    static id<MTLTexture> t[29];
     if (!t[i] || t[i].width != w || t[i].height != h || t[i].pixelFormat != pf) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h
                                                                                  mipmapped:NO];
@@ -3165,8 +3305,8 @@ static id<MTLTexture> ao_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInte
 }
 
 // One full-screen pass of ao_pipeline `kind` into `target`.
-static void ao_pass3(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTexture> t1, id<MTLTexture> t2,
-                     const struct ao_params *a)
+static void ao_pass4(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTexture> t1, id<MTLTexture> t2,
+                     id<MTLTexture> t3, const struct ao_params *a)
 {
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.colorAttachments[0].texture = target;
@@ -3177,6 +3317,7 @@ static void ao_pass3(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLT
     [e setFragmentTexture:t0 atIndex:0];
     [e setFragmentTexture:t1 atIndex:1];
     [e setFragmentTexture:t2 atIndex:2];
+    [e setFragmentTexture:t3 atIndex:3];
     [e setFragmentBytes:a length:sizeof *a atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
@@ -3184,7 +3325,7 @@ static void ao_pass3(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLT
 
 static void ao_pass(int kind, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTexture> t1, const struct ao_params *a)
 {
-    ao_pass3(kind, target, t0, t1, nil, a);
+    ao_pass4(kind, target, t0, t1, nil, nil, a);
 }
 
 // The half-resolution view depth z's 4 smaller copies (kept between frames), made once a
@@ -3254,7 +3395,7 @@ struct ssr_params {
     float strength;          // of the reflections; 0: none this frame
     float max_dist, show;    // longest ray (world units); show the reflections (1) or the trace's inputs (2)
     float fresnel, blur;     // extra reflection at a grazing angle; blur radius per half-resolution pixel of ray
-    float tonemap, expand;   // tone mapping: 0 off, 1 GT7, 3 Khronos PBR Neutral; 2 and 4 the same after
+    float tonemap, expand;   // tone mapping: 0 off, 1 filmic, 3 Khronos PBR Neutral; 2 and 4 the same after
                              // expanding highlights by `expand` (0..1)
     float fog, skin;         // add the volumetric light (fog_run); use the scattered skin (skin_run)
     float bloom, exposure;   // add the glow this much (bloom_run); scale by the eye's exposure (1; 2 show it)
@@ -3424,19 +3565,19 @@ static NSString *const ssr_source =
      "    if (h.w < 0.0) return c;\n"
      "    float4 ext = (hi - lo) * 0.25;\n"
      "    return mix(clamp(h, lo - ext, hi + ext), c, 0.1); }\n"
-     // GT7's tone mapping (Polyphony Digital's published SDR curve and chroma handling):
+     // The filmic tone map (a published SDR curve and chroma handling):
      // frame buffer 1.0 is 100 nits, paper white 250 nits. The curve maps each channel
      // (toe, linear section, exponential shoulder); the result's intensity in ICtCp is kept,
      // with the original chroma faded out towards white, and the two are blended 40:60.
-     "static float gt7_smooth(float x, float e0, float e1) { float t = saturate((x - e0) / (e1 - e0)); return t * t * (3.0 - 2.0 * t); }\n"
-     "constant float GT7_PEAK = 2.5, GT7_ALPHA = 0.25, GT7_MID = 0.2, GT7_LIN = 0.444, GT7_TOE = 1.28;\n"
-     "static float gt7_curve(float x, float P) {\n"
+     "static float filmic_smooth(float x, float e0, float e1) { float t = saturate((x - e0) / (e1 - e0)); return t * t * (3.0 - 2.0 * t); }\n"
+     "constant float FILMIC_PEAK = 2.5, FILMIC_ALPHA = 0.25, FILMIC_MID = 0.2, FILMIC_LIN = 0.444, FILMIC_TOE = 1.28;\n"
+     "static float filmic_curve(float x, float P) {\n"
      "    if (x < 0.0) return 0.0;\n"
-     "    float k = (GT7_LIN - 1.0) / (GT7_ALPHA - 1.0);\n"
-     "    float ka = P * GT7_LIN + P * k, kb = -P * k * exp(GT7_LIN / k), kc = -1.0 / (k * P);\n"
-     "    if (x >= GT7_LIN * P) return ka + kb * exp(x * kc);\n"
-     "    float wl = gt7_smooth(x, 0.0, GT7_MID);\n"
-     "    return (1.0 - wl) * GT7_MID * pow(x / GT7_MID, GT7_TOE) + wl * x; }\n"
+     "    float k = (FILMIC_LIN - 1.0) / (FILMIC_ALPHA - 1.0);\n"
+     "    float ka = P * FILMIC_LIN + P * k, kb = -P * k * exp(FILMIC_LIN / k), kc = -1.0 / (k * P);\n"
+     "    if (x >= FILMIC_LIN * P) return ka + kb * exp(x * kc);\n"
+     "    float wl = filmic_smooth(x, 0.0, FILMIC_MID);\n"
+     "    return (1.0 - wl) * FILMIC_MID * pow(x / FILMIC_MID, FILMIC_TOE) + wl * x; }\n"
      "static float3 pq_encode(float3 l) {\n"
      "    float3 p = pow(max(l, 0.0), 0.1593017578125);\n"
      "    return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), 78.84375); }\n"
@@ -3455,37 +3596,37 @@ static NSString *const ssr_source =
      "    return float3(dot(lms, float3(3.4366066943, -2.5064521187, 0.0698454243)),\n"
      "                  dot(lms, float3(-0.7913295556, 1.9836004518, -0.1922708962)),\n"
      "                  dot(lms, float3(-0.0259498997, -0.0989137147, 1.1248636144))); }\n"
-     "static float3 gt7(float3 srgb, float mode, float expand) {\n"
+     "static float3 filmic(float3 srgb, float mode, float expand) {\n"
      "    float3 lin = select(pow((srgb + 0.055) / 1.055, 2.4), srgb / 12.92, srgb <= 0.04045);\n"
      // Highlights the game clamped at 1, pushed back up (inverse Reinhard on the brightest channel).
      "    if (mode > 1.5) { float m = max(max(lin.r, lin.g), lin.b); lin *= 1.0 / max(1.0 - expand * m, 1.0 - expand); }\n"
      "    float3 c = float3(dot(lin, float3(0.6274, 0.3293, 0.0433)), dot(lin, float3(0.0691, 0.9195, 0.0114)),\n"
-     "                      dot(lin, float3(0.0164, 0.0880, 0.8956))) * GT7_PEAK;\n"
+     "                      dot(lin, float3(0.0164, 0.0880, 0.8956))) * FILMIC_PEAK;\n"
      "    float3 ucs = to_ictcp(c);\n"
-     "    float3 skew = float3(gt7_curve(c.r, GT7_PEAK), gt7_curve(c.g, GT7_PEAK), gt7_curve(c.b, GT7_PEAK));\n"
+     "    float3 skew = float3(filmic_curve(c.r, FILMIC_PEAK), filmic_curve(c.g, FILMIC_PEAK), filmic_curve(c.b, FILMIC_PEAK));\n"
      "    float3 su = to_ictcp(skew);\n"
-     "    float target = to_ictcp(float3(GT7_PEAK)).x;\n"
-     "    float chroma = 1.0 - gt7_smooth(ucs.x, 0.98 * target, 1.16 * target);\n"
+     "    float target = to_ictcp(float3(FILMIC_PEAK)).x;\n"
+     "    float chroma = 1.0 - filmic_smooth(ucs.x, 0.98 * target, 1.16 * target);\n"
      "    float3 scaled = from_ictcp(float3(su.x, ucs.y * chroma, ucs.z * chroma));\n"
-     "    float3 o = min(mix(skew, scaled, 0.6), GT7_PEAK) / GT7_PEAK;\n"
+     "    float3 o = min(mix(skew, scaled, 0.6), FILMIC_PEAK) / FILMIC_PEAK;\n"
      "    o = float3(dot(o, float3(1.6605, -0.5876, -0.0728)), dot(o, float3(-0.1246, 1.1329, -0.0083)),\n"
      "               dot(o, float3(-0.0182, -0.1006, 1.1187)));\n"
      "    o = saturate(o);\n"
      "    return select(1.055 * pow(o, 1.0 / 2.4) - 0.055, o * 12.92, o <= 0.0031308); }\n"
-     // HDR: GT7's tone map at the screen's headroom H, as Polyphony publish it except for
-     // the toe's reach, on the game's light with white at GT7's paper white (GT7_PEAK, 250
-     // nits): the toe deepens only the darkest shades (below GT7_MID, 0.2 in place of GT7's
+     // HDR: the filmic tone map at the screen's headroom H, as published except for
+     // the toe's reach, on the game's light with white at its paper white (FILMIC_PEAK, 250
+     // nits): the toe deepens only the darkest shades (below FILMIC_MID, 0.2 in place of the published
      // 0.538, since Bloodlines' dark rooms were made without a toe and its full reach hid
-     // them), straight on to 0.444 of the peak (GT7_PEAK times
+     // them), straight on to 0.444 of the peak (FILMIC_PEAK times
      // H), and the shoulder rolls the rest off into the peak; the ICtCp result weighs 0.6
      // against the per-channel curve. The light past white comes from the lightmaps, which
      // keep the map's own (the rebake section). The game's purest colours (neon, coloured
      // lamps) are taken towards the screen's wider range (P3), the more the purer they are,
      // so greys and skin stay as drawn; the result is kept within P3, outside sRGB as
      // negative values, which the extended-range screen shows. Values past white kept too.
-     "static float3 gt7_full(float3 srgb, float H) {\n"
+     "static float3 filmic_full(float3 srgb, float H) {\n"
      "    float3 s = max(srgb, 0.0), lin = select(pow((s + 0.055) / 1.055, 2.4), s / 12.92, s <= 0.04045);\n"
-     "    float P = GT7_PEAK, Ph = GT7_PEAK * H;\n"
+     "    float P = FILMIC_PEAK, Ph = FILMIC_PEAK * H;\n"
      "    float3 c = float3(dot(lin, float3(0.6274, 0.3293, 0.0433)), dot(lin, float3(0.0691, 0.9195, 0.0114)),\n"
      "                      dot(lin, float3(0.0164, 0.0880, 0.8956)));\n"
      "    float3 w = float3(dot(lin, float3(0.7538, 0.1986, 0.0476)), dot(lin, float3(0.0457, 0.9418, 0.0125)),\n"
@@ -3493,10 +3634,10 @@ static NSString *const ssr_source =
      "    float hi = max(max(lin.r, lin.g), lin.b), sat = hi > 1e-5 ? 1.0 - min(min(lin.r, lin.g), lin.b) / hi : 0.0;\n"
      "    c = mix(c, w, sat * sat) * P;\n"
      "    float3 ucs = to_ictcp(c);\n"
-     "    float3 skew = float3(gt7_curve(c.r, Ph), gt7_curve(c.g, Ph), gt7_curve(c.b, Ph));\n"
+     "    float3 skew = float3(filmic_curve(c.r, Ph), filmic_curve(c.g, Ph), filmic_curve(c.b, Ph));\n"
      "    float3 su = to_ictcp(skew);\n"
      "    float target = to_ictcp(float3(Ph)).x;\n"
-     "    float chroma = 1.0 - gt7_smooth(ucs.x, 0.98 * target, 1.16 * target);\n"
+     "    float chroma = 1.0 - filmic_smooth(ucs.x, 0.98 * target, 1.16 * target);\n"
      "    float3 scaled = from_ictcp(float3(su.x, ucs.y * chroma, ucs.z * chroma));\n"
      "    float3 o = min(mix(skew, scaled, 0.6), Ph) / P;\n"
      "    o = max(float3(dot(o, float3(1.3436, -0.2822, -0.0614)), dot(o, float3(-0.0653, 1.0758, -0.0105)),\n"
@@ -3522,7 +3663,7 @@ static NSString *const ssr_source =
      "    c = saturate(c);\n"
      "    return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308); }\n"
      // HDR output: the picture in linear light, 1 at normal white (the sRGB curve carried on
-     // past 1). post_apply's tone map (gt7_full) took the world view's highlights past white
+     // past 1). post_apply's tone map (filmic_full) took the world view's highlights past white
      // up to the peak (hdr_peak), and its colours outside sRGB as negative values, for the
      // screen's wider range; the HUD and view model stay within white. `preview` writes the
      // result divided by the headroom, in sRGB, for dumps.
@@ -3579,7 +3720,13 @@ static NSString *const ssr_source =
      "        if (a.strength <= 0.0) {}\n"
      "        else if (a.show > 1.5) col = float3(f.w, r.a, length(f.rgb));\n"
      "        else if (a.show > 0.0) col = f.w > 0.004 ? F * r.rgb : col * 0.25;\n"
-     "        else if (f.w > 0.004) col += a.strength * (F * (max(f.w, 0.0) * r.rgb + (1.0 - r.a) * f.rgb) - f.rgb);\n"
+     // The cubemap's share is taken out, never more than the pixel holds: where the game
+     // drew over the surface later (a decal) without the info target, its share stays the
+     // surface's and would take the pixel below black.
+     "        else if (f.w > 0.004) {\n"
+     "            float3 e = min(f.rgb, max(col, 0.0));\n"
+     "            col += a.strength * (F * (max(f.w, 0.0) * r.rgb + (1.0 - r.a) * e) - e);\n"
+     "        }\n"
      "        if (wm.x > 0.01) {\n"
      "            float2 uv = (float2(p) + 0.5) / a.full;\n"
      "            float3 N = normalize(wetn.sample(wls, uv).xyz + float3(0.0, 0.0, -1e-4));\n"
@@ -3616,17 +3763,17 @@ static NSString *const ssr_source =
      // The tone map. On a normal screen (peak 1) a soft shoulder from 0.75 to white with
      // the exposure or glow on, as it always has been (by the brightest channel, so the
      // hue stays), and otherwise a clip at white as an 8-bit back buffer did. With HDR
-     // (peak, in the game's colours, above 1) GT7's whole tone map at the screen's (gt7_full).
+     // (peak, in the game's colours, above 1) the whole filmic tone map at the screen's (filmic_full).
      "    if (a.tonemap == 0.0 && a.peak > 1.001) {\n"
-     "        col = gt7_full(col, pow((a.peak + 0.055) / 1.055, 2.4));\n"
+     "        col = filmic_full(col, pow((a.peak + 0.055) / 1.055, 2.4));\n"
      "    } else if (a.tonemap == 0.0) {\n"
      "        float k = a.exposure <= 0.0 && a.bloom <= 0.0 ? 1.0 : 0.75, m = max(max(col.r, col.g), col.b);\n"
      "        if (m > k) col *= (k + (1.0 - k) * (1.0 - exp(-(m - k) / (1.0 - k)))) / m;\n"
      "    }\n"
      "    if (a.tonemap > 2.5) col = pbr_neutral(saturate(col), a.tonemap, a.expand);\n"
-     "    else if (a.tonemap > 0.0) col = gt7(saturate(col), a.tonemap, a.expand);\n"
+     "    else if (a.tonemap > 0.0) col = filmic(saturate(col), a.tonemap, a.expand);\n"
      "    if (a.exposure > 1.5 && p.y < 12) col = float(p.x) < a.full.x * eye[0] * 0.5 ? float3(1.0, 0.8, 0.0) : float3(0.1);\n"
-     // With HDR the colours outside sRGB stay (negative; gt7_full).
+     // With HDR the colours outside sRGB stay (negative; filmic_full).
      "    return float4(clamp(col, a.peak > 1.001 ? -1.0 : 0.0, a.peak), c.a); }\n";
 
 // kind 0: trace (a second target for the ray's length and Fresnel factor); 1: filter;
@@ -3764,7 +3911,38 @@ struct fx_params {
     float dir[2];          // skin: blur direction (1 0 or 0 1)
     float final, sheen;    // skin: the second pass (mixes in); strength of the shine (0 none)
     float through, pad;    // skin: strength of the light through thin parts (0 none; skin_through)
+    float align[2];        // the shader's float4s below start on 16 bytes
+    // fog: the object shadows' views (fog_views) for up to 4 of its lights: each one's place in
+    // frame_lights (-1 none) and its views' first slice; view to world rotation, as rows;
+    // the views' size; this frame's offset of the steps (0 without the temporal scaler)
+    float sidx[4], sslice[4];
+    float srot[3][4];
+    float sres, sframe, spad[2];
 };
+_Static_assert(offsetof(struct fx_params, sidx) % 16 == 0, "fx_params: the shader's float4s start on 16 bytes");
+
+// The object shadows' views the haze is shadowed by this frame (pshadow_prepare), else nil.
+static id<MTLTexture> fog_views;
+static float fog_view_light[4], fog_view_slice[4], fog_view_rot[3][4];
+static int fog_nviews, fog_view_res;
+
+// Light through the windows of rooms (fog_windows): the map's window faces (their material
+// named for a window or glass) with a ceiling over the room they face, read when the map
+// opens (bl_shadow_note_map); each frame the nearest FOG_WINDOWS within FOG_WINDOW_REACH of
+// the camera light the haze in a beam the window's shape, slanting in and down
+// (FOG_WINDOW_SLANT), fading over FOG_WINDOW_FADE units. In view space for the haze: a
+// corner and the window's two edges, its facing (into the room), the beam's way and
+// colour. BL_FOG_WINDOWS (default 1) scales them, 0 none.
+#define FOG_WINDOWS 8
+#define FOG_WINDOW_REACH 1500.0f
+#define FOG_WINDOW_SLANT 0.6f
+#define FOG_WINDOW_FADE 260.0f
+struct fog_window { float o[4], u[4], v[4], n[4], d[4], c[4]; };  // see FW in fx_source
+struct map_window { float o[3], u[3], v[3], n[3], c[3], mid[3]; };
+static os_unfair_lock windows_lock = OS_UNFAIR_LOCK_INIT;
+static struct map_window *map_windows;
+static int map_nwindows;
+static float env_fog_windows = -1;
 
 // The skin pass's light through thin parts: the characters' casters in the shadow atlas
 // (shadow_draw), each with its light-space rows, and view space back to the world.
@@ -3779,24 +3957,37 @@ static NSString *const fx_source =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
      "struct FP { float2 full, hsize; float p00, p11, density, dist, steps, nlights, width, strength; float2 dir;\n"
-     "            float final, sheen, through, pad; };\n"
+     "            float final, sheen, through, pad; float2 align; float4 sidx, sslice; float4 srot[3]; float sres, sframe, spad0, spad1; };\n"
      "struct TC { float4 x, y, z, rect, k; };\n"
      "struct TH { float4 inv[3]; float4 n; TC c[16]; };\n"
      // pos.w: range (0 none); color.w: spot's full cone (cosine); dir.w: its zero cone;
      // att.w: its exponent. Points have dir 0.
      "struct FL { float4 pos, color, dir, att; };\n"
+     "struct FW { float4 o, u, v, n, d, c; };\n"
      "struct V { float4 pos [[position]]; };\n"
      "vertex V fx_vs(uint id [[vertex_id]]) {\n"
      "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
      "static float ign(float2 p) { return fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715)))); }\n"
-     "static float4 fog_at(uint2 p, texture2d<float> zt, constant FP &a, constant FL *L) {\n"
+     // Whether light k's views (slice s0 on) see past the point r from the light (world
+     // units): nothing nearer the light along that line, map or prop.
+     "static bool fog_lit(constant FP &a, texture2d_array<float> views, float s0, float3 r) {\n"
+     "    float d = length(r); float3 ar = abs(r);\n"
+     "    int ax = ar.x >= ar.y && ar.x >= ar.z ? 0 : ar.y >= ar.z ? 1 : 2;\n"
+     "    float3 q = ax == 0 ? r.yzx : ax == 1 ? r.zxy : r;\n"
+     "    float s = q.z >= 0.0 ? 1.0 : -1.0;\n"
+     "    float2 ndc = q.xy / (q.z * s);\n"
+     "    int2 c = clamp(int2(float2(ndc.x * 0.5 + 0.5, 0.5 - 0.5 * ndc.y) * a.sres), int2(0), int2(a.sres) - 1);\n"
+     "    float m = views.read(uint2(c), uint(s0) + uint(ax * 2) + (s < 0.0 ? 1u : 0u)).y;\n"
+     "    return d <= m + 1.0 + 2.0 * d / a.sres; }\n"
+     "static float4 fog_at(uint2 p, texture2d<float> zt, constant FP &a, constant FL *L, texture2d_array<float> views,\n"
+     "                     constant FW *W) {\n"
      "    float w = zt.read(p).x;\n"
      "    if (w <= 0.0) w = a.dist;\n"
      "    float2 ndc = float2((float(p.x) + 0.5) * 2.0 / a.hsize.x - 1.0, 1.0 - (float(p.y) + 0.5) * 2.0 / a.hsize.y);\n"
      "    float3 ray = float3(ndc.x / a.p00, ndc.y / a.p11, 1.0);\n"
      "    float rl = length(ray), T = min(w, a.dist), dt = T / a.steps;\n"
      "    float3 vd = ray / rl, acc = 0.0;\n"
-     "    float j = ign(float2(p));\n"
+     "    float j = fract(ign(float2(p)) + a.sframe);\n"
      "    const float g = 0.35, g1 = 1.0 - g * g, g2 = 1.0 + g * g;\n"
      "    int n = int(a.nlights), steps = int(a.steps);\n"
           // Each light only over the steps it reaches: inside its range, and where it could
@@ -3811,9 +4002,27 @@ static NSString *const fx_source =
      "        float b = dot(ray, L[k].pos.xyz), c = dot(L[k].pos.xyz, L[k].pos.xyz) - r * r, h = b * b - rr * c;\n"
      "        if (h <= 0.0) continue;\n"
      "        h = sqrt(h);\n"
-     "        int i0 = max(int(ceil((b - h) / rr / dt - j)), 0), i1 = min(int(floor((b + h) / rr / dt - j)), steps - 1);\n"
+          // A light with shadow views: 24 steps of its own over the stretch it reaches, each
+          // dropped where the views see something nearer the light (beams between the shadows
+          // of walls, pillars and railings); weighted to the 16 steps' measure.
+     "        int sv = -1;\n"
+     "        for (int s = 0; s < 4; s++) if (int(a.sidx[s]) == k && a.sslice[s] >= 0.0) sv = s;\n"
+     "        float ts = dt, t0 = 0.0;\n"
+     "        int i0, i1;\n"
+     "        if (sv >= 0) {\n"
+     "            float ta = max((b - h) / rr, 0.0), tb = min((b + h) / rr, T);\n"
+     "            if (tb <= ta) continue;\n"
+     "            ts = (tb - ta) / 24.0, t0 = ta, i0 = 0, i1 = 23;\n"
+     "        } else {\n"
+     "            i0 = max(int(ceil((b - h) / rr / dt - j)), 0), i1 = min(int(floor((b + h) / rr / dt - j)), steps - 1);\n"
+     "        }\n"
      "        for (int i = i0; i <= i1; i++) {\n"
-     "            float3 P = ray * ((float(i) + j) * dt);\n"
+     "            float3 P = ray * (t0 + (float(i) + j) * ts);\n"
+     "            if (sv >= 0) {\n"
+     "                float3 r = P - L[k].pos.xyz;\n"
+     "                if (!fog_lit(a, views, a.sslice[sv], float3(dot(a.srot[0].xyz, r), dot(a.srot[1].xyz, r), dot(a.srot[2].xyz, r))))\n"
+     "                    continue;\n"
+     "            }\n"
      "            float3 v = L[k].pos.xyz - P;\n"
      "            float d2 = max(dot(v, v), 64.0), d = sqrt(d2);\n"
      "            float3 l = v / d;\n"
@@ -3826,7 +4035,23 @@ static NSString *const fx_source =
      "                if (L[k].att.w > 0.0 && L[k].att.w != 1.0) f *= pow(c, L[k].att.w);\n"
      "            }\n"
      "            float ph = g1 / pow(g2 - 2.0 * g * dot(l, vd), 1.5);\n"
-     "            acc += L[k].color.rgb * (f * ph);\n"
+     "            acc += L[k].color.rgb * (f * ph * ts / dt);\n"
+     "        }\n"
+     "    }\n"
+          // The windows' beams: each step taken back along the beam to the window's plane,
+          // lit where that lands inside the window (soft over 3 units at its edges).
+     "    for (int k = 0; k < int(a.spad0); k++) {\n"
+     "        float nd = dot(W[k].n.xyz, W[k].d.xyz), uu = dot(W[k].u.xyz, W[k].u.xyz), vv = dot(W[k].v.xyz, W[k].v.xyz);\n"
+     "        float ph = g1 / pow(g2 - 2.0 * g * dot(-W[k].d.xyz, vd), 1.5);\n"
+     "        for (int i = 0; i < steps; i++) {\n"
+     "            float3 P = ray * ((float(i) + j) * dt);\n"
+     "            float t = dot(W[k].n.xyz, P - W[k].o.xyz);\n"
+     "            if (t <= 0.0) continue;\n"
+     "            float s = t / nd;\n"
+     "            float3 q = P - W[k].d.xyz * s - W[k].o.xyz;\n"
+     "            float x = dot(q, W[k].u.xyz) / uu, y = dot(q, W[k].v.xyz) / vv;\n"
+     "            float e = saturate(min(min(x, 1.0 - x) * sqrt(uu), min(y, 1.0 - y) * sqrt(vv)) / 3.0);\n"
+     "            acc += W[k].c.rgb * (e * ph * exp(-s / W[k].d.w));\n"
      "        }\n"
      "    }\n"
           // Rolled off so that where the lights pile up the haze nears white without passing it.
@@ -3834,9 +4059,10 @@ static NSString *const fx_source =
      // A kernel (post_traces).
      "kernel void fog_scatter(texture2d<float> zt [[texture(0)]], texture2d<float, access::write> out [[texture(1)]],\n"
      "                        constant FP &a [[buffer(0)]], constant FL *L [[buffer(1)]],\n"
+     "                        texture2d_array<float> views [[texture(2)]], constant FW *W [[buffer(2)]],\n"
      "                        uint2 gid [[thread_position_in_grid]]) {\n"
      "    if (any(gid >= uint2(a.hsize))) return;\n"
-     "    out.write(fog_at(gid, zt, a, L), gid); }\n"
+     "    out.write(fog_at(gid, zt, a, L, views, W), gid); }\n"
      "fragment float4 fog_blur(V in [[stage_in]], texture2d<float> ft [[texture(0)]], texture2d<float> zt [[texture(1)]],\n"
      "                         constant FP &a [[buffer(0)]]) {\n"
      "    int2 p = int2(in.pos.xy), m = int2(a.hsize) - 1;\n"
@@ -4187,21 +4413,83 @@ static int view_lights(void)
 // The haze's trace into ao_texture 9, in post_traces' encoder (full: the back buffer's
 // size); 0 when no light is near.
 static struct fx_params fog_frame;
+
+// The windows lighting the haze this frame (struct fog_window), nearest the camera first.
+static int fog_windows(struct fog_window *out)
+{
+    if (env_fog_windows < 0) env_fog_windows = getenv("BL_FOG_WINDOWS") ? (float)atof(getenv("BL_FOG_WINDOWS")) : 1;
+    if (env_fog_windows <= 0) return 0;
+    int pick[FOG_WINDOWS], n = 0;
+    float best[FOG_WINDOWS];
+    os_unfair_lock_lock(&windows_lock);
+    for (int i = 0; i < map_nwindows; i++) {
+        const float *m = map_windows[i].mid;
+        float dx = m[0] - frame_cam[0], dy = m[1] - frame_cam[1], dz = m[2] - frame_cam[2], d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 > FOG_WINDOW_REACH * FOG_WINDOW_REACH) continue;
+        int j;
+        if (n < FOG_WINDOWS) j = n++;
+        else if (d2 >= best[FOG_WINDOWS - 1]) continue;
+        else j = FOG_WINDOWS - 1;
+        while (j > 0 && best[j - 1] > d2) pick[j] = pick[j - 1], best[j] = best[j - 1], j--;
+        pick[j] = i, best[j] = d2;
+    }
+    for (int k = 0; k < n; k++) {
+        const struct map_window *w = &map_windows[pick[k]];
+        float d[3] = {w->n[0], w->n[1], w->n[2] - FOG_WINDOW_SLANT}, l = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        for (int r = 0; r < 3; r++) {
+            const float *R = view_rows[r];
+            out[k].o[r] = R[0] * w->o[0] + R[1] * w->o[1] + R[2] * w->o[2] + R[3];
+            out[k].u[r] = R[0] * w->u[0] + R[1] * w->u[1] + R[2] * w->u[2];
+            out[k].v[r] = R[0] * w->v[0] + R[1] * w->v[1] + R[2] * w->v[2];
+            out[k].n[r] = R[0] * w->n[0] + R[1] * w->n[1] + R[2] * w->n[2];
+            out[k].d[r] = (R[0] * d[0] + R[1] * d[1] + R[2] * d[2]) / l;
+            out[k].c[r] = w->c[r] * env_fog_windows;
+        }
+        out[k].o[3] = out[k].u[3] = out[k].v[3] = out[k].n[3] = out[k].c[3] = 0;
+        out[k].d[3] = FOG_WINDOW_FADE;
+    }
+    os_unfair_lock_unlock(&windows_lock);
+    return n;
+}
+
 static int fog_trace(BLCompute *c, id<MTLTexture> z, const float full[2])
 {
     int n = view_lights();
-    if (!n) return 0;
+    struct fog_window win[FOG_WINDOWS];
+    int nwin = fog_windows(win);
+    if (!n && !nwin) return 0;
     const float *cam = frame_cam;
     const struct fog_light *fl = frame_lights;
     LOG_ONCE("[metal] volumetric light: %d lights, camera %g %g %g\n", n, cam[0], cam[1], cam[2]);
     struct fx_params a = {{full[0], full[1]}, {(float)z.width, (float)z.height}, view_proj.p00, view_proj.p11,
                           env_fog_density, env_fog_dist, 16, (float)n};
+    // The shadowed lights, among the haze's first n; without views a 1x1 stand-in, unread.
+    static id<MTLTexture> no_views;
+    if (!no_views) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float width:1
+                                                                                     height:1 mipmapped:NO];
+        td.textureType = MTLTextureType2DArray;
+        td.storageMode = MTLStorageModePrivate;
+        no_views = [mtl newTextureWithDescriptor:td];
+    }
+    for (int s = 0; s < 4; s++) a.sidx[s] = -1, a.sslice[s] = -1;
+    if (fog_views) {
+        for (int s = 0; s < fog_nviews; s++)
+            if (fog_view_light[s] < n) a.sidx[s] = fog_view_light[s], a.sslice[s] = fog_view_slice[s];
+        memcpy(a.srot, fog_view_rot, sizeof a.srot);
+        a.sres = (float)fog_view_res;
+    }
+    if (taa_pending) a.sframe = fmodf((float)(frames % 64) * 0.618034f, 1);
+    a.spad[0] = (float)nwin;
+    LOG_ONCE("[metal] volumetric light: %d windows' beams of %d in the map\n", nwin, map_nwindows);
     static id<MTLComputePipelineState> k;
     [c setComputePipelineState:kernel_of(fx_library(), @"fog_scatter", &k)];
     [c setTexture:z atIndex:0];
+    [c setTexture:fog_views ? fog_views : no_views atIndex:2];
     [c setTexture:ao_texture(9, MTLPixelFormatRGBA16Float, z.width, z.height) atIndex:1];
     [c setBytes:&a length:sizeof a atIndex:0];
-    [c setBytes:fl length:sizeof fl[0] * (size_t)n atIndex:1];
+    [c setBytes:fl length:sizeof fl[0] * (size_t)(n ? n : 1) atIndex:1];
+    [c setBytes:win length:sizeof win[0] * (size_t)(nwin ? nwin : 1) atIndex:2];
     [c dispatchAlongside:MTLSizeMake((z.width + 7) / 8, (z.height + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
     fog_frame = a;
     return 1;
@@ -4685,9 +4973,95 @@ static int pshadow_face(const struct bl_bsp_world *w, const struct bl_bsp_face *
 
 // Called by bl_bsp when a map opens: its surfaces as triangles now (w is not kept), its
 // props on a thread of their own (their models are read from the game's files).
+// Whether there is a ceiling over p: solid within 400 units above it that is not the sky
+// (a face drawn with the sky, facing down, just where the solid starts over p).
+static int windows_roofed(const struct bl_bsp_world *w, const float p[3])
+{
+    if (!bl_bsp_world_open(w, p)) return 0;
+    float top = 0;
+    for (int h = 16; h <= 400 && !top; h += 8) {
+        float q[3] = {p[0], p[1], p[2] + (float)h};
+        if (!bl_bsp_world_open(w, q)) top = q[2];
+    }
+    if (!top) return 0;
+    for (int i = 0; i < w->nfaces; i++) {
+        const struct bl_bsp_face *f = &w->faces[i];
+        if (f->texinfo < 0 || !(w->texinfo[f->texinfo].flags & 0x4) || f->normal[2] > -0.5f || f->count < 3) continue;
+        float z = (f->dist - f->normal[0] * p[0] - f->normal[1] * p[1]) / f->normal[2];
+        if (fabsf(z - top) > 24) continue;
+        // Inside its outline seen from above: on the same side of every edge, either way round.
+        int pos = 1, neg = 1;
+        for (int c = 0; c < f->count; c++) {
+            const float *a = w->verts[w->index[f->first + c]], *b = w->verts[w->index[f->first + (c + 1) % f->count]];
+            float cr = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+            pos &= cr >= -0.5f, neg &= cr <= 0.5f;
+        }
+        if (pos || neg) return 0;
+    }
+    return 1;
+}
+
+// The map's windows for the haze (struct map_window): faces whose material names a window
+// ("wndw", "window") or glass, standing upright, with a ceiling (not the sky) over the room
+// they face both just in front and 120 units in (a shop's awning over the street is not a
+// room). Colour: a cool night light, tinted half by the material's own mean colour and
+// brighter for a brighter one.
+static void windows_note_map(const struct bl_bsp_world *w)
+{
+    struct map_window *list = malloc(sizeof *list * (size_t)(w->nfaces + 1));
+    int n = 0;
+    for (int i = 0; i < w->nfaces; i++) {
+        const struct bl_bsp_face *f = &w->faces[i];
+        if (f->texinfo < 0 || f->count < 3 || f->disp >= 0 || fabsf(f->normal[2]) > 0.3f) continue;
+        const struct bl_bsp_texinfo *ti = &w->texinfo[f->texinfo];
+        if (ti->flags & (0x4 | 0x80 | 0x200) || ti->texdata < 0 || ti->texdata >= w->ntexdata) continue;
+        char name[128];
+        const char *src = w->texdata[ti->texdata].name;
+        int k = 0;
+        for (; src[k] && k < 127; k++) name[k] = (char)tolower((unsigned char)src[k]);
+        name[k] = 0;
+        if (!strstr(name, "wndw") && !strstr(name, "window") && !strstr(name, "glass")) continue;
+        const float *nn = f->normal;
+        float u[3] = {-nn[1], nn[0], 0}, ul = sqrtf(u[0] * u[0] + u[1] * u[1]);
+        u[0] /= ul, u[1] /= ul;
+        float v[3] = {nn[1] * u[2] - nn[2] * u[1], nn[2] * u[0] - nn[0] * u[2], nn[0] * u[1] - nn[1] * u[0]};
+        if (v[2] < 0) v[0] = -v[0], v[1] = -v[1], v[2] = -v[2];
+        float lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f}, c0[3];
+        for (int c = 0; c < f->count; c++) {
+            const float *p = w->verts[w->index[f->first + c]];
+            float q[3] = {p[0] + f->origin[0], p[1] + f->origin[1], p[2] + f->origin[2]};
+            if (!c) memcpy(c0, q, sizeof c0);
+            float a = q[0] * u[0] + q[1] * u[1] + q[2] * u[2], b = q[0] * v[0] + q[1] * v[1] + q[2] * v[2];
+            lo[0] = fminf(lo[0], a), hi[0] = fmaxf(hi[0], a), lo[1] = fminf(lo[1], b), hi[1] = fmaxf(hi[1], b);
+        }
+        if (hi[0] - lo[0] < 8 || hi[1] - lo[1] < 8) continue;
+        struct map_window *m = &list[n];
+        float a0 = c0[0] * u[0] + c0[1] * u[1] + c0[2] * u[2], b0 = c0[0] * v[0] + c0[1] * v[1] + c0[2] * v[2];
+        for (int r = 0; r < 3; r++) {
+            m->o[r] = c0[r] + u[r] * (lo[0] - a0) + v[r] * (lo[1] - b0);
+            m->u[r] = u[r] * (hi[0] - lo[0]), m->v[r] = v[r] * (hi[1] - lo[1]), m->n[r] = nn[r];
+            m->mid[r] = m->o[r] + 0.5f * (m->u[r] + m->v[r]);
+        }
+        float p[3] = {m->mid[0] + nn[0] * 16, m->mid[1] + nn[1] * 16, m->mid[2] + nn[2] * 16};
+        float p2[3] = {m->mid[0] + nn[0] * 120, m->mid[1] + nn[1] * 120, m->mid[2] + nn[2] * 120};
+        if (!windows_roofed(w, p) || !windows_roofed(w, p2)) continue;
+        const float *rf = w->texdata[ti->texdata].reflectivity;
+        float lum = 0.2126f * rf[0] + 0.7152f * rf[1] + 0.0722f * rf[2];
+        float b = fminf(fmaxf(lum / 0.25f, 0.3f), 1.5f), moon[3] = {0.55f, 0.65f, 0.85f};
+        for (int r = 0; r < 3; r++) m->c[r] = 1.6f * b * (0.5f * moon[r] + 0.5f * (lum > 0.001f ? rf[r] / lum * 0.7f : moon[r]));
+        n++;
+    }
+    os_unfair_lock_lock(&windows_lock);
+    free(map_windows);
+    map_windows = list, map_nwindows = n;
+    os_unfair_lock_unlock(&windows_lock);
+    fprintf(stderr, "[metal] volumetric light: %d windows into rooms in %s\n", n, w->name);
+}
+
 void bl_shadow_note_map(const struct bl_bsp_world *w, const char *host_path)
 {
     wet_note_map(host_path);
+    windows_note_map(w);
     long n = 0;
     for (int i = 0; i < w->nfaces; i++) {
         const struct bl_bsp_face *f = &w->faces[i];
@@ -5083,6 +5457,9 @@ static int pshadow_prepare(const struct ao_params *ap)
     }
     LOG_ONCE("[metal] object shadows: %d lights, %ld + %ld triangles, views %d across\n", ns, pshadow_world, pshadow_props,
              env_pshadow_res);
+    fog_views = pshadow_views, fog_nviews = ns, fog_view_res = env_pshadow_res;
+    for (int i = 0; i < ns; i++) fog_view_light[i] = a->index[i], fog_view_slice[i] = a->light[i][3];
+    memcpy(fog_view_rot, a->inv, sizeof fog_view_rot);
     if (getenv("BL_PROP_SHADOWS_LOG") && frames % 60 == 0)
         for (int j = 0, i; j < ns && (i = pick[j]) >= 0; j++)
             fprintf(stderr, "[metal] object shadows: frame %lu light %d at %.0f %.0f %.0f colour %.0f %.0f %.0f spot %d, camera %.0f %.0f %.0f\n",
@@ -5921,9 +6298,11 @@ static int taa_resolve(id<MTLTexture> color, id<MTLTexture> out)
     stretch_draw(color, r, taa_in, r, 0);
     mtl4_track(taa_in), mtl4_track(taa_z), mtl4_track(taa_mv), mtl4_track(taa_out);
     if (fsr) {
+        // The options' Sharpening box turns FSR 4's own sharpening off too.
+        float rcas = env_sharpen ? fsr4_sharpness : 0;
         FSR4MtlDispatch f = {taa_in, taa_mv, taa_z, taa_out, (uint32_t)w, (uint32_t)h,
                              taa_jitter_sign * taa_jitter[0], taa_jitter_sign * taa_jitter[1], (float)w, (float)h,
-                             1, fsr4_sharpness, fsr4_sharpness > 0, taa_reset != 0, false, true};
+                             1, rcas, rcas > 0, taa_reset != 0, false, true};
         if (!fsr4_encode(fsr4, command_buffer(), &f)) bl_fatal("FSR 4: %s", fsr4_error(fsr4));
     } else {
         taa_scaler.colorTexture = taa_in;
@@ -5984,6 +6363,385 @@ static void world_depth_up(id<MTLTexture> from, id<MTLTexture> to)
     [e setFragmentBytes:k length:sizeof k atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
+}
+
+// --- depth of field --------------------------------------------------------------------------
+//
+// BL_DOF (the Enhanced tab's "Depth of Field", default on). In play the focus is what lies
+// in the middle of the screen (the mean of 5 x 5 points there in dioptres, eased over a few
+// frames as an eye or a camera's autofocus refocuses), but never further than DOF_FAR world
+// units, so the distance always softens. Only what lies behind the focus blurs: nothing
+// from the focus to about its own distance again, then more up to ten times as far, to
+// DOF_PLAY_MOST of the picture's height, twice that while the focus is within 100 units
+// (looking at something close, as a lens at close range). Nothing in front blurs. In a
+// conversation (while the dialogue screen paints, bl_dialog_focus) it turns over a third
+// of a second into a film's close-up: the one spoken to sharp and what lies behind soft.
+// That focus is the nearest thing in the middle of the picture (the camera frames the face
+// there), followed over a few frames (dof_focus, one thread, into its buffer); that blur
+// grows with how far behind the focus a pixel lies, up to DOF_MOST of the picture's height,
+// a little for what is well in front. Either way: 40 taps on a disc
+// (golden angle), turned per pixel and frame for the temporal scaler to smooth. A tap counts
+// only if its own blur reaches the pixel, so the sharp face does not smear into the
+// background, and bright taps count a little more, so lamps open into discs. It runs on the
+// finished world view (dof_run, from pass()), before the scaler, view model and HUD.
+
+#define DOF_MOST 0.009f
+#define DOF_PLAY_MOST 0.004f
+#define DOF_FAR 800.0f
+
+__attribute__((weak)) float bl_dialog_focus(void);
+
+static float dof_amount;  // 0..1, faded towards whether a conversation is up
+static int dof_reset;     // the focus starts again (a new conversation)
+
+// Once per world view (post_run): the fade, and whether the pass is due.
+static void dof_step(void)
+{
+    int talking = env_dof && bl_dialog_focus && bl_dialog_focus() > 0;
+    if (talking && dof_amount == 0) dof_reset = 1;
+    dof_amount = talking ? fminf(dof_amount + 0.05f, 1) : fmaxf(dof_amount - 0.05f, 0);
+    dof_now = env_dof;
+}
+
+// play_most: the most blur in play, in pixels; far: the furthest the focus goes in play.
+struct dof_params { float alpha, beta, amount, most, size[2], frame, reset, play_most, far, pad[2]; };
+
+static NSString *const dof_source =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct DP { float alpha, beta, amount, most; float2 size; float frame, reset, play_most, far, pad0, pad1; };\n"
+     "struct V { float4 pos [[position]]; };\n"
+     "vertex V dof_vs(uint id [[vertex_id]]) {\n"
+     "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
+     "static float lin(constant DP &a, float z) { return a.beta / min(z - a.alpha, -1e-7); }\n"
+     // The focus: the nearest of 9 x 9 points over the middle fifth across and third down,
+     // eased towards from the last frame's.
+     "kernel void dof_focus(depth2d<float> dt [[texture(0)]], device float *f [[buffer(0)]], constant DP &a [[buffer(1)]]) {\n"
+     "    float n = 1e9;\n"
+     "    for (int y = 0; y < 9; y++)\n"
+     "        for (int x = 0; x < 9; x++) {\n"
+     "            float2 u = float2(0.4 + 0.025 * float(x), 0.33 + 0.0417 * float(y));\n"
+     "            n = min(n, lin(a, dt.read(uint2(u * a.size))));\n"
+     "        }\n"
+     "    f[0] = a.reset > 0.0 || f[0] <= 0.0 ? n : mix(f[0], n, 0.15);\n"
+     // In play: the mean in dioptres of 5 x 5 points over the middle 6% across and 8% down.
+     "    float dp = 0.0;\n"
+     "    for (int y = 0; y < 5; y++)\n"
+     "        for (int x = 0; x < 5; x++) {\n"
+     "            float2 u = float2(0.47 + 0.015 * float(x), 0.46 + 0.02 * float(y));\n"
+     "            dp += 1.0 / min(lin(a, dt.read(uint2(u * a.size))), 1e5);\n"
+     "        }\n"
+     "    dp /= 25.0;\n"
+     "    f[1] = f[1] <= 0.0 ? 1.0 / dp : 1.0 / mix(1.0 / f[1], dp, 0.12); }\n"
+     // The blur at view depth w, in pixels: play's (focus fp), the close-up's in a
+     // conversation (focus ft), between them as it turns.
+     "static float coc(constant DP &a, float fp, float ft, float w) {\n"
+     "    float fe = min(fp, a.far);\n"
+     "    float play = a.play_most * (1.0 + saturate(100.0 / fe)) * smoothstep(0.5, 0.9, 1.0 - fe / w);\n"
+     "    float back = smoothstep(0.04, 0.55, 1.0 - ft / w), front = smoothstep(0.35, 1.5, ft / w - 1.0);\n"
+     "    return mix(play, a.most * (back + 0.4 * front), a.amount); }\n"
+     "fragment float4 dof_main(V in [[stage_in]], texture2d<float> src [[texture(0)]], depth2d<float> dt [[texture(1)]],\n"
+     "                         const device float *f [[buffer(0)]], constant DP &a [[buffer(1)]]) {\n"
+     "    constexpr sampler ls(filter::linear, address::clamp_to_edge);\n"
+     "    constexpr sampler ps(filter::nearest, address::clamp_to_edge);\n"
+     "    float2 p = in.pos.xy, inv = 1.0 / a.size;\n"
+     "    float ft = f[0], fp = f[1];\n"
+     "    float4 c0 = src.read(uint2(p));\n"
+     "    float r0 = coc(a, fp, ft, lin(a, dt.read(uint2(p))));\n"
+     "    if (!(r0 >= 0.5) || any(!isfinite(c0.rgb))) return c0;\n"
+     "    float turn = 6.2831853 * fract(52.9829189 * fract(dot(p + a.frame * 5.588238, float2(0.06711056, 0.00583715))));\n"
+     "    float3 sum = c0.rgb; float ws = 1.0;\n"
+     "    for (int i = 0; i < 40; i++) {\n"
+     "        float t = (float(i) + 0.5) / 40.0, ang = float(i) * 2.3999632 + turn;\n"
+     "        float2 o = sqrt(t) * r0 * float2(cos(ang), sin(ang));\n"
+     "        float2 uv = (p + o) * inv;\n"
+     "        float r = coc(a, fp, ft, lin(a, dt.sample(ps, uv)));\n"
+     "        float w = saturate(r - length(o) + 1.0);\n"
+     "        float3 c = src.sample(ls, uv).rgb;\n"
+     "        if (any(!isfinite(c)) || !(w > 0.0)) continue;\n"
+     "        w *= 1.0 + 3.0 * saturate(dot(c, float3(0.2126, 0.7152, 0.0722)) - 0.7);\n"
+     "        sum += c * w, ws += w;\n"
+     "    }\n"
+     "    return float4(sum / ws, c0.a); }\n";
+
+static id<MTLLibrary> dof_library(void)
+{
+    static id<MTLLibrary> lib;
+    if (!lib) {
+        NSError *error = nil;
+        lib = [mtl newLibraryWithSource:dof_source options:nil error:&error];
+        if (!lib) bl_fatal("depth of field shader: %s", error.localizedDescription.UTF8String);
+    }
+    return lib;
+}
+
+// From pass(), on the pass that ends the world view: the picture copied, the focus found,
+// the blurred picture drawn over it; then the pass reopened as it was.
+static void dof_run(id<MTLTexture> color, id<MTLTexture> depth, MTL4RenderPassDescriptor *d)
+{
+    [enc endEncoding];
+    static id<MTLBuffer> focus;
+    if (!focus) {
+        focus = [mtl newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        memset(focus.contents, 0, 16);
+    }
+    struct dof_params a = {view_proj.alpha, view_proj.beta, dof_amount, DOF_MOST * (float)color.height,
+                           {(float)color.width, (float)color.height}, (float)(frames % 64), (float)dof_reset,
+                           DOF_PLAY_MOST * (float)color.height, DOF_FAR};
+    dof_reset = 0;
+    id<MTLTexture> copy = ao_texture(28, color.pixelFormat, color.width, color.height);
+    BLCompute *c = stat_compute("dof");
+    [c copyFromTexture:color toTexture:copy];
+    static id<MTLComputePipelineState> k;
+    [c setComputePipelineState:kernel_of(dof_library(), @"dof_focus", &k)];
+    [c setTexture:depth atIndex:0];
+    [c setBuffer:focus offset:0 atIndex:0];
+    [c setBytes:&a length:sizeof a atIndex:1];
+    [c dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [c endEncoding];
+    static id<MTLRenderPipelineState> p;
+    static MTLPixelFormat pf;
+    if (!p || pf != color.pixelFormat) {
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [dof_library() newFunctionWithName:@"dof_vs"];
+        pd.fragmentFunction = [dof_library() newFunctionWithName:@"dof_main"];
+        pd.colorAttachments[0].pixelFormat = pf = color.pixelFormat;
+        NSError *error = nil;
+        p = [mtl newRenderPipelineStateWithDescriptor:pd error:&error];
+        if (!p) bl_fatal("depth of field pipeline: %s", error.localizedDescription.UTF8String);
+    }
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.colorAttachments[0].texture = color;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    BLRender *e = stat_render(rp, "dof");
+    [e setRenderPipelineState:p];
+    [e setCullMode:MTLCullModeNone];
+    [e setViewport:(MTLViewport){0, 0, color.width, color.height, 0, 1}];
+    [e setScissorRect:(MTLScissorRect){0, 0, color.width, color.height}];
+    [e setFragmentTexture:copy atIndex:0];
+    [e setFragmentTexture:depth atIndex:1];
+    [e setFragmentBuffer:focus offset:0 atIndex:0];
+    [e setFragmentBytes:&a length:sizeof a atIndex:1];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    for (int i = 0; i < 4; i++)
+        if (d.colorAttachments[i].texture) d.colorAttachments[i].loadAction = MTLLoadActionLoad;
+    d.depthAttachment.loadAction = d.stencilAttachment.loadAction = MTLLoadActionLoad;
+    enc = stat_render(d, "pass");
+}
+
+// --- motion blur ----------------------------------------------------------------------------
+//
+// BL_MBLUR (the Enhanced tab's "Motion Blur", default on): a camera's blur over its shutter,
+// set by what moves. It reads the temporal scaler's motion vectors (taa_motion: the view's
+// own from the depth, the characters' drawn over them), so it needs the scaler running. Each
+// pixel's motion is split into the view's (the depth taken back through the last frame's
+// camera, as taa_motion does) and its own (the rest: a character walking, an arm swinging).
+// Its own is blurred in full; the view's only once it is fast (a quick turn), easing in
+// from MBLUR_VIEW_FROM to MBLUR_VIEW_FULL of the picture's height, so walking and looking
+// round stay sharp. Both are scaled to a shutter open MBLUR_SHUTTER seconds, whatever the
+// frame rate, and kept under MBLUR_MOST of the height. As the published reconstruction
+// filter does it: the largest motion over 16-pixel tiles and their neighbours, so a moving
+// arm smears over the still wall beside it; then 12 taps along that motion, each counted
+// where its own blur reaches the pixel when it lies in front, the pixel's when behind
+// (mblur_vel, mblur_tile, mblur_near, mblur_main). Runs after the depth of field, before the
+// scaler, view model and HUD.
+
+#define MBLUR_SHUTTER (1.0f / 120)
+#define MBLUR_MOST 0.03f
+#define MBLUR_VIEW_FROM 0.015f
+#define MBLUR_VIEW_FULL 0.05f
+#define MBLUR_TILE 16
+
+static float mblur_scale;  // this frame: the shutter over the time since the last
+
+// Once per world view (post_run, after taa_motion): whether it is due, and the shutter's share.
+static void mblur_step(void)
+{
+    static uint64_t last;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    float dt = last ? (float)(now - last) * 1e-9f : 1.0f / 60;
+    last = now;
+    dt = fminf(fmaxf(dt, 1.0f / 240), 1.0f / 20);
+    mblur_scale = MBLUR_SHUTTER / dt;
+    mblur_now = env_mblur && taa_pending;
+}
+
+struct mblur_params {
+    float reproj[4][4];  // taa_motion's, as columns
+    float size[2], offset[2];
+    float alpha, beta, scale, most;
+    float view_from, view_full, frame, tile;
+};
+
+static NSString *const mblur_source =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct MP { float4x4 reproj; float2 size, offset; float alpha, beta, scale, most, view_from, view_full, frame, tile; };\n"
+     "struct V { float4 pos [[position]]; };\n"
+     "vertex V mblur_vs(uint id [[vertex_id]]) {\n"
+     "    V v; float2 t = float2((id << 1) & 2, id & 2); v.pos = float4(t * 2.0 - 1.0, 0.0, 1.0); return v; }\n"
+     // The blur at a pixel, in pixels: its own motion in full, the view's once fast.
+     "kernel void mblur_vel(depth2d<float> z [[texture(0)]], texture2d<float> mv [[texture(1)]],\n"
+     "                      texture2d<float, access::write> out [[texture(2)]], constant MP &p [[buffer(0)]],\n"
+     "                      uint2 gid [[thread_position_in_grid]]) {\n"
+     "    if (any(float2(gid) >= p.size)) return;\n"
+     "    float d = z.read(gid);\n"
+     "    float2 ndc = float2((float(gid.x) + 0.5) / p.size.x * 2.0 - 1.0, 1.0 - (float(gid.y) + 0.5) / p.size.y * 2.0) - p.offset;\n"
+     "    float4 q = p.reproj * float4(ndc, d, 1.0);\n"
+     "    float2 view = (q.w > 1e-6 ? q.xy / q.w - ndc : float2(0.0)) * float2(0.5, -0.5) * p.size;\n"
+     "    float2 mo = mv.read(gid).xy * p.size;\n"
+     "    float2 own = mo - view;\n"
+     "    if (dot(own, own) < 0.25) own = 0.0;\n"
+     "    float vl = length(view) * p.scale;\n"
+     "    float2 b = (own + view * smoothstep(p.view_from, p.view_full, vl)) * p.scale;\n"
+     "    float l = length(b);\n"
+     "    if (!isfinite(l)) b = 0.0;\n"
+     "    else if (l > p.most) b *= p.most / l;\n"
+     "    out.write(float4(b, 0.0, 0.0), gid); }\n"
+     // The largest blur over each tile (every other pixel), then over each tile's neighbours.
+     "kernel void mblur_tile(texture2d<float> vel [[texture(0)]], texture2d<float, access::write> out [[texture(1)]],\n"
+     "                       constant MP &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {\n"
+     "    if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;\n"
+     "    int t = int(p.tile); float2 best = 0.0; float bl = 0.0;\n"
+     "    for (int y = 0; y < t; y += 2)\n"
+     "        for (int x = 0; x < t; x += 2) {\n"
+     "            uint2 q = min(gid * uint(t) + uint2(x, y), uint2(p.size) - 1);\n"
+     "            float2 v = vel.read(q).xy; float l = dot(v, v);\n"
+     "            if (l > bl) bl = l, best = v;\n"
+     "        }\n"
+     "    out.write(float4(best, 0.0, 0.0), gid); }\n"
+     "kernel void mblur_near(texture2d<float> tiles [[texture(0)]], texture2d<float, access::write> out [[texture(1)]],\n"
+     "                       uint2 gid [[thread_position_in_grid]]) {\n"
+     "    int2 m = int2(tiles.get_width(), tiles.get_height()) - 1;\n"
+     "    if (gid.x > uint(m.x) || gid.y > uint(m.y)) return;\n"
+     "    float2 best = 0.0; float bl = 0.0;\n"
+     "    for (int y = -1; y <= 1; y++)\n"
+     "        for (int x = -1; x <= 1; x++) {\n"
+     "            float2 v = tiles.read(uint2(clamp(int2(gid) + int2(x, y), int2(0), m))).xy; float l = dot(v, v);\n"
+     "            if (l > bl) bl = l, best = v;\n"
+     "        }\n"
+     "    out.write(float4(best, 0.0, 0.0), gid); }\n"
+     "static float lin(constant MP &p, float z) { return p.beta / min(z - p.alpha, -1e-7); }\n"
+     "fragment float4 mblur_main(V in [[stage_in]], texture2d<float> src [[texture(0)]], depth2d<float> z [[texture(1)]],\n"
+     "                           texture2d<float> vel [[texture(2)]], texture2d<float> nearest [[texture(3)]],\n"
+     "                           constant MP &p [[buffer(0)]]) {\n"
+     "    constexpr sampler ls(filter::linear, address::clamp_to_edge);\n"
+     "    uint2 ip = uint2(in.pos.xy);\n"
+     "    float4 c0 = src.read(ip);\n"
+     "    float2 vn = nearest.read(ip / uint(p.tile)).xy;\n"
+     "    float ln = length(vn);\n"
+     "    if (!(ln >= 0.5) || !isfinite(ln) || any(!isfinite(c0.rgb))) return c0;\n"
+     "    float w0 = lin(p, z.read(ip));\n"
+     "    float lc = length(vel.read(ip).xy);\n"
+     "    float j = fract(52.9829189 * fract(dot(in.pos.xy + p.frame * 5.588238, float2(0.06711056, 0.00583715)))) - 0.5;\n"
+     "    float3 sum = c0.rgb / max(lc, 1.0); float ws = 1.0 / max(lc, 1.0);\n"
+     "    for (int i = 0; i < 12; i++) {\n"
+     "        float t = ((float(i) + 0.5 + j) / 12.0 - 0.5) * ln;\n"
+     "        float2 q = in.pos.xy + vn / ln * t;\n"
+     "        uint2 iq = uint2(clamp(q, float2(0.0), p.size - 1.0));\n"
+     "        float ws_ = lin(p, z.read(iq)), ls_ = length(vel.read(iq).xy);\n"
+     "        float front = saturate((w0 - ws_) / (0.02 * w0 + 1.0)), back = 1.0 - front;\n"
+     "        float at = abs(t);\n"
+     "        float w = front * saturate(1.0 - at / max(0.5 * ls_, 0.5)) + back * saturate(1.0 - at / max(0.5 * lc, 0.5));\n"
+     "        float3 c = src.sample(ls, q / p.size).rgb;\n"
+     "        if (any(!isfinite(c)) || !(w > 0.0)) continue;\n"
+     "        sum += c * w, ws += w;\n"
+     "    }\n"
+     "    return float4(sum / ws, c0.a); }\n";
+
+static id<MTLLibrary> mblur_library(void)
+{
+    static id<MTLLibrary> lib;
+    if (!lib) {
+        NSError *error = nil;
+        lib = [mtl newLibraryWithSource:mblur_source options:nil error:&error];
+        if (!lib) bl_fatal("motion blur shader: %s", error.localizedDescription.UTF8String);
+    }
+    return lib;
+}
+
+// The blur's own textures (0 the picture's copy, 1 the blur per pixel, 2 the tiles', 3
+// their neighbours'), kept while the size holds.
+static id<MTLTexture> mblur_texture(int i, MTLPixelFormat pf, NSUInteger w, NSUInteger h)
+{
+    static id<MTLTexture> t[4];
+    if (!t[i] || t[i].width != w || t[i].height != h || t[i].pixelFormat != pf) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | (i ? MTLTextureUsageShaderWrite : 0);
+        td.storageMode = MTLStorageModePrivate;
+        t[i] = [mtl newTextureWithDescriptor:td];
+    }
+    return t[i];
+}
+
+// From pass(), on the pass that ends the world view, after the depth of field: the
+// picture blurred along what moves; then the pass reopened as it was.
+static void mblur_run(id<MTLTexture> color, id<MTLTexture> depth, MTL4RenderPassDescriptor *d)
+{
+    if (!taa_mv || taa_mv.width != color.width || taa_mv.height != color.height) return;
+    [enc endEncoding];
+    NSUInteger w = color.width, h = color.height, tw = (w + MBLUR_TILE - 1) / MBLUR_TILE, th = (h + MBLUR_TILE - 1) / MBLUR_TILE;
+    struct mblur_params a;
+    memcpy(a.reproj, ssr_reproj.reproj, sizeof a.reproj);
+    a.size[0] = (float)w, a.size[1] = (float)h;
+    memcpy(a.offset, ssr_reproj.offset, sizeof a.offset);
+    a.alpha = view_proj.alpha, a.beta = view_proj.beta, a.scale = mblur_scale, a.most = MBLUR_MOST * (float)h;
+    a.view_from = MBLUR_VIEW_FROM * (float)h, a.view_full = MBLUR_VIEW_FULL * (float)h;
+    a.frame = (float)(frames % 64), a.tile = MBLUR_TILE;
+    id<MTLTexture> copy = mblur_texture(0, color.pixelFormat, w, h), vel = mblur_texture(1, MTLPixelFormatRG16Float, w, h);
+    id<MTLTexture> tiles = mblur_texture(2, MTLPixelFormatRG16Float, tw, th), nearest = mblur_texture(3, MTLPixelFormatRG16Float, tw, th);
+    BLCompute *c = stat_compute("mblur");
+    [c copyFromTexture:color toTexture:copy];
+    static id<MTLComputePipelineState> kv, kt, kn;
+    [c setComputePipelineState:kernel_of(mblur_library(), @"mblur_vel", &kv)];
+    [c setTexture:depth atIndex:0];
+    [c setTexture:taa_mv atIndex:1];
+    [c setTexture:vel atIndex:2];
+    [c setBytes:&a length:sizeof a atIndex:0];
+    [c dispatchAlongside:MTLSizeMake((w + 7) / 8, (h + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [c setComputePipelineState:kernel_of(mblur_library(), @"mblur_tile", &kt)];
+    [c setTexture:vel atIndex:0];
+    [c setTexture:tiles atIndex:1];
+    [c setBytes:&a length:sizeof a atIndex:0];
+    [c dispatchThreadgroups:MTLSizeMake((tw + 7) / 8, (th + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [c setComputePipelineState:kernel_of(mblur_library(), @"mblur_near", &kn)];
+    [c setTexture:tiles atIndex:0];
+    [c setTexture:nearest atIndex:1];
+    [c dispatchThreadgroups:MTLSizeMake((tw + 7) / 8, (th + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [c endEncoding];
+    static id<MTLRenderPipelineState> p;
+    static MTLPixelFormat pf;
+    if (!p || pf != color.pixelFormat) {
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [mblur_library() newFunctionWithName:@"mblur_vs"];
+        pd.fragmentFunction = [mblur_library() newFunctionWithName:@"mblur_main"];
+        pd.colorAttachments[0].pixelFormat = pf = color.pixelFormat;
+        NSError *error = nil;
+        p = [mtl newRenderPipelineStateWithDescriptor:pd error:&error];
+        if (!p) bl_fatal("motion blur pipeline: %s", error.localizedDescription.UTF8String);
+    }
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.colorAttachments[0].texture = color;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    BLRender *e = stat_render(rp, "mblur");
+    [e setRenderPipelineState:p];
+    [e setCullMode:MTLCullModeNone];
+    [e setViewport:(MTLViewport){0, 0, w, h, 0, 1}];
+    [e setScissorRect:(MTLScissorRect){0, 0, w, h}];
+    [e setFragmentTexture:copy atIndex:0];
+    [e setFragmentTexture:depth atIndex:1];
+    [e setFragmentTexture:vel atIndex:2];
+    [e setFragmentTexture:nearest atIndex:3];
+    [e setFragmentBytes:&a length:sizeof a atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    for (int i = 0; i < 4; i++)
+        if (d.colorAttachments[i].texture) d.colorAttachments[i].loadAction = MTLLoadActionLoad;
+    d.depthAttachment.loadAction = d.stencilAttachment.loadAction = MTLLoadActionLoad;
+    enc = stat_render(d, "pass");
 }
 
 // From pass(), for the pass that ends the world view (its effects drawn in): the picture
@@ -6277,9 +7035,12 @@ static id<MTLTexture> bloom_run(id<MTLTexture> color)
 
 // The lamps' glare (BL_GLARE, the Enhanced tab's "Lens Glare", default on), as a camera's
 // lens streaks a bright light at night: what is past BL_GLARE_THRESHOLD (1, white), at a
-// quarter size, streaked a long way sideways (three steps of seven reads, 1, 4 and 16
-// apart, fading over about 30 pixels) and a little up and down (two steps, over about 8),
-// and post_apply adds BL_GLARE_STRENGTH (0.8) of it after the bloom.
+// quarter size, streaked a long way sideways (four steps of seven reads, 1, 3, 9 and 27
+// apart, fading over about 30 pixels) and a little up and down (two steps, 1 and 3, over
+// about 8), and post_apply adds BL_GLARE_STRENGTH (0.8) of it after the bloom. Each step's
+// reads are no further apart than the last step's streak is wide, so the streak is smooth:
+// with steps of 4 and 16 it came out as copies of a long bright thing (a wet traffic
+// light's arm) a step apart.
 struct glare_params {
     float src[2], dir[2];       // the source's size in pixels; the streak's way
     float step, fade;           // the reads' spacing; the weight's fall a pixel
@@ -6339,12 +7100,13 @@ static id<MTLTexture> glare_run(id<MTLTexture> color)
     g.src[0] = (float)w, g.src[1] = (float)h;
     g.dir[0] = 1, g.dir[1] = 0, g.fade = expf(-1 / 30.0f);
     g.step = 1, glare_pass(@"glare_streak", a, bright, nil, &g);
-    g.step = 4, glare_pass(@"glare_streak", b, a, nil, &g);
-    g.step = 16, glare_pass(@"glare_streak", a, b, nil, &g);
+    g.step = 3, glare_pass(@"glare_streak", b, a, nil, &g);
+    g.step = 9, glare_pass(@"glare_streak", a, b, nil, &g);
+    g.step = 27, glare_pass(@"glare_streak", b, a, nil, &g);
     g.dir[0] = 0, g.dir[1] = 1, g.fade = expf(-1 / 8.0f);
-    g.step = 1, glare_pass(@"glare_streak", b, bright, nil, &g);
-    g.step = 4, glare_pass(@"glare_streak", v, b, nil, &g);
-    glare_pass(@"glare_mix", out, a, v, &g);
+    g.step = 1, glare_pass(@"glare_streak", a, bright, nil, &g);
+    g.step = 3, glare_pass(@"glare_streak", v, a, nil, &g);
+    glare_pass(@"glare_mix", out, b, v, &g);
     return out;
 }
 
@@ -6754,6 +7516,7 @@ static id<MTLTexture> ssil_run(id<MTLTexture> out, id<MTLTexture> edges, id<MTLT
 static struct ao_params ao_result_params;
 static struct ssr_params post_params;
 
+static void hair_run(id<MTLTexture> color, id<MTLTexture> depth);
 static void post_run(struct d3d_state *s)
 {
     view_state = 2;
@@ -6765,13 +7528,18 @@ static void post_run(struct d3d_state *s)
     id<MTLTexture> color = target_texture(bb);
     id<MTLTexture> depth = target_texture(ds);
     if (depth.width != color.width || depth.height != color.height) return;
+    dof_step();
+    hair_run(color, depth);
     id<MTLTexture> window = target_full(bb);  // the size the scaler brings it to
     taa_pending = taa_motion(depth, color.width, color.height, window.width, window.height);
+    mblur_step();
     NSUInteger hw = (color.width + 1) / 2, hh = (color.height + 1) / 2;
     int wet = wet_on() && info_frame == frames;
     int reflect = (env_ssr || wet) && info_frame == frames, skin = env_sss && info_frame == frames;
     int contact = contact_on() && info_frame == frames;
-    int pshadow = pshadow_on() && pshadow_ready();
+    // The object shadows' views serve them and the haze's beams.
+    int views = (pshadow_on() || env_fog) && pshadow_ready(), pshadow = pshadow_on() && views;
+    fog_views = nil;
     id<MTLTexture> z = ao_texture(0, MTLPixelFormatR32Float, hw, hh);
     struct ao_params a = {{(float)color.width, (float)color.height}, {(float)hw, (float)hh}, view_proj.alpha,
                           view_proj.beta, view_proj.p00, view_proj.p11, env_ao_radius,
@@ -6779,7 +7547,7 @@ static void post_run(struct d3d_state *s)
                           taa_pending ? (float)(frames % 64) : 0, 1, taa_pending ? 2.0f : 3.0f, env_ao_power};
     int ssil = env_ssil && albedo_frame == frames;
     if (env_ao || reflect || env_fog || skin || contact || ssil || pshadow) ao_pass(0, z, depth, nil, &a);
-    if (pshadow) pshadow = pshadow_prepare(&a);
+    if (views && !pshadow_prepare(&a)) pshadow = 0;
     int bloom = env_bloom && (long)frames >= env_bloom_at, eye = env_exposure && (long)frames >= env_bloom_at;
     int glare = env_glare && (long)frames >= env_bloom_at;
     int post = reflect || env_tonemap || env_hdr || env_fog || skin || bloom || eye || ssil || glare;
@@ -6815,7 +7583,7 @@ static void post_run(struct d3d_state *s)
             static int which;
             id<MTLTexture> prev = ao_texture(21 + which, MTLPixelFormatRG32Float, hw, hh);
             id<MTLTexture> next = ao_texture(22 - which, MTLPixelFormatRG32Float, hw, hh);
-            if (last == frames - 1 && !taa_reset) ao_pass3(6, next, soft, prev, taa_mv, &a);
+            if (last == frames - 1 && !taa_reset) ao_pass4(6, next, soft, prev, taa_mv, raw, &a);
             else {
                 BLCompute *blit = stat_compute(__func__);
                 [blit copyFromTexture:soft toTexture:next];
@@ -7113,6 +7881,10 @@ struct hair_swap {
     id<MTLBuffer> base_ib;  // with strips: the game's triangles drawn under them (nil: all)
     uint32_t nbase_idx;
     id<MTLTexture> base_tex;  // and their colour texture, matched to the strips (nil: the game's)
+    id<MTLBuffer> strand;     // strands: each point's colour and half-width (world units); nil: strips
+    uint32_t npts;            // strands: the points (vb's vertices); ib holds their segments, two each
+    id<MTLBuffer> cap, col;   // strands: their points captured each frame (hair_capture)
+    id<MTLBuffer> base_vb;    // strands: the game's vertices for the base, pulled in under them
 };
 static struct hair_swap *hair_swap;  // the draw's, while d3d_render_draw draws it
 // The lightmap page the draw reads smoothly (lightmap_for), and the samplers (bit n) reading it.
@@ -7214,6 +7986,374 @@ static void hair_before_draw(struct d3d_state *s)
     [blit copyFromTexture:src toTexture:hair_depth];
     [blit endEncoding];
     hair_depth_frame = frames, hair_others = 0;
+}
+
+// Hair strands drawn by the renderer itself (tex_detail.h bl_hair_mesh strand), after
+// Scthe's frostbitten-hair-webgpu (MIT): no triangles, each strand a line of its true
+// width, the share of each pixel it covers worked out exactly and the strands blended
+// front to back, so thin hair stays smooth instead of breaking into blocks.
+// The game draws the strand points (setup_draw, variant strand), which captures each
+// point's clip position and smooth normal and its colour as the game lights it
+// (hair_capture). After the world view (post_run), hair_run: each segment to the screen,
+// shone with the character lights (Kajiya-Kay, as ps_detail shines hair) and counted into
+// the 16x16 tiles it crosses; the counts summed to each tile's start in one list; the
+// segments written into it; then a group a tile, each thread a pixel, the tile's segments
+// read in batches of 256: the nearest 8 kept by depth, the rest blended behind them, each
+// faded where it meets what is drawn (the head) and darker at its roots. The result is
+// laid over the world view, its pixels marked as not skin for the passes after.
+static const char *const hair_source =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct HP {\n"
+    "    float4 vp;    // the viewport: x, y, width, height in pixels\n"
+    "    float4 proj;  // depth alpha, beta (depth = alpha + beta / w), p00, p11\n"
+    "    float4 look;  // shine, glow from behind, root darkening, soft edge (world units)\n"
+    "    uint nseg, npts, nlights, ntiles; uint tiles_x, tiles_y, cap, pad;\n"
+    "};\n"
+    "struct FL { float4 pos, color, dir, att; };\n"
+    // A segment on the screen: its ends in pixels, their w and half-widths in pixels
+    // (0: not drawn), their colours.
+    "struct Seg { float4 ab; float4 wh; float4 ca, cb; };\n"
+    "static float2 hair_px(constant HP &h, float4 p) {\n"
+    "    return h.vp.xy + float2(p.x / p.w * 0.5 + 0.5, 0.5 - p.y / p.w * 0.5) * h.vp.zw;\n"
+    "}\n"
+    // Whether a segment (ends a, b, reach r) comes near a tile.
+    "static bool hair_tile_hit(float2 a, float2 b, float r, uint tx, uint ty) {\n"
+    "    float2 c = float2(tx, ty) * 16.0 + 8.0, d = b - a;\n"
+    "    float t = dot(d, d) > 1e-8 ? saturate(dot(c - a, d) / dot(d, d)) : 0.0;\n"
+    "    return length(c - (a + t * d)) <= r + 11.32;\n"
+    "}\n"
+    "static float3 hair_shine(constant HP &h, constant FL *L, float3 c, float3 alb, float3 P, float3 N, float3 T) {\n"
+    "    float3 V = -normalize(P);\n"
+    "    float E = 0.0, S = 0.0, Sh = 0.0, Tr = 0.0, Et = 0.0;\n"
+    "    for (uint k = 0; k < h.nlights; k++) {\n"
+    "        FL l = L[k];\n"
+    "        float3 v = l.pos.xyz - P;\n"
+    "        float d2 = max(dot(v, v), 64.0), dd = sqrt(d2);\n"
+    "        float3 Ld = v / dd;\n"
+    "        float e = dot(l.color.xyz, float3(0.2126, 0.7152, 0.0722)) / (l.att.x + l.att.y * dd + l.att.z * d2);\n"
+    "        if (l.pos.w > 0.0) { float x = dd / l.pos.w; e *= saturate(1.0 - x * x * x * x); }\n"
+    "        if (dot(l.dir.xyz, l.dir.xyz) > 0.25) {\n"
+    "            float cs = dot(-Ld, l.dir.xyz);\n"
+    "            e *= cs <= l.dir.w ? 0.0 : saturate((cs - l.dir.w) / max(l.color.w - l.dir.w, 1e-4));\n"
+    "        }\n"
+    "        if (e <= 0.0) continue;\n"
+    "        E += e * (dot(N, Ld) * 0.5 + 0.5), Et += e;\n"
+    // Two lobes: a white one shifted towards the tips, a wider one in the hair's colour
+    // towards the roots; and light from behind, through the strands.
+    "        float3 H = normalize(Ld + V);\n"
+    "        float3 t1 = normalize(T - 0.08 * N), t2 = normalize(T + 0.12 * N);\n"
+    "        float h1 = dot(t1, H), h2 = dot(t2, H);\n"
+    "        float w = smoothstep(-0.3, 0.3, dot(N, Ld));\n"
+    "        S += e * w * pow(sqrt(saturate(1.0 - h1 * h1)), 90.0);\n"
+    "        Sh += e * w * pow(sqrt(saturate(1.0 - h2 * h2)), 22.0);\n"
+    "        Tr += e * pow(saturate(dot(Ld, -V)), 4.0);\n"
+    "    }\n"
+    "    if (E <= 1e-6) return c;\n"
+    "    float3 lt = c / max(alb, float3(0.02));\n"  // the game's light here
+    "    float3 sh = lt * (h.look.x / E) * (0.15 * S + 0.18 * Sh * alb) + lt * alb * (0.6 * h.look.y * Tr / max(Et, 1e-6));\n"
+    "    return c + min(sh, float3(1.0));\n"
+    "}\n"
+    "kernel void hair_clear(constant HP &h [[buffer(0)]], device uint *count [[buffer(7)]], uint i [[thread_position_in_grid]]) {\n"
+    "    if (i < h.ntiles) count[i] = 0;\n"
+    "}\n"
+    "kernel void hair_seg(constant HP &h [[buffer(0)]], device const uint *idx [[buffer(1)]],\n"
+    "                     device const float4 *cap [[buffer(2)]], device const float4 *col [[buffer(3)]],\n"
+    "                     device const float4 *st [[buffer(4)]], constant FL *L [[buffer(5)]],\n"
+    "                     device Seg *seg [[buffer(6)]], device atomic_uint *count [[buffer(7)]],\n"
+    "                     uint i [[thread_position_in_grid]]) {\n"
+    "    if (i >= h.nseg) return;\n"
+    "    uint ia = idx[2 * i], ib = idx[2 * i + 1];\n"
+    "    float4 pa = cap[2 * ia], pb = cap[2 * ib];\n"
+    "    Seg s;\n"
+    "    s.ab = 0, s.wh = 0, s.ca = 0, s.cb = 0;\n"
+    "    if (pa.w < 0.5 || pb.w < 0.5 || ia >= h.npts || ib >= h.npts) { seg[i] = s; return; }\n"
+    "    float2 a = hair_px(h, pa), b = hair_px(h, pb);\n"
+    "    float ha = st[ia].w * h.proj.z * 0.5 * h.vp.z / pa.w, hb = st[ib].w * h.proj.z * 0.5 * h.vp.z / pb.w;\n"
+    "    float r = max(ha, hb) + 1.0;\n"
+    "    float2 lo = min(a, b) - r, hi = max(a, b) + r;\n"
+    "    if (hi.x < 0.0 || hi.y < 0.0 || lo.x >= float(h.tiles_x * 16) || lo.y >= float(h.tiles_y * 16)) { seg[i] = s; return; }\n"
+    // Points the game drew off screen keep an old colour, or none: the other end's.
+    "    float4 ca = col[ia], cb = col[ib];\n"
+    "    if (ca.w <= 0.0) ca = cb;\n"
+    "    if (cb.w <= 0.0) cb = ca;\n"
+    "    if (ca.w <= 0.0) ca = cb = float4(st[ia].xyz * 0.3, 1.0);\n"
+    "    float3 Pa = float3(pa.x / h.proj.z, pa.y / h.proj.w, pa.w), Pb = float3(pb.x / h.proj.z, pb.y / h.proj.w, pb.w);\n"
+    "    float4 na = cap[2 * ia + 1], nb = cap[2 * ib + 1];\n"
+    "    float3 Na = float3(na.x / h.proj.z, na.y / h.proj.w, na.w), Nb = float3(nb.x / h.proj.z, nb.y / h.proj.w, nb.w);\n"
+    "    Na = dot(Na, Na) > 1e-12 ? normalize(Na) : float3(0.0, 0.0, -1.0);\n"
+    "    Nb = dot(Nb, Nb) > 1e-12 ? normalize(Nb) : Na;\n"
+    "    float3 T = Pb - Pa;\n"
+    "    T = dot(T, T) > 1e-12 ? normalize(T) : float3(0.0, 1.0, 0.0);\n"
+    "    s.ab = float4(a, b), s.wh = float4(pa.w, pb.w, ha, hb);\n"
+    "    s.ca = float4(hair_shine(h, L, ca.rgb, st[ia].xyz, Pa, Na, T), 1.0);\n"
+    "    s.cb = float4(hair_shine(h, L, cb.rgb, st[ib].xyz, Pb, Nb, T), 1.0);\n"
+    "    seg[i] = s;\n"
+    "    int2 t0 = max(int2(floor(lo / 16.0)), int2(0)), t1 = min(int2(floor(hi / 16.0)), int2(h.tiles_x, h.tiles_y) - 1);\n"
+    "    for (int ty = t0.y; ty <= t1.y; ty++)\n"
+    "        for (int tx = t0.x; tx <= t1.x; tx++)\n"
+    "            if (hair_tile_hit(a, b, r, uint(tx), uint(ty)))\n"
+    "                atomic_fetch_add_explicit(&count[uint(ty) * h.tiles_x + uint(tx)], 1u, memory_order_relaxed);\n"
+    "}\n"
+    // The counts summed into each tile's start in the list (one group of 1024).
+    "kernel void hair_scan(constant HP &h [[buffer(0)]], device const uint *count [[buffer(7)]],\n"
+    "                      device uint *offs [[buffer(8)]], device uint *cursor [[buffer(9)]],\n"
+    "                      uint t [[thread_position_in_threadgroup]]) {\n"
+    "    threadgroup uint part[1024];\n"
+    "    uint per = (h.ntiles + 1023) / 1024, b0 = t * per, b1 = min(b0 + per, h.ntiles), sum = 0;\n"
+    "    for (uint i = b0; i < b1; i++) sum += count[i];\n"
+    "    part[t] = sum;\n"
+    "    for (uint k = 1; k < 1024; k *= 2) {\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "        uint v = t >= k ? part[t - k] : 0;\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "        part[t] += v;\n"
+    "    }\n"
+    "    uint at = part[t] - sum;\n"
+    "    for (uint i = b0; i < b1; i++) offs[i] = cursor[i] = at, at += count[i];\n"
+    "}\n"
+    "kernel void hair_scatter(constant HP &h [[buffer(0)]], device const Seg *seg [[buffer(6)]],\n"
+    "                         device atomic_uint *cursor [[buffer(9)]], device uint *list [[buffer(10)]],\n"
+    "                         uint i [[thread_position_in_grid]]) {\n"
+    "    if (i >= h.nseg) return;\n"
+    "    Seg s = seg[i];\n"
+    "    if (s.wh.x <= 0.0) return;\n"
+    "    float2 a = s.ab.xy, b = s.ab.zw;\n"
+    "    float r = max(s.wh.z, s.wh.w) + 1.0;\n"
+    "    float2 lo = min(a, b) - r, hi = max(a, b) + r;\n"
+    "    int2 t0 = max(int2(floor(lo / 16.0)), int2(0)), t1 = min(int2(floor(hi / 16.0)), int2(h.tiles_x, h.tiles_y) - 1);\n"
+    "    for (int ty = t0.y; ty <= t1.y; ty++)\n"
+    "        for (int tx = t0.x; tx <= t1.x; tx++)\n"
+    "            if (hair_tile_hit(a, b, r, uint(tx), uint(ty))) {\n"
+    "                uint k = atomic_fetch_add_explicit(&cursor[uint(ty) * h.tiles_x + uint(tx)], 1u, memory_order_relaxed);\n"
+    "                if (k < h.cap) list[k] = i;\n"
+    "            }\n"
+    "}\n"
+    // A pixel: its coverage by each segment of the tile (the strand's width across the pixel,
+    // and along it a half pixel past each end, so two segments meeting share the pixel
+    // there), the nearest 8 kept in order, the rest blended behind as one.
+    "kernel void hair_fine(constant HP &h [[buffer(0)]], device const Seg *seg [[buffer(6)]],\n"
+    "                      device const uint *count [[buffer(7)]], device const uint *offs [[buffer(8)]],\n"
+    "                      device const uint *list [[buffer(10)]], depth2d<float, access::read> dt [[texture(0)]],\n"
+    "                      texture2d<half, access::write> out [[texture(1)]],\n"
+    "                      uint2 tg [[threadgroup_position_in_grid]], uint2 lt [[thread_position_in_threadgroup]],\n"
+    "                      uint li [[thread_index_in_threadgroup]]) {\n"
+    "    threadgroup Seg sh[256];\n"
+    "    uint t = tg.y * h.tiles_x + tg.x, o = offs[t], n = o >= h.cap ? 0u : min(count[t], h.cap - o);\n"
+    "    uint2 px = tg * 16 + lt;\n"
+    "    bool inside = px.x < out.get_width() && px.y < out.get_height();\n"
+    "    float ws = 1e30;\n"
+    "    if (inside) { float wb = h.proj.y / min(dt.read(px) - h.proj.x, -1e-7); if (wb > 0.0) ws = wb; }\n"
+    "    float2 p = float2(px) + 0.5;\n"
+    "    float kd[8]; float4 kc[8]; int kn = 0;\n"
+    "    float3 tc = 0.0; float tw = 0.0, tt = 1.0;\n"
+    "    for (uint base = 0; base < n; base += 256) {\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "        if (base + li < n) sh[li] = seg[list[o + base + li]];\n"
+    "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "        uint m = min(256u, n - base);\n"
+    "        for (uint j = 0; inside && j < m; j++) {\n"
+    "            float4 ab = sh[j].ab, wh = sh[j].wh;\n"
+    "            float2 a = ab.xy, d = ab.zw - a;\n"
+    "            float l2 = dot(d, d), len = sqrt(l2);\n"
+    "            float u = l2 > 1e-8 ? dot(p - a, d) / l2 : 0.5, uc = saturate(u);\n"
+    "            float hw = mix(wh.z, wh.w, uc);\n"
+    "            float dist = l2 > 1e-8 ? abs(d.x * (p.y - a.y) - d.y * (p.x - a.x)) / len : length(p - a);\n"
+    "            float cov = min(2.0 * hw, 1.0) * saturate(max(hw, 0.5) + 0.5 - dist);\n"
+    "            if (cov <= 0.0) continue;\n"
+    "            cov *= l2 > 1e-8 ? saturate(u * len + 0.5) * saturate((1.0 - u) * len + 0.5) : 1.0;\n"
+    "            float w = mix(wh.x, wh.y, uc);\n"
+    "            cov *= saturate((ws - w) / h.look.w);\n"
+    "            if (cov < 0.004) continue;\n"
+    "            float4 c = mix(sh[j].ca, sh[j].cb, uc);\n"
+    "            c.rgb *= mix(1.0 - 0.45 * h.look.z, 1.0, saturate((ws - w) / 0.15));\n"
+    "            float4 f = float4(c.rgb * cov, cov);\n"
+    "            if (kn == 8 && w >= kd[7]) { tc += f.rgb, tw += f.a, tt *= 1.0 - f.a; continue; }\n"
+    "            if (kn == 8) { tc += kc[7].rgb, tw += kc[7].a, tt *= 1.0 - kc[7].a; kn = 7; }\n"
+    "            int q = kn++;\n"
+    "            for (; q > 0 && kd[q - 1] > w; q--) kd[q] = kd[q - 1], kc[q] = kc[q - 1];\n"
+    "            kd[q] = w, kc[q] = f;\n"
+    "        }\n"
+    "    }\n"
+    "    if (!inside) return;\n"
+    "    float3 C = 0.0; float T = 1.0;\n"
+    "    for (int q = 0; q < kn; q++) C += T * kc[q].rgb, T *= 1.0 - kc[q].a;\n"
+    "    if (tw > 0.0) { float ta = 1.0 - tt; C += T * tc / tw * ta, T *= 1.0 - ta; }\n"
+    "    out.write(half4(half3(C), half(1.0 - T)), px);\n"
+    "}\n"
+    "struct HV { float4 pos [[position]]; };\n"
+    "vertex HV hair_vs(uint i [[vertex_id]]) {\n"
+    "    HV o; o.pos = float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0); return o;\n"
+    "}\n"
+    "fragment float4 hair_comp(HV in [[stage_in]], texture2d<float> hc [[texture(0)]]) {\n"
+    "    return hc.read(uint2(in.pos.xy));\n"
+    "}\n"
+    // Mostly hair: not skin, for the skin and eye passes (as a skinned character's other parts).
+    "struct HM { float4 c1 [[color(1)]]; };\n"
+    "fragment HM hair_mark(HV in [[stage_in]], texture2d<float> hc [[texture(0)]]) {\n"
+    "    if (hc.read(uint2(in.pos.xy)).w < 0.5) discard_fragment();\n"
+    "    HM o; o.c1 = float4(0.0, 0.0, 0.0, -2.0); return o;\n"
+    "}\n";
+
+struct hair_params {
+    float vp[4], proj[4], look[4];
+    uint32_t nseg, npts, nlights, ntiles, tiles_x, tiles_y, cap, pad;
+};
+#define HAIR_LIST (4u << 20)  // segment-tile pairs a frame at most
+#define HAIR_CAPS 4           // strand draws a frame
+// A strand draw captured this frame (hair_capture) for hair_run.
+struct hair_cap {
+    id<MTLBuffer> ib, strand, cap, col;
+    uint32_t nseg, npts;
+    struct hair_params hp;
+    struct fog_light lights[CHAR_LIGHTS];
+};
+static struct hair_cap hair_caps[HAIR_CAPS];
+static int hair_ncaps;
+static unsigned long hair_caps_frame = ~0ul;
+
+static id<MTLLibrary> hair_library(void)
+{
+    static id<MTLLibrary> lib;
+    if (!lib) {
+        NSError *error = nil;
+        lib = [mtl newLibraryWithSource:@(hair_source) options:nil error:&error];
+        if (!lib) bl_fatal("hair shader: %s", error.localizedDescription.UTF8String);
+    }
+    return lib;
+}
+
+// Called by setup_draw for a strand draw: binds where its points go and notes the view.
+static void hair_capture(struct d3d_state *s, BLRender *e, float vsx, float vsy)
+{
+    struct hair_swap *hs = hair_swap;
+    if (!hs->cap) {
+        hs->cap = [mtl newBufferWithLength:(NSUInteger)hs->npts * 32 options:MTLResourceStorageModePrivate];
+        hs->col = [mtl newBufferWithLength:(NSUInteger)hs->npts * 16 options:MTLResourceStorageModeShared];
+        memset(hs->col.contents, 0, hs->col.length);
+    }
+    [e setVertexBuffer:hs->cap offset:0 atIndex:24];
+    [e setFragmentBuffer:hs->col offset:0 atIndex:5];
+    if (hair_caps_frame != frames) hair_ncaps = 0, hair_caps_frame = frames;
+    int i = 0;
+    while (i < hair_ncaps && hair_caps[i].cap != hs->cap) i++;
+    if (i == HAIR_CAPS) return;
+    if (i == hair_ncaps) hair_ncaps++;
+    struct hair_cap *c = &hair_caps[i];
+    c->ib = hs->ib, c->strand = hs->strand, c->cap = hs->cap, c->col = hs->col;
+    c->nseg = hs->nidx / 2, c->npts = hs->npts;
+    const uint32_t *vp = s->viewport;
+    double vx = vp[0] * vsx, vw = vp[2] * vsx;
+    int n = env_sss_sheen >= 0 && view_lights() ? frame_nchar : 0;
+    c->hp = (struct hair_params){{(float)vx, vp[1] * vsy, (float)vw, vp[3] * vsy},
+                                 {view_proj.alpha, view_proj.beta, view_proj.p00, view_proj.p11},
+                                 {env_shine, env_hair_glow, env_hair_root, fmaxf(0.05f * env_hair_fade, 0.02f)},
+                                 c->nseg, c->npts, (uint32_t)n};
+    memcpy(c->lights, char_lights, sizeof char_lights[0] * (size_t)n);
+}
+
+// After the world view (post_run): the strands captured this frame, drawn over it.
+static void hair_run(id<MTLTexture> color, id<MTLTexture> depth)
+{
+    if (hair_caps_frame != frames || !hair_ncaps) return;
+    hair_caps_frame = ~0ul;
+    static id<MTLBuffer> seg, count, offs, cursor, list;
+    static id<MTLTexture> out;
+    static id<MTLComputePipelineState> kclear, kseg, kscan, kscatter, kfine;
+    uint32_t tx = (uint32_t)(color.width + 15) / 16, ty = (uint32_t)(color.height + 15) / 16, nt = tx * ty;
+    if (!count || count.length < nt * 4) {
+        count = [mtl newBufferWithLength:nt * 4 options:MTLResourceStorageModePrivate];
+        offs = [mtl newBufferWithLength:nt * 4 options:MTLResourceStorageModePrivate];
+        cursor = [mtl newBufferWithLength:nt * 4 options:MTLResourceStorageModePrivate];
+    }
+    if (!list) list = [mtl newBufferWithLength:HAIR_LIST * 4 options:MTLResourceStorageModePrivate];
+    if (!out || out.width != color.width || out.height != color.height) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                                                                     width:color.width
+                                                                                    height:color.height
+                                                                                 mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        td.storageMode = MTLStorageModePrivate;
+        out = [mtl newTextureWithDescriptor:td];
+        out.label = @"hair strands";
+    }
+    int info = info_frame == frames;
+    static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *pipes;
+    if (!pipes) pipes = [NSMutableDictionary new];
+    id<MTLRenderPipelineState> comp[2];
+    for (int k = 0; k < 1 + info; k++) {
+        NSString *key = [NSString stringWithFormat:@"%d/%d/%lu", k, info, (unsigned long)color.pixelFormat];
+        if (!pipes[key]) {
+            MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+            d.vertexFunction = [hair_library() newFunctionWithName:@"hair_vs"];
+            d.fragmentFunction = [hair_library() newFunctionWithName:k ? @"hair_mark" : @"hair_comp"];
+            d.colorAttachments[0].pixelFormat = color.pixelFormat;
+            if (info) d.colorAttachments[1].pixelFormat = INFO_FORMAT;
+            if (k) d.colorAttachments[0].writeMask = MTLColorWriteMaskNone;
+            else {
+                d.colorAttachments[0].blendingEnabled = YES;
+                d.colorAttachments[0].sourceRGBBlendFactor = d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+                d.colorAttachments[0].destinationRGBBlendFactor = d.colorAttachments[0].destinationAlphaBlendFactor =
+                    MTLBlendFactorOneMinusSourceAlpha;
+                if (info) d.colorAttachments[1].writeMask = MTLColorWriteMaskNone;
+            }
+            NSError *error = nil;
+            id<MTLRenderPipelineState> p = [mtl newRenderPipelineStateWithDescriptor:d error:&error];
+            if (!p) bl_fatal("hair pipeline: %s", error.localizedDescription.UTF8String);
+            pipes[key] = p;
+        }
+        comp[k] = pipes[key];
+    }
+    for (int i = 0; i < hair_ncaps; i++) {
+        struct hair_cap *c = &hair_caps[i];
+        if (!seg || seg.length < (NSUInteger)c->nseg * 64)
+            seg = [mtl newBufferWithLength:(NSUInteger)c->nseg * 64 options:MTLResourceStorageModePrivate];
+        c->hp.ntiles = nt, c->hp.tiles_x = tx, c->hp.tiles_y = ty, c->hp.cap = HAIR_LIST;
+        BLCompute *e = stat_compute("hair");
+        [e setBytes:&c->hp length:sizeof c->hp atIndex:0];
+        [e setBuffer:c->ib offset:0 atIndex:1];
+        [e setBuffer:c->cap offset:0 atIndex:2];
+        [e setBuffer:c->col offset:0 atIndex:3];
+        [e setBuffer:c->strand offset:0 atIndex:4];
+        [e setBytes:c->lights length:sizeof c->lights[0] * (c->hp.nlights ? c->hp.nlights : 1) atIndex:5];
+        [e setBuffer:seg offset:0 atIndex:6];
+        [e setBuffer:count offset:0 atIndex:7];
+        [e setBuffer:offs offset:0 atIndex:8];
+        [e setBuffer:cursor offset:0 atIndex:9];
+        [e setBuffer:list offset:0 atIndex:10];
+        [e setTexture:depth atIndex:0];
+        [e setTexture:out atIndex:1];
+        MTLSize g64 = MTLSizeMake(64, 1, 1);
+        [e setComputePipelineState:kernel_of(hair_library(), @"hair_clear", &kclear)];
+        [e dispatchThreadgroups:MTLSizeMake((nt + 63) / 64, 1, 1) threadsPerThreadgroup:g64];
+        [e setComputePipelineState:kernel_of(hair_library(), @"hair_seg", &kseg)];
+        [e dispatchThreadgroups:MTLSizeMake((c->nseg + 63) / 64, 1, 1) threadsPerThreadgroup:g64];
+        [e setComputePipelineState:kernel_of(hair_library(), @"hair_scan", &kscan)];
+        [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+        [e setComputePipelineState:kernel_of(hair_library(), @"hair_scatter", &kscatter)];
+        [e dispatchThreadgroups:MTLSizeMake((c->nseg + 63) / 64, 1, 1) threadsPerThreadgroup:g64];
+        [e setComputePipelineState:kernel_of(hair_library(), @"hair_fine", &kfine)];
+        [e dispatchThreadgroups:MTLSizeMake(tx, ty, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [e endEncoding];
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+        rp.colorAttachments[0].texture = color;
+        rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        if (info) {
+            rp.colorAttachments[1].texture = info_texture(color);
+            rp.colorAttachments[1].loadAction = MTLLoadActionLoad;
+            rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+        }
+        BLRender *r = stat_render(rp, "hair_composite");
+        [r setFragmentTexture:out atIndex:0];
+        for (int k = 0; k < 1 + info; k++) {
+            [r setRenderPipelineState:comp[k]];
+            [r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
+        [r endEncoding];
+        c->ib = c->strand = c->cap = c->col = nil;
+    }
+    hair_ncaps = 0;
 }
 
 static uint32_t draw_prims;  // the draw setup_draw is for: its primitives
@@ -7389,6 +8529,13 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
             detail_color = color;
         }
     }
+    // Hair strands, drawn as points to capture them (d3d9_shader.h, variant strand) for
+    // hair_run, lit as the game lights them: hair_run shines them itself.
+    if (hair_swap && hair_swap->strand) {
+        k->vsv.strand = k->psv.strand = 1;
+        k->psv.detail = k->psv.hair = k->psv.skin = 0;
+        k->vsv.smooth_normal = 1, k->vsv.tess = 0;
+    }
     // The surfaces' colour likewise, marked in its alpha: props (2) for the contact shadows,
     // with a vertex shader, not skinned, and no second set of texture coordinates; the map's
     // brushes and displacements (3), which read their lightmaps with one, for the bounced
@@ -7404,16 +8551,27 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
         int kind = !s->vs || skinned ? 1 : lightmapped ? 3 : 2;
         k->psv.albedo = k->albedo == 2 ? (uint8_t)kind : 0;
     }
-    // And their facing (shader draws only).
+    // And their facing (shader draws only). The map's see-through lightmapped surfaces (a
+    // shore's sand laid over the beach) leave the facing alone but are lit as the rest are,
+    // with their bumps and the frame's lights, or a line shows where they meet.
     if (enc_surface) {
-        k->surface = !rs[27] && (rs[168] & 7) && ps->code && !(ps->info.color_outputs & 8) ? 2 : 1;
-        k->psv.surface = k->surface == 2;
+        int shaded = (rs[168] & 7) && ps->code && !(ps->info.color_outputs & 8);
+        k->surface = !rs[27] && shaded ? 2 : 1;
+        k->psv.surface = k->surface == 2 || (shaded && rs[27] && k->psv.lightmap);
     }
     if (k->psv.hair && hair_pass >= 2) {  // SRCALPHA, INVSRCALPHA, ADD
         k->blend[0] = 1, k->blend[1] = k->blend[4] = 5, k->blend[2] = k->blend[5] = 6, k->blend[3] = k->blend[6] = 1;
         k->info = 1;
         if (k->albedo) k->albedo = 1;
         if (k->surface) k->surface = 1, k->psv.surface = 0;
+    }
+    if (overlay_depth) {  // depth alone: no colour, nothing blended
+        memset(k->blend, 0, sizeof k->blend);
+        k->write_mask = 0;
+        if (k->info) k->info = 1;
+        if (k->albedo) k->albedo = 1;
+        if (k->surface) k->surface = 1;
+        k->psv.dither = 1;
     }
 
     // A held rain draw, lit by the finished world view (the rain after the upscaler).
@@ -7503,17 +8661,9 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
     // A world view has its camera away from the origin; the main menu's smoke is drawn
     // with a camera at the origin (the w row has no translation), like a sky box.
     if (perspective && to_back_buffer && fabsf(w_row[3]) > 1e-4f) frame_has_3d++;
-    // Screens with no world view (the main menu, loading screens) are the game's 4:3
-    // layouts stretched across a wider window. Their draws to the back buffer go to a
-    // centred 4:3 area instead, with black bars (menu_bars) and the mouse mapped to
-    // match (bl_cocoa_set_squeeze); the projection then needs no correction. Which kind
-    // of screen it is comes from the frame before. BL_WIDESCREEN=stretch keeps the
-    // stretch.
-    float squeeze = 1;
-    float target_aspect = rtt.height ? (float)rtt.width / (float)rtt.height : 0;
-    if (env_widescreen && menu_frame && !pause_frame && to_back_buffer && target_aspect > 4.0f / 3.0f + 0.01f)
-        squeeze = (4.0f / 3.0f) / target_aspect, frame_squeeze = squeeze;
-    if (env_widescreen && aspect > 4.0f / 3.0f + 0.01f && perspective && squeeze == 1) {
+    // Screens with no world view (the main menu, loading screens) fill the window's width
+    // like everything else.
+    if (env_widescreen && aspect > 4.0f / 3.0f + 0.01f && perspective) {
         float proj = 0;
         if (vs->ff_vertex) {
             const float *p = (const float *)s->transform[3];
@@ -7542,12 +8692,12 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
         vp.inv_viewport[0] += 2 * taa_jitter[0] / (s->viewport[2] * vsx);
         vp.inv_viewport[1] += 2 * taa_jitter[1] / (s->viewport[3] * vsy);
     }
-    set_viewport(s, e, (uint32_t)rtt.width, (uint32_t)rtt.height, squeeze);
+    set_viewport(s, e, (uint32_t)rtt.width, (uint32_t)rtt.height);
     [e setVertexBytes:&vp length:sizeof vp atIndex:21];
     // A character in the world view, for its own motion (BLMotionDraw).
     motion_now = nil;
     if (s->vs && perspective && to_back_buffer && !menu_frame && view_state != 2 && fabsf(w_row[3]) > 1e-4f &&
-        s->viewport[2] == rt->width && s->viewport[3] == rt->height && u2f(s->viewport[5]) >= 0.99f) {
+        !k->vsv.strand && s->viewport[2] == rt->width && s->viewport[3] == rt->height && u2f(s->viewport[5]) >= 0.99f) {
         int skinned = 0;
         for (int i = 0; i < 16; i++)
             if ((vs->info.input_mask & (1u << i)) && (vs->info.input_usage[i] == 1 || vs->info.input_usage[i] == 2))
@@ -7561,6 +8711,7 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
         }
     }
     if (k->vsv.tess) [e setVertexBytes:&view_proj length:sizeof view_proj atIndex:22];
+    if (k->vsv.strand) hair_capture(s, e, vsx, vsy);
 
     float pc[224][4];
     memcpy(pc, s->ps_f, sizeof pc);
@@ -7615,6 +8766,7 @@ static int setup_draw(struct d3d_state *s, BLRender *e, uint32_t type, struct el
         pp.alpha_ref = fmaxf(pp.alpha_ref, env_hair_soft);
         if (hair_pass == 2) pp.alpha_func = 2;  // LESS: what the solid pass left
     }
+    if (overlay_depth) pp.alpha_func = 8;  // ALWAYS: the dither decides
     if (rs[28]) {  // FOGENABLE
         uint32_t c = rs[34];
         pp.fog_color[0] = (c >> 16 & 255) / 255.0f, pp.fog_color[1] = (c >> 8 & 255) / 255.0f;
@@ -7867,6 +9019,16 @@ static struct hair_swap *hair_swap_for(struct d3d_state *s, struct element *el, 
         if (ne) memcpy(r + ne->offset, n, 12);
         memcpy(r + te->offset, &src[6], 8);
     }
+    // Strands: each point's colour, and its half-width by the same fit.
+    if (m->strand) {
+        hs->strand = [mtl newBufferWithLength:(NSUInteger)m->nverts * 16 options:MTLResourceStorageModeShared];
+        float *so = hs->strand.contents;
+        for (uint32_t v = 0; v < m->nverts; v++) {
+            memcpy(&so[v * 4], &m->strand[v * 4], 12);
+            so[v * 4 + 3] = (float)(sc * m->strand[v * 4 + 3]);
+        }
+        hs->npts = m->nverts;
+    }
     // The game's triangles to keep under the strips: those whose centre is one of m->base,
     // placed by the same fit (the scalp, without the locks the strips replace).
     if (m->nbase) {
@@ -7896,6 +9058,24 @@ static struct hair_swap *hair_swap_for(struct d3d_state *s, struct element *el, 
         hs->nbase_idx = nk;
         hs->base_ib = [mtl newBufferWithBytes:keep length:(NSUInteger)(nk ? nk : 1) * 4
                                       options:MTLResourceStorageModeShared];
+        // Under strands, the base pulled 4 mm in along its normals: its hard edges and painted
+        // locks lie inside the strands, which cover them, instead of next to them.
+        if (m->strand && ne && nk) {
+            uint32_t vmax = 0;
+            for (uint32_t i = 0; i < nk; i++) vmax = keep[i] > vmax ? keep[i] : vmax;
+            hs->base_vb = [mtl newBufferWithBytes:vb + (size_t)base_vertex * stride length:(NSUInteger)(vmax + 1) * stride
+                                          options:MTLResourceStorageModeShared];
+            uint8_t *bo = hs->base_vb.contents;
+            float pull = (float)(0.004 * sc);
+            for (uint32_t i = 0; i < nk; i++) {
+                const uint8_t *src = vb + (size_t)(base_vertex + (int32_t)keep[i]) * stride;
+                const float *q = (const float *)(src + pe->offset), *n = (const float *)(src + ne->offset);
+                float *p = (float *)(bo + (size_t)keep[i] * stride + pe->offset);
+                float l = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                if (l < 1e-6f) continue;
+                for (int k = 0; k < 3; k++) p[k] = q[k] - n[k] / l * pull;
+            }
+        }
         free(keep);
         fprintf(stderr, "[metal] hair: %u of the game's %u triangles kept under the strips\n", nk / 3, count);
     }
@@ -8969,7 +10149,7 @@ static void swaps_forget(void)
     }
     for (NSData *kd in gone) {
         struct hair_swap *hs = hair_swaps[kd].pointerValue;
-        if (hs) hs->vb = hs->ib = hs->base_ib = nil, hs->tex = hs->base_tex = nil, free(hs);
+        if (hs) hs->vb = hs->ib = hs->base_ib = hs->strand = hs->cap = hs->col = hs->base_vb = nil, hs->tex = hs->base_tex = nil, free(hs);
         [hair_swaps removeObjectForKey:kd];
     }
     NSMutableDictionary<NSData *, NSValue *> *props[3] = {prop_swaps, remodel_swaps, char_swaps};
@@ -9009,9 +10189,28 @@ static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex,
     int indexed;
     struct stream_src src[16];  // each stream's vertices from `first` (copies, as for dynamic buffers)
     NSData *indices;
+    int held;  // the objects in `s` have a reference of ours, so the game's releases cannot free them
 }
 @end
+
+// Adds or drops a reference to each object a state points at.
+static void state_refs(struct d3d_state *s, uint32_t (*f)(struct obj *))
+{
+    struct obj **all[] = {s->texture, s->stream, s->render_target};
+    int n[] = {20, 16, 4};
+    for (int k = 0; k < 3; k++)
+        for (int i = 0; i < n[k]; i++)
+            if (all[k][i]) f(all[k][i]);
+    struct obj *one[] = {s->indices, s->vdecl, s->vs, s->ps, s->depth_stencil, s->back_buffer, s->auto_depth};
+    for (int i = 0; i < 7; i++)
+        if (one[i]) f(one[i]);
+}
+
 @implementation BLRainDraw
+- (void)dealloc
+{
+    if (held) state_refs(&s, obj_release);
+}
 @end
 static NSMutableArray<BLRainDraw *> *rain_held;
 static int rain_drawn, rain_lit, rain_dropped;  // frames of the last 100 (logged from present)
@@ -9160,6 +10359,7 @@ static int rain_hold(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
         if (at + len > s->indices->size) return 0;
         r->indices = [NSData dataWithBytes:(const uint8_t *)bl_g2h(s->indices->mem) + at length:len];
     }
+    state_refs(&r->s, obj_addref), r->held = 1;
     if (!rain_held) rain_held = [NSMutableArray new];
     [rain_held addObject:r];
     return 1;
@@ -9216,7 +10416,7 @@ void d3d_render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex, ui
     // blended as hair (both sides), whatever the game set.
     if (hs->vb && hs->base_ib) {
         // The base pushed a little behind, as the strips lie on it (the fringe's on its locks).
-        struct hair_swap base = {.ib = hs->base_ib, .nidx = hs->nbase_idx, .base_tex = hs->base_tex};
+        struct hair_swap base = {.ib = hs->base_ib, .nidx = hs->nbase_idx, .base_tex = hs->base_tex, .base_vb = hs->base_vb};
         uint32_t *rs = s->rs, bias[2] = {rs[195], rs[175]};
         float b = 64.0f / 16777215.0f, sl = 2.0f;
         memcpy(&rs[195], &b, 4), memcpy(&rs[175], &sl, 4);
@@ -9274,15 +10474,19 @@ static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex,
                 u2f(s->vs_f[11][2]), u2f(s->vs_f[11][3]), s->rs[14], u2f(s->vs_f[48][3]), u2f(s->vs_f[49][3]),
                 u2f(s->vs_f[50][3]));  // at: the model's place, or its first bone's (c48..c50's w)
     if (!s->render_target[0] || !count) return;
+    // Hair strands: their points, in the world view only (hair_run draws them).
+    int strands = hair_swap && hair_swap->strand;
+    if (strands && (view_state != 1 || s->render_target[0] != s->back_buffer)) return;
     struct element el[64];
     int nel = vertex_elements(s, el, 64);
     post_before_draw(s, el, nel);
     hair_before_draw(s);
+    flush_sampled_clears(s);
     BLRender *e = pass(s);
     struct pipe_key k;
     draw_prims = count;
     draw_tess = env_tess > 1 && env_round && env_tess_round > 0 && indexed && type == 4 && count <= TESS_MAX_PATCHES && s->indices && !hair_swap && !prop_swap;
-    int ok = setup_draw(s, e, type, el, nel, &k);
+    int ok = setup_draw(s, e, strands ? 1 : type, el, nel, &k);
     draw_tess = 0;
     if (!ok) return;
     if (env_tex_stats && (long)frames == draw_stats_frame) {
@@ -9399,9 +10603,10 @@ static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex,
             if (k.attr[i].format && k.attr[i].buffer == b) used = 1;
         if (!used) continue;
         int rebased;
-        if (hair_swap && hair_swap->vb) {
-            [e setVertexBuffer:hair_swap->vb offset:0 atIndex:(NSUInteger)b];
-            if (m) m->vb[b] = hair_swap->vb, m->vo[b] = 0;
+        id<MTLBuffer> hv = hair_swap ? (hair_swap->vb ? hair_swap->vb : hair_swap->base_vb) : nil;
+        if (hv) {
+            [e setVertexBuffer:hv offset:0 atIndex:(NSUInteger)b];
+            if (m) m->vb[b] = hv, m->vo[b] = 0;
             continue;
         }
         if (prop_swap && prop_swap->vb[b]) {
@@ -9461,19 +10666,31 @@ static void render_draw(struct d3d_state *s, uint32_t type, int32_t base_vertex,
     NSInteger bv = rel ? -(NSInteger)min_index : base_vertex;
     if (hair_swap) {
         ib = hair_swap->ib, io = 0, it = MTLIndexTypeUInt32, ic = hair_swap->nidx;
-        if (hair_swap->vb) bv = 0;
+        if (hair_swap->vb || hair_swap->base_vb) bv = 0;
     }
     if (prop_swap) ib = prop_swap->ib, io = 0, it = MTLIndexTypeUInt32, ic = prop_swap->nidx, bv = 0;
+    if (strands) {
+        [e drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:hair_swap->npts];
+        return;
+    }
     if (m && type == 4) {
         m->ib = ib, m->io = io, m->it = it, m->ic = ic, m->bv = bv;
         motion_keep(s, m, start, count, base_vertex);
     }
     for (int pass = 0; pass < 2; pass++) {
-        if (pass) {  // hair's blended pass
-            if (!k.psv.hair || !hair_soft_on() || !s->rs[15]) break;
+        if (pass && k.psv.hair && hair_soft_on() && s->rs[15]) {  // hair's blended pass
             hair_pass = 2, draw_tess = k.vsv.tess;
             ok = setup_draw(s, e, type, el, nel, &k);
             hair_pass = 0, draw_tess = 0;
+            if (!ok) break;
+        } else if (pass) {  // a see-through map surface's depth (overlay_depth)
+            const uint32_t *rs = s->rs;
+            if (view_state != 1 || !k.psv.lightmap || !rs[27] || !rs[7] || rs[14] || !s->depth_stencil ||
+                k.blend[1] != 5 || k.blend[2] != 6)  // SRCALPHA, INVSRCALPHA
+                break;
+            overlay_depth = 1, draw_tess = k.vsv.tess;
+            ok = setup_draw(s, e, type, el, nel, &k);
+            overlay_depth = 0, draw_tess = 0;
             if (!ok) break;
         }
         if (k.vsv.tess && draw_pre)
@@ -9496,6 +10713,7 @@ void d3d_render_draw_up(struct d3d_state *s, uint32_t type, uint32_t min_index, 
     int nel = vertex_elements(s, el, 64);
     post_before_draw(s, el, nel);
     hair_before_draw(s);
+    flush_sampled_clears(s);
     BLRender *e = pass(s);
     struct pipe_key k;
     // UP draws read stream 0 with the given stride.
@@ -9580,6 +10798,42 @@ static void write_png(id<MTLBuffer> b, NSUInteger w, NSUInteger h, const char *p
     fprintf(stderr, "[metal] wrote %s\n", dst ? path : "(failed)");
 }
 
+// BL_DARK_LOG=1: each frame's picture shrunk to 64 x 36 and read back; one at under a third
+// of the last one's brightness is logged, and the first ten written whole.
+static void dark_check(id<MTLTexture> back, unsigned long n)
+{
+    static int on = -1, written;
+    static float last;
+    static id<MTLTexture> small;
+    if (on < 0) on = getenv("BL_DARK_LOG") != NULL;
+    if (!on) return;
+    if (!small) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                      width:64
+                                                                                     height:36
+                                                                                  mipmapped:NO];
+        td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModePrivate;
+        small = [mtl newTextureWithDescriptor:td];
+    }
+    uint32_t a[4] = {0, 0, (uint32_t)back.width, (uint32_t)back.height}, b[4] = {0, 0, 64, 36};
+    stretch_draw(back, a, small, b, 1);
+    const uint8_t *px = [read_target(small) contents];
+    float sum = 0;
+    for (int i = 0; i < 64 * 36; i++) sum += 0.0722f * px[4 * i] + 0.7152f * px[4 * i + 1] + 0.2126f * px[4 * i + 2];
+    float mean = sum / (64 * 36);
+    if (last > 3 && mean < last / 3) {
+        fprintf(stderr, "[metal] dark frame %lu: brightness %.1f (the last %.1f)\n", n, mean, last);
+        if (written < 10) {
+            const char *dir = getenv("BL_DUMP_DIR") ? getenv("BL_DUMP_DIR") : ".";
+            char path[1024];
+            snprintf(path, sizeof path, "%s/dark_%lu.png", dir, n);
+            write_png(read_target(back), back.width, back.height, path), written++;
+        }
+    }
+    last = mean;
+}
+
 static int dump_this_frame(unsigned long n)
 {
     const char *list = getenv("BL_DUMP_FRAME");
@@ -9603,6 +10857,7 @@ void d3d_render_read_back(struct obj *rt)
     if (!t || !rt->mem || (rt->format != 21 && rt->format != 22) || rt == shadow_atlas || obj_scale(rt) > 1 ||
         rt->pitch < rt->width * 4)
         return;
+    flush_clear_of(rt);
     end_pass();
     if (t.width != rt->width || t.height != rt->height) {  // drawn at a resolution changed live
         MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:t.pixelFormat
@@ -9759,13 +11014,13 @@ static void present(id<CAMetalDrawable> drawable)
 }
 
 // The quest compass (bl_compass.c) across the top of the screen, in play only: a world
-// drawn this frame, full width, and the game's pointer hidden (no dialogue, inventory or
+// drawn this frame and the game's pointer hidden (no dialogue, inventory or
 // menu open). Drawn on the back buffer over the HUD, as the HUD is.
 int bl_window_cursor_hidden(void);
 int bl_compass_draw(uint32_t w, uint32_t h, const float rows[3][4], void *bgra);
 static void compass_overlay(id<MTLTexture> t)
 {
-    if (!env_compass || !last_3d || frame_squeeze < 1 || !bl_window_cursor_hidden()) return;
+    if (!env_compass || !last_3d || !bl_window_cursor_hidden()) return;
     uint32_t w = (uint32_t)(t.width * 0.34), h = (uint32_t)(w * 0.1);
     if (w < 64 || h < 8) return;
     static void *px;
@@ -9793,7 +11048,7 @@ static void compass_overlay(id<MTLTexture> t)
 // copy, under an overlay with the mockup's layers: a dark red gradient, a faint red glow
 // behind the menu, a vignette, and a red glow behind each highlighted label. The menu asks
 // for it when it paints (bl_metal_backdrop), so it goes over the HUD and anything else
-// drawn before, and its frames stay full width (no 4:3 bars). Without a level there is no
+// drawn before. Without a level there is no
 // world to show and the overlay darkens what is behind. The overlay is drawn in software at
 // a quarter of the size, again only when the screen, the style or the glows change.
 #define PAUSE_GLOWS 4
@@ -9804,7 +11059,6 @@ static void pause_backdrop(id<MTLTexture> t);
 
 void bl_metal_backdrop(int style, int world, const int (*glows)[4], int n, int sw, int sh)
 {
-    pause_seen = 1;
     pause_style = style, pause_world = world, pause_nglow = n < PAUSE_GLOWS && sw > 0 && sh > 0 ? n : 0;
     pause_sw = sw, pause_sh = sh;
     memset(pause_glow, 0, sizeof pause_glow);
@@ -9946,26 +11200,6 @@ static void pause_backdrop(id<MTLTexture> t)
     stretch_draw_ex(img, sr, t, full, 1, 1);
 }
 
-// Black bars either side of a menu narrowed to 4:3: the game's own clears and
-// backgrounds covered the whole width, so the bars may still hold an older frame.
-static void menu_bars(id<MTLTexture> t, float squeeze)
-{
-    end_pass();
-    static id<MTLTexture> black;
-    if (!black) {
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                     width:1 height:1 mipmapped:NO];
-        black = [mtl newTextureWithDescriptor:td];
-        uint32_t px = 0xFF000000;
-        [black replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&px bytesPerRow:4];
-    }
-    uint32_t bar = (uint32_t)floor(t.width * (1 - squeeze) / 2), one[4] = {0, 0, 1, 1};
-    if (!bar) return;
-    uint32_t left[4] = {0, 0, bar, (uint32_t)t.height}, right[4] = {(uint32_t)t.width - bar, 0, (uint32_t)t.width, (uint32_t)t.height};
-    stretch_draw(black, one, t, left, 0);
-    stretch_draw(black, one, t, right, 0);
-}
-
 void d3d_render_present(struct d3d_state *s)
 {
     swaps_forget();
@@ -10011,13 +11245,6 @@ void d3d_render_present(struct d3d_state *s)
     bl_cocoa_script_input(frames, game_window);
     struct obj *bb = s->back_buffer;
     id<MTLTexture> back = bb ? target_texture(bb) : nil;
-    if (back && frame_squeeze < 1) menu_bars(back, frame_squeeze);
-    static float shown_squeeze = 1;
-    if (frame_squeeze != shown_squeeze) {
-        shown_squeeze = frame_squeeze;
-        bl_cocoa_set_squeeze(frame_squeeze);
-        fprintf(stderr, "[d3d9] frame %lu: %s\n", frames, frame_squeeze < 1 ? "menu at 4:3" : "full width");
-    }
     // A world view whose draws all waited for background builds is still one.
     if (frame_waiting && !frame_has_3d) frame_has_3d = last_3d;
     builds_finish();
@@ -10034,9 +11261,9 @@ void d3d_render_present(struct d3d_state *s)
     int world_small = world_bb && world_size(target_full(world_bb), &ww, &wh);
     world_low = !menu_frame && world_small;
     world_after_menu = menu_frame && world_small;
-    pause_frame = pause_seen, pause_seen = 0;
     pause_state = s;
-    frame_has_3d = 0, frame_squeeze = 1;
+    frame_has_3d = 0;
+    if (back) dark_check(back, frames);
     if (back && dump_this_frame(frames)) {
         const char *dir = getenv("BL_DUMP_DIR") ? getenv("BL_DUMP_DIR") : ".";
         char path[1024];
@@ -10258,6 +11485,8 @@ void d3d_render_stretch(struct obj *src, uint32_t src_rect, struct obj *dst, uin
 {
     if (!src || !dst) return;
     ensure_device();
+    // Clears waiting on either run first: the copy reads the one and is not undone on the other.
+    flush_clear_of(src), flush_clear_of(dst);
     end_pass();
     // Only GPU-side surfaces (render targets) are copied here.
     id<MTLTexture> a = src->gpu || (src->usage & 1) || (src->owner && src->owner->type == OBJ_DEVICE)

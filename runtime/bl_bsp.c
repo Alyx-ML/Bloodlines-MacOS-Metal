@@ -260,13 +260,13 @@ int bl_bsp_lights(const float cam[3], struct bl_light *out, int max)
 
 // --- the map's surfaces, for the lighting rebake ----------------------------------------
 //
-// VBSP 17 as Bloodlines has it differs from Half-Life 2's in the faces: 104 bytes, with
+// VBSP 17 as Bloodlines has it differs from later Source versions' in the faces: 104 bytes, with
 // eight light styles and eight day and night bytes (and a per-style mean colour) where
-// Half-Life 2 has four styles in 56 bytes. Maps compiled again for the Unofficial Patch
-// hold each face's mean colour per style just before its samples (lightofs), as Half-Life
-// 2's do; the original maps do not (world->means says which, from the lump's size).
+// later Source versions have four styles in 56 bytes. Maps compiled again for the Unofficial Patch
+// hold each face's mean colour per style just before its samples (lightofs), as later Source
+// versions' do; the original maps do not (world->means says which, from the lump's size).
 //
-// Displacements as Half-Life 2's: 176 bytes each (lump 26: the start position, the first
+// Displacements as later Source versions': 176 bytes each (lump 26: the start position, the first
 // of its points in lump 33, the first triangle, the power), points 20 bytes (a direction,
 // a distance, alpha). Its face's four corners, from the one at the start position: rows
 // of 2^power + 1 points run from corner 0 to corner 1 (and 3 to 2), each from the first

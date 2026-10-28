@@ -55,6 +55,10 @@ minute) when the translation itself has not changed.
 `sh tools/runtime_unit.sh` builds and runs the runtime's unit test
 (`tests/runtime_unit.c`). It needs no game files. Run `tools/build_runtime.sh` first.
 
+`sh tools/build_tests.sh` builds the other checks in `tests/` (shader, map and lighting
+tools, and the zlib and filesystem pilots once the modules are built) without running
+them. Each test's header says how to run it.
+
 Only one build runs at a time. Each build script takes a lock on `build/`. A second
 build waits until the first one ends. If the build that holds the lock is no longer
 running, the next build takes the lock over.
@@ -81,9 +85,8 @@ Options (environment variables). These are the ones a player or tester needs:
 | `BL_UPSCALER=u` | the upscaler: `metalfx` (default) or `fsr4` (AMD FSR 4); wins over the Visual tab's drop-down at start |
 | `BL_UPSCALER_QUALITY=q` | the 3D view's resolution before upscaling: `native` (default), `quality` (67%), `balanced` (59%), `performance` (50%) or `ultra` (33%); wins over the Visual tab's drop-down at start |
 | `BL_FSR4_DIR=dir` | where FSR 4 is loaded from (default: the FSR4Metal folder next to the game's) |
-| `BL_FOV=degrees` | the player's field of view at 4:3 (the game's is 90, allowed 50 to 130); wider screens see more at the sides |
 | `BL_WIDESCREEN=stretch` | keep the game's 4:3 picture stretched; turns off the wide-screen correction and the wider field of view |
-| `BL_TONEMAP=t` | test tone maps, off by default: `gt7` (Gran Turismo 7), `pbr` (Khronos PBR Neutral), or `gt7x`/`pbrx`, which first expand highlights by `BL_TONEMAP_EXPAND` (0 to 1, default 0.8) |
+| `BL_TONEMAP=t` | test tone maps, off by default: `filmic` (a published filmic curve), `pbr` (Khronos PBR Neutral), or `filmicx`/`pbrx`, which first expand highlights by `BL_TONEMAP_EXPAND` (0 to 1, default 0.8) |
 | `BL_ANISO=n` | anisotropic filtering, default 16, 1 = off |
 | `BL_UPSCALE=0` | use the game's own textures, not the upscaled ones |
 | `BL_REMODEL=0` | use the game's own prop models, not the remodels |
@@ -133,7 +136,7 @@ few without a comment are traces that log to stderr. By file:
   `BL_PROP_SHADOWS`, `BL_PROP_SHADOWS_STRENGTH`, `BL_PROP_SHADOWS_RES`,
   `BL_PROP_SHADOWS_NEAR`, `BL_PROP_SHADOWS_SOFT`, `BL_PROP_SHADOWS_DEBUG`,
   `BL_PROP_SHADOWS_LOG`, `BL_SHADOWS_AB`,
-  `BL_SHARPEN_STRENGTH`, `BL_SKIN_DETAIL_STRENGTH`, `BL_SKIN_DETAIL_SIZE`,
+  `BL_SHARPEN_STRENGTH`, `BL_FSR4_SHARPNESS`, `BL_SKIN_DETAIL_STRENGTH`, `BL_SKIN_DETAIL_SIZE`,
   `BL_SKIN_DETAIL_MAX`, `BL_SKIN_DETAIL_MAX_BODY`, `BL_SKIN_DETAIL_BODY`,
   `BL_CLOTH_DETAIL`, `BL_CLOTH_DETAIL_STRENGTH`, `BL_CLOTH_DETAIL_SIZE`,
   `BL_CLOTH_DETAIL_MAX`, `BL_DETAIL`, `BL_DETAIL_STRENGTH`, `BL_SHINE`,

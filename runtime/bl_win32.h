@@ -25,8 +25,12 @@ enum {
     BL_ERROR_INVALID_PARAMETER = 87,
     BL_ERROR_INSUFFICIENT_BUFFER = 122,
     BL_ERROR_MOD_NOT_FOUND = 126,
+    BL_ERROR_NOT_SAME_DEVICE = 17,
+    BL_ERROR_DISK_FULL = 112,
     BL_ERROR_PROC_NOT_FOUND = 127,
+    BL_ERROR_DIR_NOT_EMPTY = 145,
     BL_ERROR_ALREADY_EXISTS = 183,
+    BL_ERROR_FILENAME_EXCED_RANGE = 206,
     BL_ERROR_ENVVAR_NOT_FOUND = 203,
 };
 
@@ -43,6 +47,8 @@ enum bl_handle_type { BL_H_FREE, BL_H_FILE, BL_H_FIND, BL_H_EVENT, BL_H_HEAP, BL
 uint32_t bl_handle_new(enum bl_handle_type type, void *obj);
 void *bl_handle_get(uint32_t h, enum bl_handle_type type);
 void bl_handle_free(uint32_t h);
+uint32_t bl_handle_dup(uint32_t h);
+uint32_t bl_thread_current_handle(void);  // a real handle to the calling thread (bl_thread.c)
 // CloseHandle for events and threads (bl_thread.c); 0 if h is neither.
 int bl_sync_close(uint32_t h);
 
@@ -56,6 +62,10 @@ int bl_path_to_host(const char *win, char *host, size_t cap);
 const char *bl_data_dir(void);
 // Registry DWORDs for the runtime's own settings (bl_registry.c); path like "HKCU\\Software\\...".
 uint32_t bl_reg_get_dword(const char *path, const char *name, uint32_t def);
+// The Gameplay tab's Skip intro movies (bl_vgui.c), saved in the registry: the game's
+// movies (media\*.bik, only played at start) then fail to open, and the game goes on.
+int bl_skip_intro_movies(void);
+void bl_skip_intro_movies_set(int on);
 void bl_reg_set_dword(const char *path, const char *name, uint32_t value);
 // The main display (bl_display.c): desktop size in pixels, and the video modes offered.
 void bl_screen_size(uint32_t *w, uint32_t *h);

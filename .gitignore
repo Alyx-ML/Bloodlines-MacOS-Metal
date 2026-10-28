@@ -21,3 +21,13 @@ build/
 # Python bytecode caches.
 __pycache__/
 *.pyc
+# Media, models and data made from the game or downloaded (movies, frames, meshes, packs).
+*.mov
+*.mp4
+*.bik
+*.sig
+*.bin
+*.npz
+*.obj
+*.webp
+*.zip

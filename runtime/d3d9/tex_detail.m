@@ -758,7 +758,8 @@ id<MTLTexture> bl_detail_flat(id<MTLDevice> dev)
 }
 
 // <name>_hair.bin: "BLHM", version 1, vertex count, index count, anchor count (uint32 each),
-// the vertices {position xyz, normal xyz, uv}, the indices (uint32), the anchors (xyz) and
+// the vertices {position xyz, normal xyz, uv} (version 3, strands: then the colour rgb and
+// the half-width; the indices pairs, not triangles), the indices (uint32), the anchors (xyz) and
 // the rectangle of the game's texture to keep (u0 v0 u1 v1), all little-endian floats; then
 // optionally a count (uint32) and that many centres (xyz) of the game's triangles to draw
 // under the strips.
@@ -780,24 +781,29 @@ const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, uint64_t key, uint3
         snprintf(u, path + sizeof path - u, "_hair.bin");
         NSData *d = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path]];
         const uint32_t *hd = d.bytes;
-        if (d.length >= 20 && !memcmp(hd, "BLHM", 4) && hd[1] == 1) {
-            uint32_t nv = hd[2], ni = hd[3], na = hd[4];
-            size_t need = 20 + (size_t)nv * 32 + (size_t)ni * 4 + (size_t)na * 12 + 16;
+        if (d.length >= 20 && !memcmp(hd, "BLHM", 4) && (hd[1] == 1 || hd[1] == 3)) {
+            uint32_t nv = hd[2], ni = hd[3], na = hd[4], vsize = hd[1] == 3 ? 48 : 32;
+            size_t need = 20 + (size_t)nv * vsize + (size_t)ni * 4 + (size_t)na * 12 + 16;
             uint32_t nb = 0;
             if (d.length >= need + 4) memcpy(&nb, (const uint8_t *)d.bytes + need, 4);
             if (d.length == need || d.length == need + 4 + (size_t)nb * 12) {
                 m = calloc(1, sizeof *m);
                 m->nverts = nv, m->nidx = ni, m->nanchors = na;
                 const uint8_t *p = (const uint8_t *)d.bytes + 20;
-                m->verts = memcpy(malloc((size_t)nv * 32 + 1), p, (size_t)nv * 32), p += (size_t)nv * 32;
+                float *vv = malloc((size_t)nv * 32 + 1), *sv = vsize == 48 ? malloc((size_t)nv * 16 + 1) : NULL;
+                for (uint32_t i = 0; i < nv; i++, p += vsize) {
+                    memcpy(vv + i * 8, p, 32);
+                    if (sv) memcpy(sv + i * 4, p + 32, 16);
+                }
+                m->verts = vv, m->strand = sv;
                 m->idx = memcpy(malloc((size_t)ni * 4 + 1), p, (size_t)ni * 4), p += (size_t)ni * 4;
                 m->anchors = memcpy(malloc((size_t)na * 12 + 1), p, (size_t)na * 12), p += (size_t)na * 12;
                 memcpy(m->keep, p, 16), p += 16;
                 if (d.length > need)
                     m->nbase = nb, m->base = memcpy(malloc((size_t)nb * 12 + 1), p + 4, (size_t)nb * 12);
-                int bad = 0;  // a corner past the vertices: the tool's output is wrong
+                int bad = sv ? ni % 2 : ni % 3;  // an index past the vertices: the tool's output is wrong
                 for (uint32_t i = 0; i < ni; i++) bad |= m->idx[i] >= nv;
-                if (bad) fprintf(stderr, "[detail] %s: a hair triangle's corner is past its %u vertices; not used\n", path, nv);
+                if (bad) fprintf(stderr, "[detail] %s: a hair index is past its %u vertices, or their count is wrong; not used\n", path, nv);
                 if (nv && !bad) {
                     snprintf(u, path + sizeof path - u, "_hair.png");
                     m->tex = load_rgba(dev, path);
@@ -807,12 +813,16 @@ const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, uint64_t key, uint3
                 }
                 if (bad || (nv && !m->tex)) {  // no strips at all keeps only `keep`: that is used
                     m->tex = nil, m->base_color = nil;
-                    free((void *)m->verts), free((void *)m->idx), free((void *)m->anchors), free((void *)m->base);
+                    free((void *)m->verts), free((void *)m->strand), free((void *)m->idx), free((void *)m->anchors);
+                    free((void *)m->base);
                     free(m), m = NULL;
                 }
             }
         }
-        if (m) fprintf(stderr, "[detail] hair mesh for %s: %u vertices, %u triangles\n", name.UTF8String, m->nverts, m->nidx / 3);
+        if (m && m->strand)
+            fprintf(stderr, "[detail] hair strands for %s: %u points, %u segments\n", name.UTF8String, m->nverts, m->nidx / 2);
+        else if (m)
+            fprintf(stderr, "[detail] hair mesh for %s: %u vertices, %u triangles\n", name.UTF8String, m->nverts, m->nidx / 3);
     }
     meshes[name] = [NSValue valueWithPointer:m];
     return m;

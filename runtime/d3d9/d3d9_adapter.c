@@ -1,5 +1,6 @@
 // IDirect3D9: one adapter reporting a DirectX 9 class GPU (shader model 2.0, like the
 // Radeon 9800 the game was tuned on), its display modes, formats and caps.
+#include <stdio.h>
 #include <string.h>
 
 #include "bl_win32.h"
@@ -92,7 +93,7 @@ static int is_depth(uint32_t f) { return f == 70 || f == 71 || f == 73 || f == 7
 uint32_t bl_IDirect3D9_CheckDeviceFormat_c(uint32_t self, uint32_t adapter, uint32_t type, uint32_t adapter_fmt,
                                           uint32_t usage, uint32_t rtype, uint32_t fmt)
 {
-    (void)self, (void)type, (void)adapter_fmt, (void)rtype;
+    (void)self, (void)type, (void)adapter_fmt;
     if (adapter) return D3DERR_INVALIDCALL;
     int color_rt = fmt == 21 || fmt == 22 || fmt == 23 || fmt == 113 || fmt == 114 || fmt == 116 || fmt == 36 || fmt == 34;
     switch (fmt) {
@@ -101,7 +102,14 @@ uint32_t bl_IDirect3D9_CheckDeviceFormat_c(uint32_t self, uint32_t adapter, uint
     case FOURCC('D', 'X', 'T', '1'): case FOURCC('D', 'X', 'T', '3'): case FOURCC('D', 'X', 'T', '5'):
         break;
     case 75: case 77: case 80:
-        return (usage & 1) ? D3DERR_NOTAVAILABLE : D3D_OK;  // not as render targets
+        // Depth buffers only: not render targets, and not textures (the renderer has no
+        // depth textures to sample), D3DRTYPE_TEXTURE, VOLUMETEXTURE, CUBETEXTURE.
+        if (rtype == 3 || rtype == 4 || rtype == 5) {
+            static int said;
+            if (!said++) fprintf(stderr, "[d3d9] depth format %u as a texture: not available\n", fmt);
+            return D3DERR_NOTAVAILABLE;
+        }
+        return (usage & 1) ? D3DERR_NOTAVAILABLE : D3D_OK;
     default:
         return D3DERR_NOTAVAILABLE;
     }

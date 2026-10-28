@@ -79,6 +79,7 @@ static struct obj *new_texture(enum obj_type type, uint32_t vtbl, uint32_t w, ui
 uint32_t d3d_create_texture(uint32_t w, uint32_t h, uint32_t levels, uint32_t usage, uint32_t format,
                             uint32_t pool, uint32_t out)
 {
+    if (!w || !h) return D3DERR_INVALIDCALL;
     struct obj *t = new_texture(OBJ_TEXTURE, bl_vtbl_IDirect3DTexture9(), w, h, 1, levels, usage, format, pool, 1);
     put_out(out, t);
     return D3D_OK;
@@ -87,6 +88,7 @@ uint32_t d3d_create_texture(uint32_t w, uint32_t h, uint32_t levels, uint32_t us
 uint32_t d3d_create_volume_texture(uint32_t w, uint32_t h, uint32_t d, uint32_t levels, uint32_t usage,
                                    uint32_t format, uint32_t pool, uint32_t out)
 {
+    if (!w || !h || !d) return D3DERR_INVALIDCALL;
     struct obj *t = new_texture(OBJ_VOLUMETEXTURE, bl_vtbl_IDirect3DVolumeTexture9(), w, h, d, levels, usage, format, pool, 1);
     put_out(out, t);
     return D3D_OK;
@@ -95,6 +97,7 @@ uint32_t d3d_create_volume_texture(uint32_t w, uint32_t h, uint32_t d, uint32_t 
 uint32_t d3d_create_cube_texture(uint32_t edge, uint32_t levels, uint32_t usage, uint32_t format, uint32_t pool,
                                  uint32_t out)
 {
+    if (!edge) return D3DERR_INVALIDCALL;
     struct obj *t = new_texture(OBJ_CUBETEXTURE, bl_vtbl_IDirect3DCubeTexture9(), edge, edge, 1, levels, usage, format, pool, 6);
     put_out(out, t);
     return D3D_OK;
@@ -440,11 +443,30 @@ uint32_t bl_IDirect3DVertexDeclaration9_GetDeclaration_c(uint32_t self, uint32_t
     return D3D_OK;
 }
 
-// Shader bytecode: DWORD tokens ending with 0x0000FFFF.
+// The number of DWORD tokens of shader bytecode: the version token, then instructions up
+// to the end token 0x0000FFFF, or 0 when there is none. Walked an instruction at a time, so
+// data (comments, def's constants) is never taken for the end. Shader model 2 and later
+// give each instruction's length; in 1.x, parameter tokens have the top bit set and are
+// stepped over one by one.
+static uint32_t shader_tokens(uint32_t code)
+{
+    uint32_t major = G32(code) >> 8 & 0xFF;
+    for (uint32_t i = 1; i < 0x10000;) {
+        uint32_t t = G32(code + 4 * i), op = t & 0xFFFF;
+        if (t == 0x0000FFFF) return i + 1;
+        if (t >> 31) i++;                                                // 1.x parameter
+        else if (op == 0xFFFE) i += 1 + (t >> 16 & 0x7FFF);                // comment
+        else if (op == 0x51 || op == 0x30) i += 6;                       // def, defi
+        else if (op == 0x2F) i += 3;                                     // defb
+        else i += major >= 2 ? 1 + (t >> 24 & 0xF) : 1;
+    }
+    return 0;
+}
+
 uint32_t d3d_create_shader(enum obj_type type, uint32_t code, uint32_t out)
 {
-    uint32_t n = 1;
-    while (G32(code + 4 * (n - 1)) != 0x0000FFFF) n++;
+    uint32_t n = code ? shader_tokens(code) : 0;
+    if (!n) return D3DERR_INVALIDCALL;
     struct obj *s = obj_new(type, type == OBJ_VSHADER ? bl_vtbl_IDirect3DVertexShader9() : bl_vtbl_IDirect3DPixelShader9());
     s->size = 4 * n;
     s->mem = bl_guest_malloc(s->size);

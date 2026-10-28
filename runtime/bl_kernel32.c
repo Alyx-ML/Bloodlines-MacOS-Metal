@@ -50,6 +50,10 @@ uint32_t bl_errno_to_win32(int err)
     case EEXIST: return BL_ERROR_FILE_EXISTS;
     case ENOMEM: return BL_ERROR_NOT_ENOUGH_MEMORY;
     case EBADF: return BL_ERROR_INVALID_HANDLE;
+    case ENOSPC: case EDQUOT: return BL_ERROR_DISK_FULL;
+    case ENOTEMPTY: return BL_ERROR_DIR_NOT_EMPTY;
+    case EXDEV: return BL_ERROR_NOT_SAME_DEVICE;
+    case ENAMETOOLONG: return BL_ERROR_FILENAME_EXCED_RANGE;
     default: return BL_ERROR_INVALID_PARAMETER;
     }
 }
@@ -86,6 +90,22 @@ uint32_t bl_handle_new(enum bl_handle_type type, void *obj)
             return i * 4;
         }
     bl_fatal("out of Win32 handles");
+}
+
+// Another handle to what `h` stands for (events and threads, which are never freed), or 0.
+uint32_t bl_handle_dup(uint32_t h)
+{
+    uint32_t i = h / 4;
+    pthread_mutex_lock(&handle_lock);
+    int ok = h % 4 == 0 && i && i < MAX_HANDLES && handles[i].type != BL_H_FREE;
+    enum bl_handle_type type = ok ? handles[i].type : BL_H_FREE;
+    void *obj = ok ? handles[i].obj : NULL;
+    pthread_mutex_unlock(&handle_lock);
+    if (!ok) {
+        bl_set_last_error(BL_ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    return bl_handle_new(type, obj);
 }
 
 void *bl_handle_get(uint32_t h, enum bl_handle_type type)
@@ -324,6 +344,24 @@ uint32_t bl_k32_GetFileType_c(uint32_t h)
     return S_ISREG(st.st_mode) || S_ISDIR(st.st_mode) ? 1 : S_ISFIFO(st.st_mode) ? 3 : 2;
 }
 
+#define SKIP_INTRO_KEY "HKCU\\Software\\Troika\\Vampire\\Native"
+int bl_skip_intro_movies(void) { return bl_reg_get_dword(SKIP_INTRO_KEY, "SkipIntroMovies", 0) != 0; }
+
+void bl_skip_intro_movies_set(int on)
+{
+    bl_reg_set_dword(SKIP_INTRO_KEY, "SkipIntroMovies", on != 0);
+    fprintf(stderr, "[movies] intro movies %s\n", on ? "skipped" : "played");
+}
+
+// A Bink movie in the game's media folder: the intro movies, the only ones there.
+static int intro_movie(const char *host)
+{
+    size_t n = strlen(host);
+    const char *slash = strrchr(host, '/');
+    return n > 4 && !strcasecmp(host + n - 4, ".bik") && slash && slash - host >= 6 &&
+           !strncasecmp(slash - 6, "/media", 6);
+}
+
 uint32_t bl_k32_CreateFileA_c(uint32_t name, uint32_t access, uint32_t share, uint32_t sec, uint32_t disposition,
                               uint32_t flags, uint32_t tmpl)
 {
@@ -331,6 +369,11 @@ uint32_t bl_k32_CreateFileA_c(uint32_t name, uint32_t access, uint32_t share, ui
     char host[1024];
     if (!bl_path_to_host(G(name), host, sizeof host)) {
         bl_set_last_error(BL_ERROR_PATH_NOT_FOUND);
+        return BL_INVALID_HANDLE;
+    }
+    // BinkOpen then fails, and the engine goes on to the next movie, then the menu.
+    if (intro_movie(host) && bl_skip_intro_movies()) {
+        bl_set_last_error(BL_ERROR_FILE_NOT_FOUND);
         return BL_INVALID_HANDLE;
     }
     int rd = (access & 0x80000000u) != 0, wr = (access & 0x40000000u) != 0;
@@ -449,6 +492,23 @@ uint32_t bl_k32_DuplicateHandle_c(uint32_t sproc, uint32_t h, uint32_t tproc, ui
                                   uint32_t inherit, uint32_t options)
 {
     (void)sproc, (void)tproc, (void)access, (void)inherit;
+    // GetCurrentProcess()'s handle stands for the process wherever it is; GetCurrentThread()'s
+    // becomes a real handle to the thread (one that works from other threads too).
+    if (h == 0xffffffffu) {
+        if (out) U32(out) = h;
+        return 1;
+    }
+    if (h == 0xfffffffeu) {
+        uint32_t t = bl_thread_current_handle();
+        if (out) U32(out) = t;
+        return t != 0;
+    }
+    if (bl_handle_get(h, BL_H_THREAD) || bl_handle_get(h, BL_H_EVENT)) {
+        uint32_t d = bl_handle_dup(h);
+        if (out) U32(out) = d;
+        if (d && (options & 1)) bl_k32_CloseHandle_c(h);  // DUPLICATE_CLOSE_SOURCE
+        return d != 0;
+    }
     int fd = file_fd(h);
     if (fd < 0) { bl_set_last_error(BL_ERROR_INVALID_HANDLE); return 0; }
     int nfd = dup(fd);
@@ -506,33 +566,45 @@ uint32_t bl_k32_CloseHandle_c(uint32_t h)
     return 1;
 }
 
-static uint32_t path_op_result(int r)
+// The result of a call on host path `host` (0 succeeded, else errno says why).
+static uint32_t path_op_result(const char *host, int r)
 {
     if (r == 0) return 1;
-    bl_set_last_error(bl_errno_to_win32(errno));
+    bl_set_last_error(path_error(host, errno));
+    return 0;
+}
+
+// A path with no place under the game directory.
+static uint32_t bad_path(void)
+{
+    bl_set_last_error(BL_ERROR_PATH_NOT_FOUND);
     return 0;
 }
 
 uint32_t bl_k32_DeleteFileA_c(uint32_t name)
 {
     char host[1024];
-    return bl_path_to_host(G(name), host, sizeof host) ? path_op_result(unlink(host)) : 0;
+    return bl_path_to_host(G(name), host, sizeof host) ? path_op_result(host, unlink(host)) : bad_path();
 }
 
 uint32_t bl_k32_MoveFileA_c(uint32_t from, uint32_t to)
 {
     char a[1024], b[1024];
     struct stat st;
-    if (!bl_path_to_host(G(from), a, sizeof a) || !bl_path_to_host(G(to), b, sizeof b)) return 0;
+    if (!bl_path_to_host(G(from), a, sizeof a) || !bl_path_to_host(G(to), b, sizeof b)) return bad_path();
     if (stat(b, &st) == 0) { bl_set_last_error(BL_ERROR_ALREADY_EXISTS); return 0; }
-    return path_op_result(rename(a, b));
+    // A missing destination folder is the destination's error, anything else the source's.
+    if (rename(a, b) == 0) return 1;
+    int err = errno;
+    bl_set_last_error(err == ENOENT && access(a, F_OK) == 0 ? path_error(b, err) : path_error(a, err));
+    return 0;
 }
 
 uint32_t bl_k32_CreateDirectoryA_c(uint32_t name, uint32_t sec)
 {
     (void)sec;
     char host[1024];
-    if (!bl_path_to_host(G(name), host, sizeof host)) return 0;
+    if (!bl_path_to_host(G(name), host, sizeof host)) return bad_path();
     if (mkdir(host, 0755) == 0) return 1;
     bl_set_last_error(errno == EEXIST ? BL_ERROR_ALREADY_EXISTS : path_error(host, errno));
     return 0;
@@ -880,9 +952,10 @@ uint32_t bl_k32_ReadConsoleInputA_c(uint32_t h, uint32_t buf, uint32_t len, uint
     return 1;
 }
 
-// Environment: the game sees an empty environment plus what it sets itself.
+// Environment: the game sees an empty environment plus what it sets itself (any thread).
 #define MAX_ENV 64
 static char *env_names[MAX_ENV], *env_values[MAX_ENV];
+static pthread_mutex_t env_lock = PTHREAD_MUTEX_INITIALIZER;
 
 uint32_t bl_k32_GetEnvironmentStrings_c(void) { return bl_guest_calloc(1, 4); }
 uint32_t bl_k32_GetEnvironmentStringsW_c(void) { return bl_guest_calloc(1, 4); }
@@ -891,18 +964,29 @@ uint32_t bl_k32_FreeEnvironmentStringsW_c(uint32_t p) { bl_guest_free(p); return
 
 uint32_t bl_k32_GetEnvironmentVariableA_c(uint32_t name, uint32_t buf, uint32_t size)
 {
+    pthread_mutex_lock(&env_lock);
     for (int i = 0; i < MAX_ENV; i++)
         if (env_names[i] && !strcasecmp(env_names[i], G(name))) {
             uint32_t n = (uint32_t)strlen(env_values[i]);
-            if (size <= n) return n + 1;
-            put_str(buf, size, env_values[i]);
-            return n;
+            if (size > n) put_str(buf, size, env_values[i]);
+            pthread_mutex_unlock(&env_lock);
+            return size <= n ? n + 1 : n;
         }
+    pthread_mutex_unlock(&env_lock);
     bl_set_last_error(BL_ERROR_ENVVAR_NOT_FOUND);
     return 0;
 }
 
+static uint32_t set_env(uint32_t name, uint32_t value);
 uint32_t bl_k32_SetEnvironmentVariableA_c(uint32_t name, uint32_t value)
+{
+    pthread_mutex_lock(&env_lock);
+    uint32_t r = set_env(name, value);
+    pthread_mutex_unlock(&env_lock);
+    return r;
+}
+
+static uint32_t set_env(uint32_t name, uint32_t value)
 {
     int slot = -1;
     for (int i = 0; i < MAX_ENV; i++) {
@@ -1307,13 +1391,13 @@ uint32_t bl_k32_SetFileAttributesA_c(uint32_t name, uint32_t attrs)
         return 0;
     }
     mode_t m = (attrs & 0x01) ? st.st_mode & ~(mode_t)0222 : st.st_mode | S_IWUSR;
-    return path_op_result(chmod(host, m));
+    return path_op_result(host, chmod(host, m));
 }
 
 uint32_t bl_k32_RemoveDirectoryA_c(uint32_t name)
 {
     char host[1024];
-    return bl_path_to_host(G(name), host, sizeof host) ? path_op_result(rmdir(host)) : 0;
+    return bl_path_to_host(G(name), host, sizeof host) ? path_op_result(host, rmdir(host)) : bad_path();
 }
 
 uint32_t bl_k32_GetFileSize_c(uint32_t h, uint32_t high)

@@ -566,7 +566,7 @@ static const char *const header =
     "    float4 t0 [[user(t0)]]; float4 t1 [[user(t1)]]; float4 t2 [[user(t2)]]; float4 t3 [[user(t3)]];\n"
     "    float4 t4 [[user(t4)]]; float4 t5 [[user(t5)]]; float4 t6 [[user(t6)]]; float4 t7 [[user(t7)]];\n"
     "    float fog [[user(fog)]]; float fogz [[user(fogz)]];\n"
-    "    float4 bln [[user(bln)]];\n"
+    "    float4 bln [[user(bln)]]; float4 bls [[user(bls)]];\n"
     "};\n"
     "struct BLPSIn {\n"
     "    float4 pos [[position]];\n"
@@ -574,7 +574,7 @@ static const char *const header =
     "    float4 t0 [[user(t0)]]; float4 t1 [[user(t1)]]; float4 t2 [[user(t2)]]; float4 t3 [[user(t3)]];\n"
     "    float4 t4 [[user(t4)]]; float4 t5 [[user(t5)]]; float4 t6 [[user(t6)]]; float4 t7 [[user(t7)]];\n"
     "    float fog [[user(fog)]]; float fogz [[user(fogz)]];\n"
-    "    float4 bln [[user(bln)]];\n"
+    "    float4 bln [[user(bln)]]; float4 bls [[user(bls)]];\n"
     "};\n"
     "static inline float4 bl_c(constant float4 *c, int i, int n) { return uint(i) < uint(n) ? c[i] : float4(0.0); }\n"
     "static inline float4 bl_lit(float4 s) {\n"
@@ -1335,6 +1335,14 @@ static void ps_rain_light(struct out *o)
     line(o, "}");
 }
 
+// A strand's point (variant strand): its colour, lit as the game lights it and fogged,
+// kept for the renderer's strand drawing at the point's vertex id; nothing drawn.
+static void ps_strand(struct out *o)
+{
+    line(o, "bl_hcol[uint(in.bls.x + 0.5)] = float4(clamp(bl_gain(oc0.xyz, p.out_gain), 0.0, p.out_max), 1.0);");
+    line(o, "discard_fragment();");
+}
+
 static void ps_alpha_and_fog(struct out *o)
 {
     line(o, "if (!bl_cmp(p.alpha_func, oc0.w, p.alpha_ref)) discard_fragment();");
@@ -1407,7 +1415,7 @@ static const char *const tess_main =
     "    out.d0 = BL_I(d0); out.d1 = BL_I(d1);\n"
     "    out.t0 = BL_I(t0); out.t1 = BL_I(t1); out.t2 = BL_I(t2); out.t3 = BL_I(t3);\n"
     "    out.t4 = BL_I(t4); out.t5 = BL_I(t5); out.t6 = BL_I(t6); out.t7 = BL_I(t7);\n"
-    "    out.fog = BL_I(fog.x); out.fogz = opos.w;\n"
+    "    out.fog = BL_I(fog.x); out.fogz = opos.w; out.bls = 0;\n"
     "    return out;\n"
     "}\n";
 
@@ -1435,6 +1443,8 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         // Tessellated (v->tess): the shader is a function run on each corner of a triangle.
         int tess = v && v->tess && v->smooth_normal && g.info.input_mask;
         int motion = v && v->motion && !tess;
+        int strand = v && v->strand && !tess && !motion;
+        const char *strand_args = strand ? ",\n                       uint _vid [[vertex_id]], device float4 *bl_hc [[buffer(24)]]" : "";
         if (tess)
             put(o, "struct BLVSRaw { float4 pos, p2, d0, d1, t0, t1, t2, t3, t4, t5, t6, t7, fog, pts; };\n"
                    "static inline BLVSRaw bl_vs(BLVSIn in, constant float4 *c, constant BLVSParams &p) {\n");
@@ -1445,8 +1455,8 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
                 g.info.input_mask ? "BLVSIn in [[stage_in]], " : "");
         else
             put(o, "vertex BLVSOut bl_main(%sconstant float4 *c [[buffer(20)]],\n"
-                   "                       constant BLVSParams &p [[buffer(21)]]) {\n",
-                g.info.input_mask ? "BLVSIn in [[stage_in]], " : "");
+                   "                       constant BLVSParams &p [[buffer(21)]]%s) {\n",
+                g.info.input_mask ? "BLVSIn in [[stage_in]], " : "", strand_args);
         o->indent = 1;
         for (int i = 0; i < D3D_SHADER_MAX_INPUTS; i++)
             if (g.info.input_mask & (1u << i)) line(o, "float4 v%d = float4(in.v%d);", i, i);
@@ -1517,7 +1527,12 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         line(o, "out.pos = opos;");
         line(o, "out.pos.y *= p.clip_y;");
         line(o, "out.pos.xy += float2(p.inv_viewport.x, -p.inv_viewport.y) * opos.w;");
+        line(o, "out.bls = 0;");
         line(o, "out.psize = opts.x;");
+        if (strand) {
+            line(o, "bl_hc[_vid * 2] = out.pos; bl_hc[_vid * 2 + 1] = out.bln;");
+            line(o, "out.psize = 1.0; out.bls = float4(float(_vid), 0.0, 0.0, 0.0);");
+        }
         // The colours within 0 and 1 as D3D9 has them, but for the world view with HDR
         // (p.color_max), whose lighting may pass white.
         line(o, "out.d0 = float4(clamp(od0.xyz, 0.0, p.color_max), saturate(od0.w));");
@@ -1564,6 +1579,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
             put(o, ",\n                         texture2d<float> bl_pm [[texture(12)]], constant float4 *bl_wl [[buffer(4)]],"
                    " texture2d<float> bl_ph [[texture(19)]]");
         if (v && v->rain) put(o, ",\n                         texture2d<float> bl_rl [[texture(20)]]");
+        if (v && v->strand) put(o, ",\n                         device float4 *bl_hcol [[buffer(5)]]");
         put(o, ") {\n");
         o->indent = 1;
         if (surface) {
@@ -1629,6 +1645,12 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (surface) ps_surface(o, g.alb_stage >= 0 ? g.alb_coord : NULL, g.alb_stage);
         if (v && v->rain && (g.info.color_outputs & 1)) ps_rain_light(o);
         ps_alpha_and_fog(o);
+        if (v && v->strand) ps_strand(o);
+        if (v && v->dither) {
+            line(o, "const float _bd[16] = {0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0};");
+            line(o, "uint2 _bq = uint2(in.pos.xy) & 3u;");
+            line(o, "if (oc0.w * 16.0 <= _bd[_bq.y * 4u + _bq.x] + 0.5) discard_fragment();");
+        }
         if (v && v->shadow_caster) line(o, v->shadow_caster == 2 ? "oc0.w = in.pos.z;" : "oc0.w = 1.0 - in.pos.z;");
         line(o, "BLPSOut out;");
         // The colour as an 8-bit target would take it (0 to 1, alpha too), except that the
@@ -1843,7 +1865,7 @@ char *d3d_ff_vs_msl(const struct d3d_ff_vs *k, char *err, int errlen)
         if (k->tex_mask & (1u << n)) line(o, "out.t%d = in.v%d;", n, 3 + n);
         else line(o, "out.t%d = 0;", n);
     }
-    line(o, "out.fog = 1.0; out.fogz = out.pos.w; out.bln = 0;");
+    line(o, "out.fog = 1.0; out.fogz = out.pos.w; out.bln = 0; out.bls = 0;");
     line(o, "return out;");
     put(o, "}\n");
     return o->s;

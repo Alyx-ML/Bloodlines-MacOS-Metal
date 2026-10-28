@@ -349,7 +349,7 @@ uint32_t bl_u32_GetWindowLongA_c(uint32_t h, uint32_t index)
     case -20: return w->exstyle;
     case -21: return w->userdata;
     default:
-        if (index + 4 <= MAX_EXTRA) {
+        if ((int32_t)index >= 0 && index <= MAX_EXTRA - 4) {  // the window's extra bytes
             uint32_t v;
             memcpy(&v, w->extra + index, 4);
             return v;
@@ -372,7 +372,7 @@ uint32_t bl_u32_SetWindowLongA_c(uint32_t h, uint32_t index, uint32_t value)
     case -20: w->exstyle = value; break;
     case -21: w->userdata = value; break;
     default:
-        if (index + 4 <= MAX_EXTRA) memcpy(w->extra + index, &value, 4);
+        if ((int32_t)index >= 0 && index <= MAX_EXTRA - 4) memcpy(w->extra + index, &value, 4);
         break;
     }
     return old;

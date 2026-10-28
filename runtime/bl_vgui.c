@@ -45,7 +45,7 @@ void bl_vgui_GetCursorLine_c(_cpu *cpu)
 // The options dialog gets an "Enhanced" tab after "Visual", holding the renderer's
 // effects as check boxes in three headed columns: "Lighting" (Global Illumination, Bounced
 // Light, Ambient Occlusion, Volumetric Light), "Camera" (HDR, Bloom, Eye Adaptation,
-// Sharpening, Lens Glare) and "Surfaces & Characters" (Reflections, Skin Scattering, Smooth
+// Sharpening, Lens Glare, Depth of Field, Motion Blur) and "Surfaces & Characters" (Reflections, Skin Scattering, Smooth
 // Characters, Skin Detail, Rain Effects). The renderer's shadows are not a box: they are "Enhanced", a fifth choice
 // in the Visual tab's Shadows drop-down, after "Soft".
 // Like the Visual tab's settings they take effect as soon as they are clicked:
@@ -76,7 +76,8 @@ void bl_vgui_GetCursorLine_c(_cpu *cpu)
 extern char GameUI_operator_new[], GameUI_CheckButton_ctor[], GameUI_Panel_SetPos[], GameUI_Panel_GetPos[],
     GameUI_Panel_SetSize[], GameUI_Panel_GetSize[], GameUI_PropertyPage_ctor[], GameUI_PropertyPage_dtor[], GameUI_Label_ctor[],
     GameUI_SubVisual_Update[], GameUI_CvarSlider_Reset[], GameUI_CommandCombo_Reset[], GameUI_CvarToggle_Reset[],
-    GameUI_LabeledCombo_ctor[];
+    GameUI_LabeledCombo_ctor[], GameUI_Slider_ctor[], GameUI_Slider_SetRange[], GameUI_Slider_SetCaption[],
+    GameUI_Slider_RecomputeNob[];
 int bl_effect_enabled(int effect);
 void bl_effect_set(int effect, int on);
 int bl_upscaler_get(int which);
@@ -84,6 +85,12 @@ int bl_upscaler_set(int which, int value);  // 0: refused (FSR 4 that cannot run
 int bl_render_live_mode(uint32_t width, uint32_t height);
 int bl_display_mode_get(void);
 void bl_display_mode_set(int mode);
+int bl_skip_intro_movies(void);
+void bl_skip_intro_movies_set(int on);
+int bl_camera_fov(void);
+void bl_camera_fov_set(int degrees);
+int bl_camera_body(void);
+void bl_camera_body_set(int on);
 void bl_render_output_size(uint32_t *width, uint32_t *height);
 
 // In the order of the renderer's effects (BL_EFFECT_* in metal_render.m). Shadows and the
@@ -92,18 +99,30 @@ static const char *const box_names[] = { "AmbientOcclusion", "Reflections", "HDR
                                          "SkinScattering", "Shadows", "Bloom", "EyeAdaptation",
                                          "BouncedLight", "GlobalIllumination", "SmoothCharacters",
                                          "SharpenAfterAA", "SkinDetail", "QuestCompass", "RainEffects",
-                                         "LensGlare" };
+                                         "LensGlare", "DepthOfField", "MotionBlur" };
 static const char *const box_texts[] = { "Ambient Occlusion", "Reflections", "HDR", "Volumetric Light",
                                          "Skin Scattering", "Shadows", "Bloom", "Eye Adaptation",
                                          "Bounced Light", "Global Illumination", "Smooth Characters",
                                          "Sharpening", "Skin Detail", "Quest compass", "Rain Effects",
-                                         "Lens Glare" };
-#define NBOXES 16
+                                         "Lens Glare", "Depth of Field", "Motion Blur" };
+#define NBOXES 18
 static uint32_t box_page, enhanced_page, boxes[NBOXES];
 // The Gameplay tab gets one more: the quest compass (bl_compass.c), the renderer's setting
 // after the Enhanced tab's (BL_EFFECT_COMPASS), under the tab's "Damage floaters" box.
 #define COMPASS_EFFECT 13
 static uint32_t gameplay_page, compass_box;
+// And under it, skipping the intro movies (bl_skip_intro_movies, bl_kernel32.c), the
+// first-person body and, under them, the Field of View slider (bl_camera_* in
+// bl_client.c). The slider is a plain vgui::Slider (0xa0 bytes, built with (parent,
+// name) at 0x10035C30): SetRange(lo, hi) at 0x10036620, its caption at 0x100363E0,
+// +0x80 its value, +0x9c its tick count, and 0x10035D90 places the knob for the value.
+static uint32_t intro_box, body_box, fov_slider;
+#define FOV_LO 65
+#define FOV_HI 110
+
+// Whether the options screen shows slider p's value as it is (degrees) rather than as a
+// share of its range (bl_options.c).
+int bl_vgui_slider_in_units(uint32_t p) { return p && p == fov_slider; }
 #define LOG_ONCE_VGUI(...) do { static int once_; if (!once_++) fprintf(stderr, __VA_ARGS__); } while (0)
 
 static uint32_t call_this(void *cpu, const void *fn, uint32_t self, int nargs, const uint32_t *args)
@@ -121,7 +140,7 @@ static uint32_t vcall(void *cpu, uint32_t self, uint32_t slot, int nargs, const 
 // Places in optionssubvisual.res units (scaled to the screen like the Visual tab, where
 // "Combat effects" is at 336,160 and 28 tall; the page runs from about -120 to 935
 // across and -15 to 300 down): three columns 300 apart around the page's middle, each a
-// heading and its boxes 40 apart (four in the first, five in the others). x, y.
+// heading and its boxes 40 apart (four in the first, seven in the second, five in the third). x, y.
 #define COLUMN_W 290
 static const int heading_x[3] = { -24, 276, 576 };
 #define HEADING_Y 45
@@ -129,7 +148,8 @@ static const char *const heading_texts[3] = { "Lighting", "Camera", "Surfaces & 
 static const int box_place[NBOXES][2] = { { -24, 165 }, { 576, 85 },  { 276, 85 },  { -24, 205 },
                                            { 576, 125 }, { 0, 0 },     { 276, 125 }, { 276, 165 },
                                            { -24, 125 }, { -24, 85 },  { 576, 165 }, { 276, 205 },
-                                           { 576, 205 }, { 0, 0 },     { 576, 245 }, { 276, 245 } };
+                                           { 576, 205 }, { 0, 0 },     { 576, 245 }, { 276, 245 },
+                                           { 276, 285 }, { 276, 325 } };
 
 // The Shadows drop-down (the Visual page's +0x80) is a CCvarLabeledComboBox: +0x58 its
 // ComboBox, +0x6c its item count, +0x7c the cvar's value at the last reset; AddItem(text,
@@ -150,12 +170,9 @@ static void add_enhanced_shadows(void *cpu, uint32_t combo)
     uint32_t a[2] = { text, command };
     vcall(cpu, combo, 0x1b8, 2, a);
     shadow_combo = combo;
-    // The setting shows as Enhanced only with Soft shadows; with any other it is off.
-    if (field(combo, 0x7c) != 3) {
-        if (bl_effect_enabled(SHADOWS_EFFECT)) bl_effect_set(SHADOWS_EFFECT, 0);
-    } else if (bl_effect_enabled(SHADOWS_EFFECT)) {
-        vcall(cpu, combo, 0x1bc, 1, &n);
-    }
+    // The setting shows as Enhanced only with Soft shadows. Opening the page changes
+    // nothing: only the player's pick does (bl_vgui_poll).
+    if (field(combo, 0x7c) == 3 && bl_effect_enabled(SHADOWS_EFFECT)) vcall(cpu, combo, 0x1bc, 1, &n);
 }
 
 // Drop-downs of the renderer's settings: on the Visual tab the upscaling ones
@@ -283,23 +300,49 @@ static void make_boxes(void *cpu, uint32_t page)
         vcall(cpu, box, 0x23c, 1, &on);
         boxes[i] = box;
     }
-    if (gameplay_page && !compass_box) {  // at 40,90 in optionssubgameplay.res units
-        static uint32_t name, text;
-        if (!name) name = bl_guest_strdup("QuestCompass"), text = bl_guest_strdup("Quest compass");
-        uint32_t size = 0xfc;
-        uint32_t box = bl_call_guest(cpu, bl_h2g(GameUI_operator_new), BL_CDECL, 0, 1, &size);
-        if (!box) return;
-        uint32_t a[3] = { gameplay_page, name, text };
-        call_this(cpu, GameUI_CheckButton_ctor, box, 3, a);
+    if (gameplay_page && !compass_box) {  // at 40,90 and every 40 down in optionssubgameplay.res units
+        static uint32_t names[3], texts[3], fov_name, fov_text;
+        if (!names[0]) {
+            names[0] = bl_guest_strdup("QuestCompass"), texts[0] = bl_guest_strdup("Quest compass");
+            names[1] = bl_guest_strdup("SkipIntroMovies"), texts[1] = bl_guest_strdup("Skip intro movies");
+            names[2] = bl_guest_strdup("FirstPersonBody"), texts[2] = bl_guest_strdup("First-person body");
+            fov_name = bl_guest_strdup("FieldOfView"), fov_text = bl_guest_strdup("Field of View");
+        }
+        for (int i = 0; i < 3; i++) {
+            uint32_t size = 0xfc;
+            uint32_t box = bl_call_guest(cpu, bl_h2g(GameUI_operator_new), BL_CDECL, 0, 1, &size);
+            if (!box) return;
+            uint32_t a[3] = { gameplay_page, names[i], texts[i] };
+            call_this(cpu, GameUI_CheckButton_ctor, box, 3, a);
+            uint32_t at[2] = { pos[0] + (uint32_t)(int32_t)floor((40 - 336) * k + 0.5),
+                               pos[1] + (uint32_t)(int32_t)floor((90 + 40 * i - 160) * k + 0.5) };
+            uint32_t wh[2] = { (uint32_t)(420 * k + 0.5), sz[1] };
+            call_this(cpu, GameUI_Panel_SetPos, box, 2, at);
+            call_this(cpu, GameUI_Panel_SetSize, box, 2, wh);
+            vcall(cpu, box, 0x1d8, 1, &font);
+            uint32_t on = i == 2 ? bl_camera_body() : i ? bl_skip_intro_movies() : bl_effect_enabled(COMPASS_EFFECT) != 0;
+            vcall(cpu, box, 0x23c, 1, &on);
+            if (i == 2) body_box = box;
+            else if (i) intro_box = box;
+            else compass_box = box;
+        }
+        uint32_t size = 0xa0;  // at 40,210, a tick every 5 degrees
+        uint32_t slider = bl_call_guest(cpu, bl_h2g(GameUI_operator_new), BL_CDECL, 0, 1, &size);
+        if (!slider) return;
+        uint32_t a[2] = { gameplay_page, fov_name };
+        call_this(cpu, GameUI_Slider_ctor, slider, 2, a);
+        uint32_t range[2] = { FOV_LO, FOV_HI };
+        call_this(cpu, GameUI_Slider_SetRange, slider, 2, range);
+        call_this(cpu, GameUI_Slider_SetCaption, slider, 1, &fov_text);
+        *(uint32_t *)bl_g2h(slider + 0x80) = (uint32_t)bl_camera_fov();
+        *(uint32_t *)bl_g2h(slider + 0x9c) = (FOV_HI - FOV_LO) / 5;
         uint32_t at[2] = { pos[0] + (uint32_t)(int32_t)floor((40 - 336) * k + 0.5),
-                           pos[1] + (uint32_t)(int32_t)floor((90 - 160) * k + 0.5) };
+                           pos[1] + (uint32_t)(int32_t)floor((210 - 160) * k + 0.5) };
         uint32_t wh[2] = { (uint32_t)(420 * k + 0.5), sz[1] };
-        call_this(cpu, GameUI_Panel_SetPos, box, 2, at);
-        call_this(cpu, GameUI_Panel_SetSize, box, 2, wh);
-        vcall(cpu, box, 0x1d8, 1, &font);
-        uint32_t on = bl_effect_enabled(COMPASS_EFFECT) != 0;
-        vcall(cpu, box, 0x23c, 1, &on);
-        compass_box = box;
+        call_this(cpu, GameUI_Panel_SetPos, slider, 2, at);
+        call_this(cpu, GameUI_Panel_SetSize, slider, 2, wh);
+        call_this(cpu, GameUI_Slider_RecomputeNob, slider, 0, NULL);
+        fov_slider = slider;
     }
 }
 
@@ -323,7 +366,8 @@ void bl_vgui_AddPage_c(_cpu *cpu)
     uint32_t dialog = ecx, page = args[0], title = args[1];
     uint32_t a[3] = { page, title, 0 };
     vcall(cpu, field(dialog, 0xe4), 0x1ac, 3, a);
-    if (title && !strcmp((const char *)bl_g2h(title), "#GameUI_Gameplay")) gameplay_page = page, compass_box = 0;
+    if (title && !strcmp((const char *)bl_g2h(title), "#GameUI_Gameplay"))
+        gameplay_page = page, compass_box = intro_box = body_box = fov_slider = 0;
     // The Video tab: Display Mode under Resolution (+0x1a0).
     if (title && !strcmp((const char *)bl_g2h(title), "#GameUI_Video") && field(page, 0x1a0))
         make_combo(cpu, page, DISPLAY_COMBO, field(page, 0x1a0), 1);
@@ -375,7 +419,8 @@ void bl_vgui_VisualDestroy_c(_cpu *cpu)
 {
     uint32_t page = ecx;
     if (box_page == page)
-        box_page = 0, enhanced_page = 0, memset(boxes, 0, sizeof boxes), gameplay_page = 0, compass_box = 0;
+        box_page = 0, enhanced_page = 0, memset(boxes, 0, sizeof boxes), gameplay_page = 0,
+        compass_box = intro_box = body_box = fov_slider = 0;
     if (shadow_combo == field(page, 0x80)) shadow_combo = 0;
     // The dialog deletes its pages together: the Video tab's drop-down goes with these.
     if (upscale_page == page) upscale_page = 0, memset(combos, 0, sizeof combos);
@@ -401,6 +446,23 @@ void bl_vgui_poll(void)
     for (int i = 0; i < NBOXES; i++)
         if (boxes[i]) poll_box(boxes[i], i, &seen_box[i], &seen_on[i]);
     if (compass_box) poll_box(compass_box, COMPASS_EFFECT, &seen_box[NBOXES], &seen_on[NBOXES]);
+    if (intro_box) {  // saved when it differs from the setting
+        int on = *(const uint8_t *)bl_g2h(intro_box + 0xba) != 0;
+        static int seen = -1;
+        if (on != seen) {
+            seen = on;
+            if (on != bl_skip_intro_movies()) bl_skip_intro_movies_set(on);
+        }
+    }
+    if (body_box) {
+        int on = *(const uint8_t *)bl_g2h(body_box + 0xba) != 0;
+        if (on != bl_camera_body()) bl_camera_body_set(on);
+    }
+    // The slider takes effect as it moves; saved when its value differs from the setting.
+    if (fov_slider) {
+        int v = (int)field(fov_slider, 0x80);
+        if (v >= FOV_LO && v <= FOV_HI && v != bl_camera_fov()) bl_camera_fov_set(v);
+    }
     // The Shadows drop-down: as a box, a change is saved, compared with the text last seen.
     static uint32_t seen_combo;
     static int seen_enhanced;

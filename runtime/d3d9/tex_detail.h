@@ -45,9 +45,12 @@ id<MTLTexture> bl_detail_flat(id<MTLDevice> dev);
 // strips, in the space of `anchors` (the game's hair vertices they replace, in the same
 // units as the tools' import), with their own texture; or, with no strips, the part of
 // the game's hair to keep drawing, as a rectangle of its texture coordinates (`keep`).
+// Strands (version 3 of the file): points along the strands, whose indices are pairs (a
+// segment each), drawn by the renderer itself (metal_render.m, hair_run).
 struct bl_hair_mesh {
     uint32_t nverts, nidx, nanchors;
     const float *verts;  // nverts x {position xyz, normal xyz, uv}
+    const float *strand; // strands: nverts x {colour rgb, half-width}; else NULL
     const uint32_t *idx;
     const float *anchors;  // nanchors x xyz
     float keep[4];         // u0, v0, u1, v1
