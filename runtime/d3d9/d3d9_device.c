@@ -151,6 +151,7 @@ uint32_t bl_IDirect3DDevice9_Reset_c(DEV, uint32_t pp)
 {
     UNUSED;
     memcpy(st.pp, bl_g2h(pp), sizeof st.pp);
+    fprintf(stderr, "[d3d9] reset %ux%u format %u\n", st.pp[0], st.pp[1], st.pp[2]);
     make_back_buffers();
     memcpy(bl_g2h(pp), st.pp, sizeof st.pp);
     return D3D_OK;

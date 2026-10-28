@@ -233,6 +233,11 @@ const char *bl_tex_name_any_thread(uint32_t w, uint32_t h, uint32_t format, cons
     return e && e->w == w && e->h == h ? e->name : NULL;
 }
 
+uint64_t bl_tex_key(uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch)
+{
+    return level_key(w, h, format, data, pitch);
+}
+
 id<MTLTexture> bl_hires_texture(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data,
                                 uint32_t pitch)
 {

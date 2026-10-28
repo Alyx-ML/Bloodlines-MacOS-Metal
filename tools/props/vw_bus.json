@@ -1,0 +1,1 @@
+{"model": "models/scenery/vehicles/vw_bus/vw_bus.mdl", "method": "rebuild", "bevel": 2.5, "segments": 2, "angle": 35, "length": 15, "material": "VW_Bus", "wheels": {"axis": "y", "centers": [[61.27, 14.73], [-53.42, 14.73]], "radius": 16, "sides": 24}}

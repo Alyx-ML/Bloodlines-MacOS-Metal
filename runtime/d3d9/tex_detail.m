@@ -5,6 +5,7 @@
 // so only the aspect has to agree. BL_TEX_DIR names the folder (default:
 // native/build/textures/characters, beside the boot binary's build folder).
 #import "tex_detail.h"
+#include "char_remodel.h"
 #import <ImageIO/ImageIO.h>
 #include <mach-o/dyld.h>
 #include <math.h>
@@ -814,5 +815,30 @@ const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, uint64_t key, uint3
         if (m) fprintf(stderr, "[detail] hair mesh for %s: %u vertices, %u triangles\n", name.UTF8String, m->nverts, m->nidx / 3);
     }
     meshes[name] = [NSValue valueWithPointer:m];
+    return m;
+}
+
+const struct bl_body_mesh *bl_detail_body(uint64_t key, uint32_t w, uint32_t h, const char **name)
+{
+    static NSMutableDictionary<NSString *, NSValue *> *meshes;
+    if (!cache) return NULL;
+    NSArray *hit = cache_find(key, 0, w, h);
+    if (!hit || hit.count < 3 || hit[2] == [NSNull null]) return NULL;
+    NSString *nm = hit[2];
+    if (name) *name = nm.UTF8String;
+    if (!meshes) meshes = [NSMutableDictionary new];
+    NSValue *v = meshes[nm];
+    if (v) return v.pointerValue;
+    struct bl_body_mesh *m = NULL;
+    char path[1600];
+    snprintf(path, sizeof path, "%s/%s", dir, nm.UTF8String);
+    char *u = strstr(path, "_n.png");
+    if (u) {
+        snprintf(u, path + sizeof path - u, "_mesh.bin");
+        NSData *d = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path]];
+        if (d) m = char_mesh_parse(d.bytes, d.length, path);
+        if (m) fprintf(stderr, "[detail] character mesh for %s: %u vertices, %u triangles\n", nm.UTF8String, m->nverts, m->nidx / 3);
+    }
+    meshes[nm] = [NSValue valueWithPointer:m];
     return m;
 }

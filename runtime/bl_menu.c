@@ -193,7 +193,9 @@ void bl_menu_Smoke(_cpu *cpu)
     uint32_t sa = eax, sc = ecx, sd = edx, skip = 0;
     if (cur_menu == ecx && cur_level) {
         gothic_flush(cpu, surface(cpu));
-        bl_metal_backdrop(0, 1, (const int (*)[4])glow, glow[2] > glow[0]);
+        int sw, sh;
+        gothic_screen(cpu, surface(cpu), &sw, &sh);
+        bl_metal_backdrop(0, 1, (const int (*)[4])glow, glow[2] > glow[0], sw, sh);
         divider(cpu, ecx);
         skip = 1;
     }
@@ -210,7 +212,9 @@ void bl_menu_Logo(_cpu *cpu)
     uint32_t sa = eax, sc = ecx, sd = edx;
     if (!cur_level) {
         gothic_flush(cpu, surface(cpu));
-        bl_metal_backdrop(2, 0, (const int (*)[4])glow, glow[2] > glow[0]);
+        int sw, sh;
+        gothic_screen(cpu, surface(cpu), &sw, &sh);
+        bl_metal_backdrop(2, 0, (const int (*)[4])glow, glow[2] > glow[0], sw, sh);
         divider(cpu, cur_menu);
     }
     double u = unit(cpu);

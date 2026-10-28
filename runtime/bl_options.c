@@ -99,7 +99,7 @@ enum { SET_LABEL_EM = 15, SET_GAP = 16, SET_TALL = 76, SET_SPACE = 54, COL_W = 6
 // fit down to 40 from the bottom of the sheet; the label 22 in, the control in the last 380
 // (a slider's value in its last 70), its value 26-pixel. The description 120 right of them,
 // its title 22-pixel.
-enum { ROW_W = 960, ROW_H = 56, ROW_MIN = 38, ROW_HEAD = 60, ROW_PAD = 22, CTRL_W = 380, NUM_W = 70,
+enum { ROW_W = 960, ROW_H = 56, ROW_MIN = 38, ROW_TIGHT = 30, ROW_HEAD = 60, ROW_PAD = 22, CTRL_W = 380, NUM_W = 70,
        ROW_VALUE_EM = 26, DESC_GAP = 120, DESC_EM = 22 };
 
 static const int IVORY[3] = { 236, 226, 207 }, GOLD[3] = { 176, 143, 88 }, GOLD_HI[3] = { 230, 201, 143 },
@@ -481,9 +481,10 @@ static const char *const descriptions[][2] = {
     { "Resolution", "The size of the picture. Higher is sharper, lower is faster." },
     { "Display Mode", "In a window, a borderless window over the whole screen, or full screen." },
     { "Upscaler", "What enlarges the picture to the screen's size: Apple's MetalFX or AMD's FSR 4. Both "
-                  "also smooth jagged edges." },
+                  "also smooth jagged edges. None draws it at full size with MetalFX smoothing the edges "
+                  "only." },
     { "Upscaling Quality", "How big the picture is drawn before it is enlarged. Native draws it at full "
-                           "size; the lower settings are faster but softer." },
+                           "size; the lower settings are faster but softer. Not used with no upscaler." },
     { "Image Quality", "How detailed the textures are. Lower uses less memory." },
     { "Lighting", "How the world is lit. Higher looks better and costs more." },
     { "Bump Mapping", "Relief on walls, floors and characters from their surface maps." },
@@ -510,6 +511,9 @@ static const char *const descriptions[][2] = {
     { "Skin Scattering", "Light passing softly into skin, so faces look less waxy." },
     { "Smooth Characters", "Rounder characters, without the corners of their original shapes." },
     { "Skin Detail", "Fine pores and creases on faces and hands." },
+    { "Rain Effects", "Where it rains, streets and pavements turn dark and shiny, with puddles that "
+                     "reflect the lights and ripple in the rain. Grass, dirt and sand stay as they are." },
+    { "Lens Glare", "Bright lamps streak and glow at night, as through a camera's lens." },
     { "Auto Renew Disciplines", "A discipline starts again by itself when it runs out, while you have "
                                 "the blood for it." },
     { "Show Damage Floaters", "Numbers rise from those you hit, showing the damage." },
@@ -576,6 +580,12 @@ static void layout_rows(void *cpu, uint32_t pg, const uint32_t *ps, const int *k
     int rh = (int)(px(ROW_H) * f), hh = (int)(px(ROW_HEAD) * f);
     if (rh < px(ROW_MIN)) rh = px(ROW_MIN);
     if (hh < htall + px(4)) hh = htall + px(4);
+    // Still too many (the Enhanced tab's): the rows share what the headings leave, down to
+    // ROW_TIGHT, so the last one is not cut off.
+    if (nr && nh * hh + nr * rh > room) {
+        int fit = (room - nh * hh) / nr;
+        rh = fit < px(ROW_TIGHT) ? px(ROW_TIGHT) : fit;
+    }
     int w = pw < px(ROW_W) ? pw : px(ROW_W);
     if (pg != desc_page) desc_page = pg, desc_name[0] = 0;
     desc_x = x0 + w + px(DESC_GAP), desc_y = y0 + top, desc_w = pw - w - px(DESC_GAP);
@@ -750,7 +760,7 @@ static void layout_page(void *cpu, uint32_t s, uint32_t pg)
 static void paint_dialog(void *cpu, uint32_t s)
 {
     gothic_flush(cpu, s);
-    bl_metal_backdrop(1, bl_menu_in_level(cpu), (const int (*)[4])glows, nglow);
+    bl_metal_backdrop(1, bl_menu_in_level(cpu), (const int (*)[4])glows, nglow, screen_w, screen_h);
     uint32_t font = gothic_font(cpu, s, TITLE_EM * unit());
     text3(cpu, s, font, "OPTIONS", px(LEFT), px(TITLE_Y), px(TITLE_EM * 0.32), IVORY, 1);
     gothic_line(cpu, s, px(LEFT + 22), px(LEFT + 560), px(RULE_Y), gold_fade, 3, 1);
@@ -1016,6 +1026,71 @@ static void paint_box(void *cpu, uint32_t s, int w, int h)
     frame_rect(cpu, s, 0, 0, w, h);
 }
 
+// The Load Game and Save Game dialogs, laid out at the screen's scale like the options
+// (the game's own layout is for its smaller fonts: rows 20 pixels tall at 1080): a panel
+// 1500 by 860 in the middle, the notes under its title, then the save's name (Save Game),
+// the list with 40-pixel rows, and its buttons in a row at the bottom. Each in the order
+// the game put them, top to bottom.
+enum { GAMES_W = 1500, GAMES_H = 860, GAMES_PAD = 48, GAMES_TOP = 100, GAMES_ROW = 40, GAMES_FIELD = 46 };
+
+static void layout_games(void *cpu, uint32_t s, uint32_t f)
+{
+    int w = px(GAMES_W) < screen_w - px(80) ? px(GAMES_W) : screen_w - px(80);
+    int h = px(GAMES_H) < screen_h - px(80) ? px(GAMES_H) : screen_h - px(80);
+    set_bounds(cpu, f, (screen_w - w) / 2, (screen_h - h) / 2, w, h);
+    struct { uint32_t p; int kind, x, y; } it[24];
+    int n = 0;
+    uint32_t vp = field(f, 4), ip = ipanel(cpu);
+    int count = (int)vcall(cpu, ip, IP_CHILD_COUNT, 1, &vp);
+    for (int i = 0; i < count && n < 24; i++) {
+        uint32_t a[2] = { vp, i }, c = panel_of(cpu, vcall(cpu, ip, IP_CHILD, 2, a));
+        if (!c || is(c, FRAME_BUTTON) || is(c, FRAME_SYSTEM_BUTTON) || !(vcall(cpu, c, P_IS_VISIBLE, 0, NULL) & 0xff))
+            continue;
+        it[n].p = c, it[n].kind = kind_of(cpu, c);
+        get_bounds(cpu, c, &it[n].x, &it[n].y, NULL, NULL);
+        home_pos(c, &it[n].x, &it[n].y);
+        n++;
+    }
+    for (int a = 1; a < n; a++)  // top to bottom, then left to right
+        for (int b = a; b > 0 && (it[b].y < it[b - 1].y || (it[b].y == it[b - 1].y && it[b].x < it[b - 1].x)); b--) {
+            __typeof__(it[0]) t = it[b];
+            it[b] = it[b - 1], it[b - 1] = t;
+        }
+    int x0 = px(GAMES_PAD), cw = w - 2 * x0, y = px(GAMES_TOP);
+    int bt = gothic_tall(PAGE_BTN_EM * unit()) + px(10), by = h - px(GAMES_PAD) * 3 / 4 - bt;
+    double em = 24 * unit();
+    uint32_t body = body_font(cpu, s, em);
+    for (int i = 0; i < n; i++) {
+        if (it[i].kind == K_NOTE || it[i].kind == K_HEADING) {
+            char t[256], lines[4][160];
+            label_text(cpu, it[i].p, t, sizeof t);
+            int k = wrap(cpu, s, body, t, cw, lines, 4), lh = (k > 0 ? k : 1) * body_tall(em);
+            set_bounds(cpu, it[i].p, x0, y, cw, lh);
+            y += lh + px(18);
+        } else if (it[i].kind == K_OTHER) {
+            set_bounds(cpu, it[i].p, x0, y, cw / 2, px(GAMES_FIELD));
+            y += px(GAMES_FIELD) + px(18);
+        }
+    }
+    for (int i = 0; i < n; i++)
+        if (it[i].kind == K_LIST) {
+            uint32_t l = it[i].p;
+            *(uint32_t *)bl_g2h(l + 0x104) = (uint32_t)px(GAMES_ROW);
+            *(uint32_t *)bl_g2h(l + 0xec) = (uint32_t)px(GAMES_ROW);
+            set_bounds(cpu, l, x0, y + px(6), cw, by - px(30) - y - px(6));
+        }
+    uint32_t font = gothic_font(cpu, s, PAGE_BTN_EM * unit());
+    int x = x0;
+    for (int i = 0; i < n; i++)
+        if (it[i].kind == K_BUTTON) {
+            char t[64];
+            caps(cpu, it[i].p, t, sizeof t);
+            int bw = gothic_text_width(cpu, s, font, t, px(PAGE_BTN_EM * 0.26));
+            set_bounds(cpu, it[i].p, x, by, bw + px(6), bt);
+            x += bw + px(BTN_GAP);
+        }
+}
+
 // A confirmation or message box: a dark panel, a gold frame, the title over a divider.
 static void paint_popup(void *cpu, uint32_t f)
 {
@@ -1083,8 +1158,11 @@ void bl_options_FrameBackground(_cpu *cpu)
         skip = 1;
     } else if (is(f, LOAD_GAME) || is(f, SAVE_GAME)) {
         games = f, games_seen = now(), frame_no++;
-        gothic_flush(cpu, surface(cpu));
-        bl_metal_backdrop(1, bl_menu_in_level(cpu), NULL, 0);
+        uint32_t s = surface(cpu);
+        screen(cpu, s);
+        layout_games(cpu, s, f);
+        gothic_flush(cpu, s);
+        bl_metal_backdrop(1, bl_menu_in_level(cpu), NULL, 0, 0, 0);
         paint_popup(cpu, f);
         skip = 1;
     } else if (is(f, CONFIRM) || is(f, MESSAGE_BOX)) {

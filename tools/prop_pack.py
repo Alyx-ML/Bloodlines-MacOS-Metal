@@ -17,6 +17,7 @@ Writes <out>/<model>/<mesh number>.msh and rebuilds <out>/index.txt from all of 
 """
 import argparse
 import hashlib
+import json
 import os
 import struct
 import sys
@@ -118,6 +119,13 @@ def main():
                     lines.append(f"{key} {len(me['tris'])} {name}\n")
                     print(f"{model} mesh {k} ({me['material']}): {len(me['tris'])} triangles -> {nt}")
                 write_file(os.path.join(out, rel, "keys"), "".join(lines))
+                # relief remodels' lighting is smoothed when drawn (prop_remodel.c)
+                recipe = os.path.join(HERE, "props", stem + ".json")
+                smooth = os.path.join(out, rel, "smooth")
+                if os.path.exists(recipe) and json.load(open(recipe)).get("method") == "relief":
+                    write_file(smooth, "")
+                elif os.path.exists(smooth):
+                    os.remove(smooth)
             except mdl_extract.Refused as e:
                 print(f"refused {model}: {e}", file=sys.stderr)
                 refused += 1

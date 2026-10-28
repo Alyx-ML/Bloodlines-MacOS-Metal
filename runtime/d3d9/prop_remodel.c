@@ -152,6 +152,56 @@ static void blend(uint8_t *dst, const uint8_t *src[3], const float w[3], int nea
     }
 }
 
+// A relief remodel's colours (the game's lighting worked out at the original's corners,
+// blended across its big triangles, which shows them): each a Gaussian mean of those
+// within SMOOTH_R units, for remodels whose folder holds a "smooth" file
+// (tools/prop_pack.py writes it for tools/blender/rock_relief.py's). Bytes colours only.
+#define SMOOTH_R 48.0f
+static int smooth_colours(const struct prop_in *in, struct prop_out *out, const float *mv, uint32_t nv)
+{
+    int done = 0;
+    for (int i = 0; i < in->nel; i++) {
+        const struct prop_elem *el = &in->el[i];
+        if (el->usage != 10 || (el->type != 4 && el->type != 8) || !out->data[el->stream]) continue;
+        uint32_t st = in->stride[el->stream];
+        uint8_t *base = out->data[el->stream] + el->offset;
+        float *acc = calloc((size_t)nv * 4, sizeof *acc);
+        if (!acc) continue;
+        const float k = -1 / (2 * (SMOOTH_R / 2) * (SMOOTH_R / 2));
+        for (uint32_t a = 0; a < nv; a++) {
+            const float *p = mv + 8 * a;
+            float sum = 0, c[4] = {0};
+            for (uint32_t b = 0; b < nv; b++) {
+                const float *q = mv + 8 * b;
+                float dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2], d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 > SMOOTH_R * SMOOTH_R) continue;
+                float wt = expf(d2 * k);
+                const uint8_t *src = base + (size_t)b * st;
+                for (int j = 0; j < 4; j++) c[j] += wt * src[j];
+                sum += wt;
+            }
+            for (int j = 0; j < 4; j++) acc[4 * a + j] = c[j] / sum;
+        }
+        for (uint32_t a = 0; a < nv; a++)
+            for (int j = 0; j < 4; j++) base[(size_t)a * st + j] = (uint8_t)fminf(255, acc[4 * a + j] + 0.5f);
+        free(acc);
+        done++;
+    }
+    return done;
+}
+
+static int wants_smooth(const char *file)
+{
+    char path[1400];
+    snprintf(path, sizeof path, "%s/%s", dir, file);
+    char *slash = strrchr(path, '/');
+    if (!slash) return 0;
+    snprintf(slash + 1, sizeof path - (size_t)(slash + 1 - path), "smooth");
+    FILE *f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
 int prop_remodel(const struct prop_in *in, struct prop_out *out, char *name, size_t namelen)
 {
     memset(out, 0, sizeof *out);
@@ -266,6 +316,11 @@ int prop_remodel(const struct prop_in *in, struct prop_out *out, char *name, siz
         memcpy(out->data[pe->stream] + (size_t)v * in->stride[pe->stream] + pe->offset, p, 12);
         if (ne) memcpy(out->data[ne->stream] + (size_t)v * in->stride[ne->stream] + ne->offset, p + 3, 12);
         if (te) memcpy(out->data[te->stream] + (size_t)v * in->stride[te->stream] + te->offset, p + 6, 8);
+    }
+    if (wants_smooth(name)) {
+        int n = smooth_colours(in, out, mv, nv);
+        static int said;
+        if (said++ < 8) fprintf(stderr, "[remodel] %s: %d colour element%s smoothed\n", name, n, n == 1 ? "" : "s");
     }
     out->nverts = nv;
     out->idx = mi;

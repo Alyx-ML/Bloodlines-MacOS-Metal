@@ -22,3 +22,5 @@ const char *bl_tex_name(uint32_t w, uint32_t h, uint32_t format, const uint8_t *
 // The same from any thread (no reuse of the last hash), after the first bl_tex_name or
 // bl_hires_prefetch.
 const char *bl_tex_name_any_thread(uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch);
+// A level's fingerprint as names.txt and index.txt hold it (any size); 0 for formats not hashed.
+uint64_t bl_tex_key(uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch);

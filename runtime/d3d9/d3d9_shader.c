@@ -556,7 +556,7 @@ static const char *const header =
     "struct BLVSParams { int4 i[16]; uint b[16]; float2 inv_viewport; float clip_y; float color_max; };\n"
     "struct BLPSParams { int4 i[16]; uint b[16]; float4 bumpenv[8]; float4 bumpenv_l[8]; float4 fog_color;\n"
     "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float gloss, pbr; float4 view;\n"
-    "    float bump, metal, spec, pom; float pom_dist, tag, out_max, stage_max; float out_gain, pad6, pad7, pad8; };\n"
+    "    float bump, metal, spec, pom; float pom_dist, tag, out_max, stage_max; float out_gain, wet, cavity, grain; };\n"
     // A glow's bright parts times up to g (p.out_gain), its dim parts as drawn.
     "static float3 bl_gain(float3 c, float g) {\n"
     "    return g > 1.0 ? c * mix(1.0, g, smoothstep(0.5, 1.0, max(max(c.x, c.y), c.z))) : c; }\n"
@@ -1263,6 +1263,25 @@ static void ps_surface(struct out *o, const char *coord, int stage)
     line(o, "float3 _pbmn = _pbm.xyz * 2.0 - 1.0;");
     line(o, "float3 _pbnb = normalize(_pbt * _pbmn.x - _pbb * _pbmn.y + _pbn * max(_pbmn.z, 0.05));");
     line(o, "_pbo = float4(_pbnb, _pbm.a);");
+    // Crevices: the height map's low parts darker whatever the light, so rock reads in the
+    // dark too, where no light of the map's reaches the bumps.
+    line(o, "if (p.cavity > 0.0 && p.pom > 0.0)");
+    line(o, "    oc0.xyz *= mix(1.0, 0.35 + 0.65 * smoothstep(0.05, 0.75, bl_ph.sample(_pbs, _pbuv).r), p.cavity);");
+    // Grain: a texture stretched over a whole cliff is magnified close up, a texel over
+    // several pixels. Its own brightness, read 4 times smaller, over its local mean (the
+    // same read 4 mipmaps blurrier) gives the fine detail it lacks; only the brightness, so
+    // the colours and the layout stay its own. Faded in as its texels grow past a pixel.
+    line(o, "if (p.grain > 0.0) {");
+    line(o, "    float2 _grts = float2(tex%d.get_width(), tex%d.get_height());", stage, stage);
+    line(o, "    float _grm = 1.0 / max(max(length(_pbux * _grts), length(_pbuy * _grts)), 1e-6);");
+    line(o, "    float _grf = p.grain * smoothstep(0.7, 2.5, _grm);");
+    line(o, "    if (_grf > 0.0) {");
+    line(o, "        float2 _gruv = _pbuv * 4.0;");
+    line(o, "        float _grl = dot(tex%d.sample(_pbs, _gruv, gradient2d(_pbux * 4.0, _pbuy * 4.0)).rgb, float3(0.2126, 0.7152, 0.0722));", stage);
+    line(o, "        float _grb = dot(tex%d.sample(_pbs, _gruv, gradient2d(_pbux * 64.0, _pbuy * 64.0)).rgb, float3(0.2126, 0.7152, 0.0722));", stage);
+    line(o, "        oc0.xyz *= mix(1.0, clamp(_grl / max(_grb, 0.02), 0.55, 1.6), _grf);");
+    line(o, "    }");
+    line(o, "}");
     line(o, "float _pbE = 0.0, _pbf = 0.0; float3 _pbS = float3(0.0), _pbSw = float3(0.0);");
     line(o, "float _pbr = clamp(_pbm.a, 0.08, 1.0), _pba = _pbr * _pbr * _pbr * _pbr;");
     line(o, "float3 _pbV = -normalize(_pbp); float _pbnv = saturate(dot(_pbnb, _pbV)) + 1e-4;");
@@ -1301,6 +1320,21 @@ static void ps_surface(struct out *o, const char *coord, int stage)
 
 // Alpha test and fog on oc0, as the fixed-function back end does after any pixel shader.
 // _fog: the share of the colour the fog leaves.
+// Variant rain: oc0's colour lit by the world view around the pixel.
+static void ps_rain_light(struct out *o)
+{
+    line(o, "{");
+    line(o, "    constexpr sampler _rsm(filter::linear, address::clamp_to_edge);");
+    line(o, "    float2 _rs = float2(bl_rl.get_width(), bl_rl.get_height()), _ru = in.pos.xy / _rs;");
+    line(o, "    float3 _rl = 0.25 * bl_rl.sample(_rsm, _ru).rgb;");
+    line(o, "    for (int _i = 0; _i < 8; _i++) {");
+    line(o, "        float _a = float(_i) * 0.7853982;");
+    line(o, "        _rl += 0.09375 * bl_rl.sample(_rsm, _ru + 0.04 * float2(cos(_a) * _rs.y / _rs.x, sin(_a))).rgb;");
+    line(o, "    }");
+    line(o, "    oc0.xyz *= 0.2 + 3.0 * _rl;");
+    line(o, "}");
+}
+
 static void ps_alpha_and_fog(struct out *o)
 {
     line(o, "if (!bl_cmp(p.alpha_func, oc0.w, p.alpha_ref)) discard_fragment();");
@@ -1400,9 +1434,15 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (g.info.input_mask) put(o, "};\n");
         // Tessellated (v->tess): the shader is a function run on each corner of a triangle.
         int tess = v && v->tess && v->smooth_normal && g.info.input_mask;
+        int motion = v && v->motion && !tess;
         if (tess)
             put(o, "struct BLVSRaw { float4 pos, p2, d0, d1, t0, t1, t2, t3, t4, t5, t6, t7, fog, pts; };\n"
                    "static inline BLVSRaw bl_vs(BLVSIn in, constant float4 *c, constant BLVSParams &p) {\n");
+        else if (motion)
+            put(o, "struct BLMVOut { float4 pos [[position]]; float4 mc [[user(mc)]]; float4 mp [[user(mp)]]; };\n"
+                   "vertex BLMVOut bl_main(%sconstant float4 *c [[buffer(20)]],\n"
+                   "                       constant BLVSParams &p [[buffer(21)]], constant float4 *cp [[buffer(26)]]) {\n",
+                g.info.input_mask ? "BLVSIn in [[stage_in]], " : "");
         else
             put(o, "vertex BLVSOut bl_main(%sconstant float4 *c [[buffer(20)]],\n"
                    "                       constant BLVSParams &p [[buffer(21)]]) {\n",
@@ -1439,6 +1479,29 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
             if (start(&g.ps, code, err, errlen) || gen_body(&g)) goto failed;
             line(o, "_p2 = opos;");
             line(o, "}");
+        }
+        if (motion) {
+            // The body again with last frame's constants (its bones and camera).
+            line(o, "float4 _pm = opos;");
+            line(o, "{");
+            line(o, "constant float4 *c = cp;");
+            line(o, "float4 r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0, r8 = 0, r9 = 0, r10 = 0, "
+                    "r11 = 0, r12 = 0, r13 = 0, r14 = 0, r15 = 0;");
+            line(o, "int4 a0 = 0; int aL = 0;");
+            line(o, "float4 opos = 0, ofog = float4(1.0), opts = float4(1.0), od0 = float4(1.0), od1 = 0;");
+            line(o, "float4 ot0 = 0, ot1 = 0, ot2 = 0, ot3 = 0, ot4 = 0, ot5 = 0, ot6 = 0, ot7 = 0;");
+            if (start(&g.ps, code, err, errlen) || gen_body(&g)) goto failed;
+            line(o, "_pm = opos;");
+            line(o, "}");
+            line(o, "BLMVOut out;");
+            line(o, "out.pos = _p1;");
+            line(o, "out.pos.y *= p.clip_y;");
+            line(o, "out.pos.xy += float2(p.inv_viewport.x, -p.inv_viewport.y) * _p1.w;");
+            line(o, "out.mc = _p1; out.mc.y *= p.clip_y;");
+            line(o, "out.mp = _pm; out.mp.y *= p.clip_y;");
+            line(o, "return out;");
+            put(o, "}\n");
+            return o->s;
         }
         if (tess) {
             line(o, "BLVSRaw r = {_p1, _p2, float4(clamp(od0.xyz, 0.0, p.color_max), saturate(od0.w)),");
@@ -1500,6 +1563,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (surface)
             put(o, ",\n                         texture2d<float> bl_pm [[texture(12)]], constant float4 *bl_wl [[buffer(4)]],"
                    " texture2d<float> bl_ph [[texture(19)]]");
+        if (v && v->rain) put(o, ",\n                         texture2d<float> bl_rl [[texture(20)]]");
         put(o, ") {\n");
         o->indent = 1;
         if (surface) {
@@ -1563,6 +1627,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (g.env) line(o, "float3 _d = oc0.xyz - _e0, _w = _e1 - _e0;");
         if (detail && skin && g.base_coord[0]) ps_detail(o, g.base_coord, v->hair);
         if (surface) ps_surface(o, g.alb_stage >= 0 ? g.alb_coord : NULL, g.alb_stage);
+        if (v && v->rain && (g.info.color_outputs & 1)) ps_rain_light(o);
         ps_alpha_and_fog(o);
         if (v && v->shadow_caster) line(o, v->shadow_caster == 2 ? "oc0.w = in.pos.z;" : "oc0.w = 1.0 - in.pos.z;");
         line(o, "BLPSOut out;");
@@ -1585,7 +1650,9 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
                  v->albedo == 2 ? "p.tag" : v->albedo == 3 ? "0.8" : "1.0");
         else if (albedo)
             line(o, "out.c2 = float4(0.5, 0.5, 0.5, %s);", v->albedo == 2 ? "p.tag" : v->albedo == 3 ? "0.8" : "1.0");
-        if (surface) line(o, "out.c3 = _pbo;");
+        // The material's take on the rain (p.wet) rides on the roughness, 3 apart
+        // (metal_render.m surf_class).
+        if (surface) line(o, "out.c3 = float4(_pbo.xyz, _pbo.w + 3.0 * p.wet);");
         if (g.info.writes_depth) line(o, "out.depth = odepth;");
         line(o, "return out;");
         put(o, "}\n");
@@ -1681,6 +1748,7 @@ char *d3d_ff_ps_msl(const struct d3d_ff_ps *k, const struct d3d_shader_variant *
         put(o, ",\n                         %s tex%d [[texture(%d)]], sampler smp%d [[sampler(%d)]]", tex_type(kind),
             i, i, i, i);
     }
+    if (v && v->rain) put(o, ",\n                         texture2d<float> bl_rl [[texture(20)]]");
     put(o, ") {\n");
     o->indent = 1;
     line(o, "float4 cur = in.d0, tmp = 0, tex = 0;");
@@ -1720,6 +1788,7 @@ char *d3d_ff_ps_msl(const struct d3d_ff_ps *k, const struct d3d_shader_variant *
     if (k->specular) line(o, "cur.xyz = clamp(cur.xyz + in.d1.xyz, 0.0, p.stage_max);");
     if (getenv("BL_FF_HIGHLIGHT")) line(o, "cur.xyz = float3(1.0, 0.0, 1.0);");  // debugging: show these draws
     line(o, "float4 oc0 = cur;");
+    if (v && v->rain) ps_rain_light(o);
     ps_alpha_and_fog(o);
     if (v && v->shadow_caster) line(o, v->shadow_caster == 2 ? "oc0.w = in.pos.z;" : "oc0.w = 1.0 - in.pos.z;");
     line(o, "BLPSOut out;");

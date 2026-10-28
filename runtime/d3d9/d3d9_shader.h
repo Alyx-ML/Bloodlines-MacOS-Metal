@@ -94,6 +94,15 @@ struct d3d_shader_variant {
     // light: the map's lights at [[buffer(4)]] ([0].x their count, then four float4 each,
     // struct fog_light in metal_render.m).
     uint8_t surface;
+    // Vertex: a character's own motion (metal_render.m, motion_draw): the body runs again
+    // on last frame's constants at [[buffer(26)]], and the output is only the position
+    // (as drawn) and both frames' clip positions without the offsets added to it (BLMVOut).
+    uint8_t motion;
+    // Pixel: the rain, lit by the light around it (metal_render.m, the rain after the
+    // upscaler): the finished world view at [[texture(20)]], read over a wide patch round
+    // the pixel, scales and tints the colour before the fog, so drops shine in front of
+    // lamps and neon and all but go in the dark.
+    uint8_t rain;
 };
 
 // Soft shadows from the atlas (variant shadow_receiver): the atlas is seen as 8x8 cells
@@ -165,7 +174,13 @@ struct d3d_ps_params {
                               // for the world view with HDR)
     float out_gain;           // oc0's bright parts times up to this (1; more for the world view's
                               // glows with HDR: bl_gain)
-    float pad3[3];
+    float wet;                // variant surface: how its material takes the rain (metal_render.m
+                              // material_wet: 0 not at all, 1 a sheen, 2 puddles as well)
+    float cavity;             // variant surface: how much the height map's low parts darken the
+                              // colour, in any light (rock: metal_render.m material_rock; 0 none)
+    float grain;              // variant surface: how much fine grain from the colour texture itself,
+                              // read 4 times smaller, sharpens it where it is stretched past
+                              // the screen's pixels (cliffs: metal_render.m material_rock; 0 none)
 };
 
 // Fixed-function pixel stages (draws with no pixel shader): the texture stage states

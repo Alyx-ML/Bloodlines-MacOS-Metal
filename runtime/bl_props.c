@@ -35,7 +35,9 @@
 // the first folder holding its .vmt, whose $basetexture's .tth (Troika's header, then a
 // VTF 7.x one) gives its mean colour, linear, at 0x20 into the VTF header.
 #include "bl_props.h"
+#include <ctype.h>
 #include <dirent.h>
+#include <mach-o/dyld.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -405,6 +407,46 @@ static int mdl_tris(const uint8_t *m, long mn, const uint8_t *v, long vn, struct
     return o->n > before;
 }
 
+// A remodelled prop's shape, as the renderer draws it (prop_remodel.c): every mesh of the
+// model, build/remodels/<its name without models/ and .mdl, lower case>/<mesh>.msh
+// (tools/prop_pack.py: "BLPM", vertex, triangle and original vertex counts, 8 floats per
+// vertex, the position first, then 3 u32 per triangle). 0 when the model has none.
+static int remodel_tris(const char *model, struct tris *o)
+{
+    char exe[1024], rel[256];
+    uint32_t n = sizeof exe;
+    if (_NSGetExecutablePath(exe, &n)) return 0;
+    char *slash = strrchr(exe, '/');
+    if (!slash) return 0;
+    *slash = 0;  // build/tests
+    const char *r = strncasecmp(model, "models/", 7) ? model : model + 7;
+    snprintf(rel, sizeof rel, "%s", r);
+    for (char *c = rel; *c; c++) *c = (char)tolower((unsigned char)*c);
+    char *dot = strrchr(rel, '.');
+    if (dot) *dot = 0;
+    int before = o->n;
+    for (int k = 0;; k++) {
+        char path[1400];
+        snprintf(path, sizeof path, "%s/../remodels/%s/%d.msh", exe, rel, k);
+        FILE *f = fopen(path, "rb");
+        if (!f) break;
+        uint8_t h[16];
+        uint32_t nv = 0, nt = 0;
+        float(*v)[8] = NULL;
+        uint32_t(*t)[3] = NULL;
+        if (fread(h, 1, 16, f) == 16 && !memcmp(h, "BLPM", 4)) {
+            memcpy(&nv, h + 4, 4), memcpy(&nt, h + 8, 4);
+            v = malloc(sizeof *v * (nv + 1)), t = malloc(sizeof *t * (nt + 1));
+            if (fread(v, sizeof *v, nv, f) != nv || fread(t, sizeof *t, nt, f) != nt) nt = 0;
+        }
+        fclose(f);
+        for (uint32_t i = 0; i < nt; i++)
+            if (t[i][0] < nv && t[i][1] < nv && t[i][2] < nv) add_tri(o, v[t[i][0]], v[t[i][1]], v[t[i][2]]);
+        free(v), free(t);
+    }
+    return o->n > before;
+}
+
 // Half-Life's AngleMatrix: pitch, yaw, roll in degrees.
 static void angle_matrix(const float a[3], float m[3][3])
 {
@@ -485,7 +527,8 @@ static struct bl_props *props_load(const char *bsp_path, const uint8_t *d, long 
                 uint8_t *md = search_read(&s, name, &ml);
                 strcpy(dot, ".dx80.vtx");
                 uint8_t *vx = md ? search_read(&s, name, &vl) : NULL;
-                if (vx) mdl_tris(md, ml, vx, vl, &mesh[m]);
+                // what is drawn: a remodel's shape where the prop has one
+                if (vx && !(visible && remodel_tris(name, &mesh[m]))) mdl_tris(md, ml, vx, vl, &mesh[m]);
                 if (!md || !mdl_colour(&s, md, ml, colour[m])) colour[m][0] = -1;
                 if (md && ml >= 0xcc) {  // the hull: its corners at 0xb4 and 0xc0
                     float lo[3], hi[3];

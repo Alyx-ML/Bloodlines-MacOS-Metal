@@ -46,6 +46,11 @@ struct obj {
     void *pbr;                 // textures: its PBRify normal and roughness map (metal_render.m pbr_map), or NULL
     void *pom;                 // textures: its height map for parallax (metal_render.m pbr_map), or NULL
     float metal;               // textures: how metallic its material is (metal_render.m material_metal)
+    int rain;                  // textures: a particle sheet holding the rain's drop (metal_render.m wet_rain_sheet)
+    uint16_t rain_drop[4], rain_ring[4];  // with rain: where the drop and its splash ring are (x, y, w, h; w 0 none)
+    uint8_t rain_flip;         // with rain: the drop stored upside down
+    int wet;                   // textures: how its material takes the rain (metal_render.m material_wet)
+    int rock;                  // textures: rock or cliff (metal_render.m material_rock)
     void *sound;               // DirectSound buffer state (dsound.c)
     int dirty;                 // guest memory changed since the last upload
     int rewrites;              // static vertex buffers: times rewritten after first use

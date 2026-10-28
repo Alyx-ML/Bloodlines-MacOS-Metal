@@ -21,7 +21,8 @@ struct bl_props {
 // From the .bsp at bsp_path (its contents: file, size bytes); NULL with err filled when
 // the static props lump cannot be read.
 struct bl_props *bl_props_load(const char *bsp_path, const uint8_t *file, long size, char *err, int errlen);
-// The same with each prop shaped by its visible mesh where it has one, for the object
-// shadows (metal_render.m), which should match what is drawn.
+// The same with each prop shaped by its visible mesh where it has one (its remodel's, from
+// build/remodels, when it is remodelled), for the object shadows (metal_render.m), which
+// should match what is drawn.
 struct bl_props *bl_props_load_visible(const char *bsp_path, const uint8_t *file, long size, char *err, int errlen);
 void bl_props_free(struct bl_props *p);

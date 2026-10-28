@@ -48,9 +48,9 @@ void gothic_flush(void *cpu, uint32_t s);
 
 // The renderer's backdrop (d3d9/metal_render.m): the last world view when `world`, under
 // the darkening overlay `style` (0 the pause menu, 1 the options dialog, 2 none: the
-// start-up menu) with a red glow behind each of `n` boxes, drawn now over everything so
-// far. Its frames stay full width.
-void bl_metal_backdrop(int style, int world, const int (*glows)[4], int n);
+// start-up menu) with a red glow behind each of `n` boxes (in pixels of the sw x sh
+// screen), drawn now over everything so far. Its frames stay full width.
+void bl_metal_backdrop(int style, int world, const int (*glows)[4], int n, int sw, int sh);
 
 // An image of the HUD's (bl_hud.c), `slot` 0 or 1: w x h pixels of premultiplied BGRA,
 // drawn now on the back buffer at x, y of the sw x sh screen, as the game's HUD is.

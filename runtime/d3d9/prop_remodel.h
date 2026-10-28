@@ -9,7 +9,8 @@
 // (3 floats each, from its lowest vertex number on).
 // Each new vertex takes every attribute of the game's own (its lighting, colours,
 // weights...) interpolated from the nearest point of the original triangles, then the
-// remodel's position, normal and UV.
+// remodel's position, normal and UV. A relief remodel's colours (the game's lighting at
+// the original's corners) are then smoothed across it (a "smooth" file in its folder).
 #pragma once
 #include <stddef.h>
 

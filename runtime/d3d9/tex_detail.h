@@ -62,5 +62,11 @@ struct bl_hair_mesh {
 // The hair mesh for the texture `key` (w x h), or NULL; after bl_detail_normal saw it.
 const struct bl_hair_mesh *bl_detail_hair(id<MTLDevice> dev, uint64_t key, uint32_t w, uint32_t h);
 
+// A character rebuilt for the texture `key` (w x h): its mesh (char_remodel.h, made by
+// tools/bodies/export_game_mesh.py beside the texture's normal map as <name>_mesh.bin),
+// or NULL; after bl_detail_normal saw it. `name` is set to the file's name.
+struct bl_body_mesh;
+const struct bl_body_mesh *bl_detail_body(uint64_t key, uint32_t w, uint32_t h, const char **name);
+
 // The texture `key` (w x h) is gone: what was remembered for it is dropped.
 void bl_detail_forget(uint64_t key, uint32_t w, uint32_t h);

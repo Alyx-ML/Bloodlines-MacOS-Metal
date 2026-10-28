@@ -1,0 +1,212 @@
+{
+  "blend": "build/hair/jeanette.blend",
+  "textures": "build/textures/characters/models/character/npc/unique/santa_monica/jeanette",
+  "body": "jeanette_body",
+  "keep_game": ["choker"],
+  "garments": {
+    "shirt": {
+      "material": "jeanette_body",
+      "min_bright": 200,
+      "min_z": 0.9,
+      "thickness": 0.0025,
+      "hem": 0.006,
+      "pin_band": 0.012
+    },
+    "bra": {
+      "material": "jeanette_body",
+      "red": true,
+      "max_z": 1.1,
+      "thickness": 0.002,
+      "hem": 0.003
+    },
+    "choker": {
+      "material": "jeanette_body",
+      "red": true,
+      "min_z": 1.1,
+      "thickness": 0.003,
+      "hem": 0.0
+    },
+    "skirt": {
+      "material": "jeanette_skirt",
+      "thickness": 0.003,
+      "hem": 0.008
+    },
+    "boots": {
+      "material": "jeanette_body",
+      "max_z": 0.25,
+      "thickness": 0.002,
+      "hem": 0.004,
+      "crease": 40
+    }
+  },
+  "head": "build/heads/jeanette_head.npz",
+  "straps": {
+    "boot_straps": {
+      "material": "jeanette_body",
+      "on": "boots",
+      "texture": "jeanette_body_opaque2.png",
+      "width": 0.0165,
+      "thickness": 0.0012,
+      "wire": 0.0011,
+      "lines": [
+        [
+          [
+            0.4262,
+            0.8347
+          ],
+          [
+            0.475,
+            0.8237
+          ],
+          [
+            0.5262,
+            0.8311
+          ],
+          [
+            0.5726,
+            0.8457
+          ]
+        ],
+        [
+          [
+            0.4115,
+            0.7529
+          ],
+          [
+            0.4359,
+            0.7554
+          ],
+          [
+            0.4896,
+            0.7737
+          ],
+          [
+            0.5214,
+            0.7859
+          ],
+          [
+            0.5543,
+            0.7993
+          ],
+          [
+            0.5995,
+            0.8128
+          ]
+        ],
+        [
+          [
+            0.4066,
+            0.803
+          ],
+          [
+            0.453,
+            0.7945
+          ],
+          [
+            0.5067,
+            0.7737
+          ],
+          [
+            0.5458,
+            0.7652
+          ],
+          [
+            0.578,
+            0.7639
+          ],
+          [
+            0.6239,
+            0.7603
+          ]
+        ]
+      ],
+      "buckles": [
+        {
+          "uv": [
+            0.5262,
+            0.8323
+          ],
+          "size": [
+            0.0154,
+            0.0138
+          ]
+        },
+        {
+          "uv": [
+            0.5543,
+            0.7993
+          ],
+          "size": [
+            0.0143,
+            0.0121
+          ]
+        },
+        {
+          "uv": [
+            0.578,
+            0.7639
+          ],
+          "size": [
+            0.0115,
+            0.0138
+          ]
+        },
+        {
+          "uv": [
+            0.453,
+            0.7945
+          ],
+          "size": [
+            0.0121,
+            0.0099
+          ]
+        },
+        {
+          "uv": [
+            0.4347,
+            0.7554
+          ],
+          "size": [
+            0.0121,
+            0.0121
+          ]
+        },
+        {
+          "uv": [
+            0.475,
+            0.8237
+          ],
+          "size": [
+            0.0066,
+            0.0055
+          ]
+        }
+      ]
+    }
+  },
+  "cuffs": {
+    "socks": {
+      "texture": "jeanette_body_opaque2.png",
+      "min_bright": 185,
+      "z": [
+        0.4,
+        0.62
+      ],
+      "height": 0.025,
+      "thickness": 0.0015,
+      "ribs": 44
+    }
+  },
+  "lod": {
+    "body": 6000,
+    "shirt": 9000,
+    "bra": 1200,
+    "choker": 700,
+    "skirt": 5000,
+    "boots": 3500,
+    "boot_straps": 4000,
+    "socks": 900,
+    "head": 4500
+  },
+  "model": "build/hair/src/models/character/npc/unique/santa_monica/jeanette/jeanette.mdl"
+}

@@ -18,7 +18,7 @@ Each PNG is matched to its texture by name, never by its look:
   - a PNG the size of the original is the export itself and is left alone.
 
 The new size is the original's times the largest power of two that fits the PNG (which
-must have the original's shape). Upscalers shift colours a little, so the PNG's colours
+must have the original's shape); a "-replace" picture keeps its own size. Upscalers shift colours a little, so the PNG's colours
 are first matched to the original's: chaiNNer's wavelet colour fix (as in PBRify_Remix's
 "With Color Fix" chain), which keeps the PNG's fine detail and takes the broad colour from
 the original, with the edges wrapping as brush textures repeat. A PNG named "<name>-replace.png"
@@ -177,8 +177,12 @@ def build(o, img):
     return b"".join(out)
 
 
-def target_size(o, img):
+def target_size(o, img, replace):
     w, h = o["w"], o["h"]
+    if replace:  # a supplied picture keeps its own size, whole BC7 blocks (within 2% of the shape)
+        if abs(img.width * h - img.height * w) > 0.02 * img.height * w:
+            raise Refused(f"PNG is {img.width}x{img.height}, not the shape of the original {w}x{h}")
+        return img.width // 4 * 4, img.height // 4 * 4
     if img.width * h != img.height * w:
         raise Refused(f"PNG is {img.width}x{img.height}, not the shape of the original {w}x{h}")
     k = 0
@@ -211,10 +215,10 @@ def pack(job):
             return name, "up to date", None
         o = original(tth, ttz)
         img = img.convert("RGBA")
-        tw, th = target_size(o, img)
+        replace = os.path.splitext(os.path.basename(png))[0].lower().endswith("-replace")
+        tw, th = target_size(o, img, replace)
         if (tw, th) != img.size:
             img = img.resize((tw, th), Image.LANCZOS)
-        replace = os.path.splitext(os.path.basename(png))[0].lower().endswith("-replace")
         tex = build(o, img if replace else colour_fix(o, img))
         os.makedirs(os.path.dirname(tex_out), exist_ok=True)
         write_file(tex_out, tex)

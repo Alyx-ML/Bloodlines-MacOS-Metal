@@ -3390,7 +3390,7 @@ Verified: the runtime builds, the game links. Not verified: any of it on screen.
 ### Contact shadows: Bend Studio's screen-space shadows
 
 The contact shadows (`metal_render.m`, contact shadows section) are now Bend Studio's
-screen-space shadows from Days Gone (`bend_sss_gpu.h`/`bend_sss_cpu.h`, Apache 2.0, Sony
+screen-space shadows (`bend_sss_gpu.h`/`bend_sss_cpu.h`, Apache 2.0, Sony
 Interactive Entertainment 2023) in place of our own 16-step march; the old trace is gone.
 
 - Up to 4 lights a frame (the brightest at the camera among the haze's lights), each
@@ -3444,3 +3444,458 @@ What this changes:
 
 Built; not yet checked on screen by the user. To watch: GPU cost of the full-size back buffer
 (the view model, HUD and the final copies are now at up to 3840x2160).
+
+### Rain effects and lens glare
+
+Two new effects, each a box on the Enhanced tab, on by default (`bl_vgui.c`, hints in
+`bl_options.c`):
+
+- **Rain Effects** (`BL_WET`, `metal_render.m`, rain effects section; first called Wet Streets). A map rains when
+  its entities hold one of the game's rain emitters (`wet_note_map`, read from the map's
+  entities lump as it opens). Only the Santa Monica maps have them: the hub, the pier, the
+  beach house and the ocean house. On those maps, ground the sky reaches is darker and
+  glossy, and it reflects through the screen-space reflections. Flat ground gets puddles,
+  placed by a world-space noise. While rain is falling, rings spread on the puddles. Rain
+  counts as falling while its drop or splash sprites are drawn: `particles/dropletfast.tga`
+  and `fortituderings.tga`, recognised by their pixels' fingerprints (`wet_rain_texture`,
+  `bl_tex_key` in `tex_hires.m`, `struct obj` `rain`).
+  - Covered ground stays dry. A 2048² height map, 4096 units across round the camera and
+    seen from above (`wet_height`), is drawn from the object shadows' casters. It is
+    redrawn when the camera nears its edge.
+  - `wet_run` writes half-resolution normals, roughness, wetness and puddle values.
+    `ssr_trace` traces those pixels even with Reflections off. `post_apply` darkens them
+    and adds what they reflect, using Schlick's Fresnel term. Characters stay dry.
+  - Only hard materials take the rain (`material_wet`, by texture name, `struct obj`
+    `wet`). The first version wet everything the sky reached, grass included, which the
+    user rejected. Streets, pavements, curbs, asphalt, concrete, tile, brick floors and
+    the parking-lot paint are class 2: shine plus puddles. These are the ground the
+    game's own Santa Monica materials wet with the `GlobalWetness` proxy. Wood, brick,
+    stone, metal and building surfaces are class 1: shine only. A draw with any soft
+    texture (grass, dirt, mud, sand, gravel, plants, cloth and so on) stays dry. The
+    class goes to the shader as `d3d_ps_params` `wet` and rides on the surface-facing
+    texture's roughness, 3 apart (`surf_class`). So it needs the PBR surface pass
+    (`BL_PBR`, on by default).
+  - The Enhanced tab had 14 boxes, so the last row fell off the bottom of the page.
+    `layout_rows` now shares the room left by the headings among the rows, down to 30
+    pixels each (`ROW_TIGHT`).
+- **Lens Glare** (`BL_GLARE`, bloom section, `glare_run`). What is past white (luminance 1,
+  `BL_GLARE_THRESHOLD`) is taken at quarter size and streaked: three Kawase steps sideways
+  (fading over about 30 pixels) and two up and down (about 8). `post_apply` adds 0.8 of
+  it after the bloom (`BL_GLARE_STRENGTH`).
+
+Verified: the shaders compile with `xcrun metal`, the runtime builds, the game links.
+
+Not verified:
+- either effect on screen;
+- whether the raindrop fingerprints match. If they don't match, the streets are still wet
+  but no rings appear.
+
+## 2026-10-28: FSR 4's own sharpening on; MetalFX against FSR 4
+
+The user asked why FSR 4 looked softer than MetalFX. Headless captures on sm_asylum_1, both at
+Performance (640x360 up to 1280x720), compared on the same frames:
+- Flipping the jitter (`BL_TAA_JITTER=-1`) made FSR 4 far worse (doubled bottles, ghosted
+  bartender), so the jitter we pass was already right.
+- We called FSR4Metal with `sharpen` off. AMD's driver always runs RCAS after the model, so our
+  picture was FSR 4 without its last pass. It now runs at sharpness 0.8 (`fsr4_sharpness`;
+  `BL_FSR4_SHARPNESS` 0..1 overrides it).
+- With RCAS on, FSR 4 is sharper than MetalFX on Jeanette's close-up: eyes, lashes, the choker's
+  emblem and the strands of her hair. MetalFX is smoother but blurs her face.
+- FSR 4 shows stair-stepped edges on her hair and along her jaw, and MetalFX doesn't. Our motion
+  vectors come from the camera only (`taa_motion`), so a moving, animated character has the
+  wrong motion. MetalFX then throws its history away and blurs; FSR 4 falls back to the
+  640x360 pixels, which shows as steps. Motion vectors for characters (their bones' previous
+  pose) would fix both. Not done.
+
+The pictures are in `build/compare/` (ignored by git).
+
+## 2026-10-28: Characters' own motion for the upscalers
+
+The motion vectors were the camera's only (`taa_motion`'s full-screen pass), so an animated
+character's pixels pointed to the wrong place in the last frame. MetalFX then dropped its history
+there and blurred the character; FSR 4 showed its 640x360 pixels as steps.
+
+How it works now:
+- `setup_draw` notes each skinned draw of the world view (a vertex shader reading blend
+  weights or indices, full viewport, perspective) with its constants (`BLMotionDraw`).
+- `render_draw` adds its vertex and index bindings, and `motion_keep` keeps its constants by
+  draw: the shader, the vertex and index buffers, the start, the count and the nth such draw
+  this frame. With last frame's constants for the same draw, the draw goes on a list. A first
+  bone that moved more than 64 units since last frame is taken for another copy of the same
+  model, and the draw is skipped.
+- `motion_run`, in `taa_motion`'s pass after the camera's motion, draws the listed ones again
+  with a motion variant of their vertex shader (`d3d_shader_variant.motion`, d3d9_shader.c).
+  The variant runs the shader's body a second time on last frame's constants at
+  `[[buffer(26)]]`, which hold last frame's bones and camera, and outputs both clip
+  positions.
+- The fragment writes the motion where its view depth is within 2 units and 2% of what the
+  frame drew. The redraw is flat while the frame's characters are tessellated, and it has no
+  alpha test. Elsewhere it discards, which keeps the camera's motion.
+- Skipped on a camera cut. `motion_frame_end` makes this frame's constants last frame's.
+
+Checked headless on sm_asylum_1, Jeanette's close-up, Performance (640x360 to 1280x720),
+both upscalers, before and after (`build/compare/jeanette_motion_*.png`). 64 character
+draws took their own motion and nothing failed to compile.
+- MetalFX: her face is sharp where it was smeared (eyes, lashes, lips).
+- FSR 4: the steps along her jaw, neck and collar are gone. The ends of her hair stay
+  slightly stepped (alpha-tested strands).
+
+Not checked: in a window, other characters and maps, timing.
+
+## 2026-10-28: The upscalers' largest step
+
+Picking Upscaling Quality "Quality" in a 3600x2025 full-screen window aborted with
+"TAA: MetalFX made no temporal scaler for 853x480". Since the menus-and-HUD change the
+back buffer follows the screen's pixels, so the world view (Resolution x the quality
+share) can be far smaller than the window: 853x480 to 3600x2025 is 4.2 times, more than
+MetalFX's temporal scaler takes.
+
+`world_size` now keeps the world view no smaller than the back buffer divided by the
+scaler's largest step: `supportedInputContentMaxScaleForDevice:` for MetalFX, 3 times for
+FSR 4 (its Ultra Performance step). The jitter phases use the same size, so they stay
+matched. In that window, Quality now draws the world at 1200x675 instead of 853x480.
+
+Verified: the runtime and boot build. Not verified: the window run itself (handed to the
+user), and FSR 4 above 3 times was not tried, so 3 is the documented step, not a tested one.
+
+### Beach house ground: surface maps and supplied pictures
+
+The beach house had no surface maps. `tools/tex_extract.py --map sm_beachhouse_1` exported
+its 344 textures. The gravel by the house is `ground/piersandb` and the beach sand is
+`ground/piersand`.
+- The user supplied 2048×2048 pictures of both, in the originals' layout (luminance
+  correlation 0.85 and 0.88, the same mean colour). They went in as `-replace.png`, and
+  `tools/tex_pack.py` packed them at 2048×2048 BC7.
+- The bump and roughness maps were made from each picture at the game texture's size
+  (512), read as a tile. `tools/tex_height.py` made the height maps from the pictures at
+  full size.
+
+Checked in the game by the user: the gravel's maps from the original texture. Not yet
+checked: the supplied pictures.
+
+## 2026-10-28: The menus' red glow back behind the hovered item
+
+Since the menus went to the window's own detail, the red glow behind the hovered menu item
+showed up in the wrong place (beside the logo when Load Game was hovered). The menus give
+the glow's box in the game's screen pixels (1280x720, say), and the renderer drew it in
+the back buffer's pixels, which now follow the window (3600x2025, say).
+
+`bl_metal_backdrop` now also takes the game's screen size (the pause menu and the options
+dialog pass it), and the overlay scales each glow's box to the back buffer. The overlay is
+redrawn when that size changes.
+
+Verified: the runtime and boot build. Not verified: in a window (handed to the user).
+
+The pier's textures were exported too (`--map sm_pier_1`, plus `models/scenery/misc/rocks/rocka`
+through `--list`). The user supplied pictures for six pier model textures in
+`sm_pier_1/models/scenery/structural/pier/NewTex/`: arcadefront, arch, cliffa, supports,
+walkway and walkwaystairs. Each layout matches its original (blurred correlation on the
+opaque pixels 0.81 to 1.00; arcadefront 0.55, its lattice holes aside, and matches by eye).
+- They went in as `-replace.png`, at the original's size times the largest power of two
+  the picture holds: walkwaystairs 2048 (from 256), the rest 2048 on the long side.
+- The pictures have no alpha, so the game's own alpha, upscaled, was put on each. This
+  keeps the arcade front's lattice and the walkway's grate see-through.
+- Bump and roughness maps were made for all six. Height maps were made for arch, cliffa,
+  supports and walkwaystairs, but not for the two see-through ones. All six were packed
+  as BC7.
+- Two more were supplied: `plaster/giocryptwllb`, the stained wall around the pier tunnel
+  arch, and `stone/twrtrima`, the carved ledge along its top. Their blurred correlation
+  is 0.998 and 0.999. Both are 2048×2048 replacements, with bump, roughness and height
+  maps, packed as BC7.
+- The cliff rocks (`models/scenery/misc/rocks/rocka`, 1024×1024) got bump, roughness and
+  height maps from the game's own texture, because the user said they looked flat.
+- The rocks showed no change in the dark. The bumps (`ps_surface`) only shade relative to
+  the frame's lights (`frame_lights`, the volumetric light's list), and those don't reach
+  the rocks there. Rock and cliff textures (`material_rock`: "rock", "cliff" or "bluff"
+  in the name, `struct obj` `rock`) now get two things. Crevice shading from the height
+  map works in any light (`d3d_ps_params` `cavity`: down to 0.35 in the lowest parts).
+  Their parallax is 2.5 times deeper (`BL_POM_ROCK`). Other surfaces are unchanged.
+  Verified: the runtime builds and links, and shader_test compiles all 5388 variants
+  (0 failed). Not verified: the look in the game.
+- The user supplied a 2048×2048 picture for `rocka` (blurred correlation 0.994). It went in
+  as a replacement, and its bump, roughness and height maps were remade from it.
+- The beach tunnel got user-supplied 2048×2048 pictures for `stone/tnnlflra` (the cobbled
+  floor) and `stone/tnnlwlla` (the rubble walls and plastered ceiling). Both went in as
+  replacements, and their bump, roughness and height maps were made from them.
+- The pier cliff `models/scenery/structural/pier/cliffa` (446 triangles) was remodelled
+  with real relief by `tools/blender/rock_relief.py` (recipe `tools/props/cliffa.json`).
+  The script subdivides it four times, rounds the inside (Catmull-Clark) and keeps the
+  open edges flat. It then pushes the surface in and out by the mid frequencies of
+  `cliffa_h`, up to 12 units either side, and fades the relief to nothing at the open edges.
+  Last, it decimates the mesh to 20,000 triangles and 10,050 vertices; UVs are the
+  original's.
+  The rounding moved the surface 1.0 units on average and 10.4 at most. Blender works on
+  it flipped to face outward, and the output keeps the game's clockwise winding with
+  outward normals, as the other remodels do. Packed by `tools/prop_pack.py`.
+  Collision is still the original shape. Not verified: the look in the game.
+  On the user's first look the parallax on top of the new shape was far too deep. Rock
+  drawn as a remodel now gets no parallax (and so no cavity shading), because its relief is
+  in the geometry. Unremodelled rock keeps both.
+  The user found 20,000 triangles far too heavy. The cliff was remade at 3,998 triangles
+  and 2,039 vertices, with the relief taken from coarser features (blur 6 instead of 2
+  pixels) to suit the lighter mesh.
+
+## 2026-10-28: The rain drawn after the upscaler
+
+The rain's drops and splashes (the textures `wet_rain_texture` recognises) are thin, fast
+and see-through, and write no depth or motion of their own. MetalFX and FSR 4 blend each
+pixel with earlier frames, so they smear such sprites or let them fade. MetalFX has a
+reactive mask for this case; FSR 4 (FSR4Metal) takes none. So one fix for both:
+- `rain_hold` (from `d3d_render_draw`): while the world view is being drawn
+  (`view_state` 1, on the back buffer), a draw that samples a rain texture is held back.
+  It keeps a copy of the device's state, of the vertices it reads (copied for this frame,
+  as for dynamic buffers) and of its indices.
+- `rain_draw_held` (from the end of `pass`, once `view_state` is 2): the held draws are
+  drawn by `render_draw`, using those copies (`rain_now`). That happens after the world
+  view has gone through the scaler and been brought up to the window's size, with the
+  view model: at the window's pixels, depth-tested against the depth brought up with the
+  picture.
+- They are drawn after the world's post effects, so the occlusion and bloom no longer
+  touch them.
+- A frame whose world view has no pass after it drops its held draws, logged once.
+- Rain drawn through `d3d_render_draw_up` is not held.
+
+Verified: the runtime and boot build. Not verified: on screen (handed to the user). That
+includes whether the drop textures are recognised at all; the log line
+"[metal] rain: N draws after the upscaler" shows they are.
+  Seen in the game, the cliffs still smeared with parallax. Their texture stretches over
+  the whole cliff (one UV unit is about 346 game units), so even the normal depth is large
+  there. Textures named cliff or bluff now get no parallax and no cavity shading; their
+  bump and roughness maps stay. Rock textures (`rocka`) are unchanged.
+- The beach house's cliffs are about a dozen copies of the four pier cliff models. `cliffb`,
+  `cliffc` and `cliffd` were remodelled like `cliffa` (recipes in `tools/props/`):
+  392, 396 and 365 triangles became 4,000, 3,999 and 3,999, with about 2,050 vertices each.
+  The rounding moved them 0.8 to 1.0 units on average and 8.7 at most. Not verified: the
+  look in the game.
+- In the game all four cliff remodels were drawn (`[remodel] … cliffa/0.msh: 446 triangles
+  drawn as 3998`, and the same for b, c and d), yet the cliffs still showed flat-edged
+  patches. The object shadows (`bl_props_load_visible`) still read each prop's original
+  `.mdl`, so the old low-poly cliffs shadowed the new surfaces wherever those dipped below
+  them. A remodelled prop now casts its remodel's shape (every mesh from
+  `build/remodels/<model>/<k>.msh`, `remodel_tris` in `bl_props.c`). This holds for every
+  remodelled prop, which matches what is drawn. The lighting rebake's casters (`bl_props_load`)
+  are unchanged. Not verified: the look in the game.
+
+## 2026-10-28: Finer, lit rain
+
+The rain on the Santa Monica maps is the Unofficial Patch's `raindrops2` particle: 1000
+drops a second from `rain_follow_emitter`, each a 3x10-unit sprite of
+`particles/dropletfast.tga`, a 5x25 picture, grey and unlit. Two changes to how the
+renderer draws it, using the held rain draws (previous section):
+- **A finer drop.** In place of the 5x25 picture, `rain_drop_texture` draws the same shape
+  at 32x160 with its own mipmaps: a thin streak, faint at its tail (the top) and fullest
+  towards its head, with a glint at the head. Grey with straight alpha, as the game's. It
+  goes in `texture_of` as the texture's `hires`.
+- **Lit by the light around it.** The shader variant `rain` (`d3d9_shader.h`;
+  `ps_rain_light` in `d3d9_shader.c`, for shader and fixed-function draws alike) reads the
+  finished world view (`hdr_world`, copied this frame) at the pixel and at 8 points round
+  it, 4% of the screen's height away. The drop's colour is scaled by
+  0.2 + 3 x that light, before the fog. Drops in front of lamps and neon take their colour
+  and shine; in the dark they all but go.
+- Only held draws are lit (`rain_now`). The splash rings keep their own picture.
+
+Verified: the runtime and boot build. The fixed-function shader with the variant was
+generated and compiled with Metal's runtime compiler. Not verified: on screen (handed to the user).
+- The user still saw big triangles on the cliffs, and the wall lamps standing off them.
+  - The triangles: the game lights a static prop at its own corners, and the remodel took
+    those colours blended across each original triangle. So a lamp's light still came out
+    triangular. `prop_remodel.c` now smooths a relief remodel's byte colours (usage COLOR)
+    across the new mesh, a Gaussian mean within 48 units, when its folder holds a `smooth`
+    file. `tools/prop_pack.py` writes that file for recipes with `"method": "relief"`. It
+    logs `[remodel] <file>: N colour elements smoothed`. N is 0 if the draw has no colour
+    stream, in which case the triangles come from elsewhere.
+  - The lamps: `tools/prop_pins.py` finds every prop (static, or an entity with a model)
+    whose origin lies within 24 units of a placed cliff's surface, on every map that places
+    it. It writes them in the cliff's own space to `<name>_pins.json`.
+  - `rock_relief.py` keeps the original surface within 40 units of each pin, fading to the
+    full rounding and relief by 96. `cliffa` has 24 pins (the cage lamps and the walkway
+    steps on the beach house and pier maps), `cliffb` 1, `cliffc` and `cliffd` none. The
+    pins' distance to the surface changed by 1.8 units at most.
+  - Remade at 3,999, 4,000, 3,999 and 3,999 triangles. Not verified: the look in the game.
+- The user still found the cliffs a mess, for two reasons.
+  - The wide pins (40 and 96 units) left the original's big flat triangles around the steps.
+    The pins now keep the surface within 12 units and fade out by 40.
+  - The relief folded when thinned. Adjacent triangles met at a median of 25 degrees,
+    against 4.4 in the 171,264-triangle mesh before thinning. The relief now takes only the
+    height map's broad forms (blur 40 minus blur 240 pixels, depth 32), which 4,000
+    triangles can carry: median fold 7 to 8 degrees, 0.6% of edges above 45. The bump map
+    keeps the fine detail.
+  - The lamps' distance to the surface changes by 3 units at most.
+  - The game logs `1 colour element smoothed` for all four cliffs, so the lighting
+    smoothing works. Not verified: the look in the game.
+
+## 2026-10-28: The rain found on the particle sheet
+
+The user's window run on sm_beachhouse_1 printed no "[metal] rain:" line, so none of the
+rain work above was running. That includes the puddle rings and the held, finer, lit drops.
+The fingerprints in `wet_rain_texture` match the game's files, so the game had to be
+changing the pictures as it loaded them. Two headless runs (the user's go-ahead for each,
+`BL_RAIN_TEXTURES`, debugging since removed) showed how:
+- No texture is ever 5x25 or a lone 64x64 ring.
+- The game packs the sprites its particle systems use into shared 256x256 A8R8G8B8
+  sheets. On sm_beachhouse_1, a sheet written in frame 215 holds the drop at 0,0 (as
+  stored, not upside down), the mist's furball at 16,0, the splash ring at 56,0 and other
+  sprites below.
+
+So, replacing the whole-texture fingerprints:
+- `wet_rain_sheet` (texture upload) marks a 256x256 A8R8G8B8 texture as the rain's
+  when it holds the drop at a step of 8 texels, either way up (a one-texel alpha check,
+  then the 5x25 fingerprint, `bl_tex_key` with the sheet's pitch). It then looks for the
+  ring's 64x64 fingerprint the same way, records both places (`struct obj` `rain_drop`,
+  `rain_ring`, `rain_flip`) and logs "[metal] rain: the particle sheet with its drop
+  at ...".
+- `rain_kind` (from `rain_hold`) reads where a draw's first vertex reads the sheet
+  (texture coordinate 0, FLOAT2): in the drop's place 1, in the ring's 2, elsewhere 0.
+  The sheet's other sprites (the mist, sparks) are left as they were.
+- Held drops have their coordinates moved from the drop's place on the sheet to the whole
+  of `rain_drop_texture`. `setup_draw` binds that texture in the sheet's place for them
+  (`rain_now_drop`). The texture swap through `hires` is gone.
+- A draw of the sheet through DrawPrimitiveUP is logged once and not held.
+- The puddle rings' "rain is falling" now means the rain sheet is drawn from.
+
+Verified: the runtime and boot build, and the sheet layout above, from the dumped sheet.
+Not verified: a run with the new recognition (handed to the user). The log lines to look
+for are "[metal] rain: the particle sheet with its drop at 0,0, splash ring at 56,0" and
+"[metal] rain: N draws after the upscaler".
+
+- Supplied pictures keep their own size. `tools/tex_pack.py` used to force every hires texture to the original's size times a power of two, so the user's 1440x2880 cliff picture went in at 1024x2048. A `-replace` picture now packs at its own size (rounded down to whole BC7 blocks, shape within 2% of the original's); upscales keep the power-of-two rule. The pier's cliffa (1440x2880), supports (1440x2912) and arcadefront (2912x1440) were reinstalled from the user's pictures at full size. The runtime loader already handled any size.
+
+- Cliff remodels no longer come through the stairs. `tools/prop_pins.py` pinned each mounted prop at its origin only, so a long stairway or walkway was held at one point and the new relief pushed through the rest of it. It now samples every mounted prop's whole surface every 8 units (read with `mdl_extract.parse`) and keeps every sample within 24 units of the cliff, one per 8-unit cube; the other remodelled cliffs are left out so their joins still take the new shape. `rock_relief.py` finds the nearest pin with a KD-tree. Pins: cliffa 3526, cliffb 31, cliffc 170, cliffd 98. Under the pins the surface moves 0.1-0.6 units on average (at most 6, from thinning).
+
+## 2026-10-28: The rain's flicker
+
+With the rain recognised, the user saw the whole picture flicker in a window (Quality
+upscaling, 3600x2025). A headless run on sm_beachhouse_1 (native size, the user's
+go-ahead) added a count every 100 frames. The rain was held in only 8, 6 and 45 of each 100
+frames, and never dropped. The game draws a frame's particles from one sheet together:
+drops, splashes and the mist's puffs in one draw, in depth order. `rain_kind` judged a
+draw by its first vertex, so the rain switched frame by frame between the held, lit,
+full-size drawing and the game's own drawing through the scaler.
+- `rain_kind` now holds a draw when any of its vertices reads the drop or the splash
+  ring. The mist's puffs in the same draw go with it, lit the same way.
+- Moving the coordinates onto a separate drop texture can't work for mixed draws, so it
+  is gone. The finer drop is now part of a copy of the sheet 4 times the size
+  (`rain_sheet_hires`, made once when the game writes the sheet, with its own mipmaps): the
+  sheet brought up smoothly, with the finer drop drawn in the drop's place. It is the
+  sheet's `hires`, so every draw from the sheet uses it.
+- The count stays in the log: "[metal] rain: of the last 100 frames, N drawn after the
+  upscaler (L lit), D dropped".
+
+The six frames saved headless (600-605, native size) showed no flash, so the flicker
+needs the upscaled size to show. Verified: the build. Not verified: the window run (handed
+to the user), where the count should read close to 100 drawn.
+
+- Fine grain on cliffs. The cliff texture (now the user's 1440x2880 picture) is stretched over a whole cliff about 560 units tall, about 4 texels per unit, so close up each texel covers several pixels and the detail blurs. The surface variant (`ps_surface`) now reads the colour texture's own brightness 4 times smaller, over its local mean (the same read 4 mipmaps blurrier), and multiplies it in where the texture is magnified past a pixel (faded in from 0.7 to 2.5 pixels per texel). Brightness only, so the picture's colours and layout (the grass band) stay as they are. `d3d_ps_params.grain` (was padding): 0.8 for cliffs (`material_rock` 2), 0 for everything else.
+
+- Van (vw_bus) rebuilt and retextured. The smooth remodel (`prop_soft.py`) cannot round it: the van is flat panels whose normals average across corners, so curving puffs the roof up, and held back it changes nothing. New `tools/blender/prop_rebuild.py` (recipe `tools/props/vw_bus.json`, method "rebuild"):
+  - each face is turned to match its own normals, then the imported normals are cleared;
+  - the body's corners (its largest piece, edges of the VW_Bus material at least 15 units long meeting at over 35 degrees) are rounded 2.5 units in 2 steps, UVs interpolated;
+  - the wheels (separate pieces within 16 units of the axle centres) get the circumferential edges on their outer half split to 24 sides along the true arc;
+  - shading is smooth, with edges sharper than 40 degrees left hard.
+  
+  Result: 6,238 triangles against the original's 5,217; the winding matches the game's on every face.
+  
+  Rejected: 48-sided wheels and 3-step rounding (10,679 triangles); collapse thinning of the whole van (dragged the texture across the window frames); collapse thinning of the interior alone (pushed the lining through the body).
+  
+  The user's 2048x2048 `NewTex/vw_bus.png` is installed as `vw_bus-replace.png` and packed at 2048 BC7.
+
+### The Video tab's resolution kept after Apply
+
+Options is made again each time it opens, and the Video tab's constructor reads the current
+mode from the engine (0x1001b750), which keeps the start-up size until the game starts again.
+So after a live change the drop-down went back to the old resolution ("it snaps back").
+GameUI (re-translated): at 0x1001b78a, before that mode is copied to the selected one
+(+0x10c), `bl_vgui_VideoCurrent` puts the size the world view is drawn at in its place, as
+`bl_vgui_VideoApply` already does on Apply.
+
+Verified: GameUI re-translates, the runtime builds, the game links. Not verified on screen.
+
+## 2026-10-28: Bounced light: variance-guided filter; upscaled intro movies
+
+### Bounced light's noise filter
+Godot's 4-neighbour smart blur (2 passes) is replaced by a variance-guided a-trous filter
+(`ssil_filter`, after Schied et al. 2017's SVGF, written here; nothing taken from LSGI, whose
+licence needs the author's permission): 4 passes of 5x5 taps 1, 2, 4 and 8 half-resolution
+pixels apart, each weighted by its view depth against this pixel's plane and by its
+brightness against this pixel's, in 4 of the noise's standard deviations. The history
+(`ssil_history`) now also keeps the mean of the brightness and of its square (a second
+target), from which the filter's first pass takes the noise left in the mean; a pixel with
+fewer than 4 frames uses at least its 3x3 spread, so freshly uncovered areas are spread wide
+and settled ones keep their detail. The history is clipped to 2 standard deviations of the
+3x3 mean instead of the min/max range (a range of one frame's noise pulled it about), and
+restarts only on a large cut. `BL_SSIL_BLUR` is now the filter's passes (default 4).
+The user's first window run showed black squares at the picture's corners: the gather leaves
+a few pixels there not finite, which the old 2-pixel blur kept small and the new filter's
+30-pixel reach spread. The history and the filter now take such pixels as no light. The
+user's next run: the squares are gone.
+
+### Upscaled intro movies
+`tools/movie_upscale.sh` decodes each Bink movie with ffmpeg, upscales its frames with
+Real-ESRGAN (realesrgan-x4plus, then down to 2x) and writes `build/hires/movies/<movie>.mov`
+(HEVC, no sound); `<movie>.sig` holds each original frame shrunk to 8x8 RGB. Bink still
+plays the movie, its sound and timing; `d3d9/movie_hires.m` finds the frame Bink draws among
+the originals by that 8x8 picture and draws the same frame of the .mov in its place (the
+movie identified only when one matches clearly better than the rest). Only troika.mov is
+made: 4x Real-ESRGAN runs about 3 s a frame on an M4 Pro, too slow for all four. Not seen in a
+window.
+
+### Effects switched without the game stopping
+
+Switching an effect on the Enhanced tab (reflections, bounced light, skin scattering, rain
+effects, contact shadows) gives the world's draws other shader variants and pipelines, all
+needed on the next frame. They were built there one after another, and with macOS's shader
+cache empty (every shader's source changes when the shared parameters do) that frame took
+about half a minute.
+
+- `bl_effect_set` now starts background builds: until a frame of the world view is drawn with
+  nothing missing, a missing variant (`shader_function`) or pipeline (`pipeline`, now
+  `pipeline_build`) is compiled on a global queue, on all cores, and the draws that need it
+  are left out until it is ready. `builds_finish` puts the finished ones in the caches
+  between frames and logs `[metal] effects: N shaders and M pipelines built in the
+  background` at the end. A frame whose world draws all waited still counts as a world view
+  (no switch to the menu layout), and the characters' motion pipelines wait instead of
+  marking the shader as failed.
+- Start-up and map loads are unchanged (the early compile and the draws' own builds).
+
+Verified: the runtime builds without warnings and the game links. Not verified in the
+game: how long the builds take, and whether objects are missing for a moment after the
+options close.
+
+### No upscaler
+The Visual tab's Upscaler drop-down is now None, MetalFX, FSR 4. None (`BL_UPSCALER=none`,
+registry value 2) draws the world view at the window's own size through MetalFX's temporal
+scaler, for its anti-aliasing alone; the saved quality is kept for when an upscaler is chosen
+again. With None the Upscaling Quality drop-down is greyed and does not change (bl_vgui_poll
+clears its enabled flag, which the options' painting and click handling read). Built; not
+seen in a window.
+
+### Load Game and Save Game at the screen's scale
+
+The Load Game and Save Game dialogs kept the game's own layout, made for its smaller fonts:
+list rows 20 pixels tall at 1080, so the saves were tiny text on a big screen. They are now
+laid out each frame like the options (`layout_games` in bl_options.c, from
+bl_options_FrameBackground): a panel 1500 by 860 (in 1080 units) in the middle, the notes
+under the title stacked (they overlapped before), the save's name field (Save Game), the
+list with 40-pixel rows and header, and the buttons in a row at the bottom.
+
+Verified: the runtime builds and the game links. Not verified on screen, including the
+Save Game dialog's name field and the list's column widths in the wider panel.
+
+### No stall after a menu closes
+
+After the options closed, the first frame with the world view took 3.8 seconds, all of it
+waiting for the GPU (`[hitch] frame 1239: 3847.7 ms ... waiting for the GPU 3785.1`; the user
+saw up to half a minute). The frame before it had no world view, so that frame was drawn at
+full size (`world_low` is set from the frame before) and the temporal scaler was made again
+for it ("MetalFX temporal scaler, 3600x2025 to 3600x2025"), then once more for the next
+frame's smaller size. A new MetalFX scaler, or FSR 4 context, is that slow to start.
+
+- The first world view after a menu (`world_after_menu`, set in present) now leaves the scaler
+  out: drawn at full size it needs none, and its history starts again on the next frame. The
+  scaler made for the upscaled size is kept.
+- Slow frames are now logged without BL_HITCH: one over a second, and a run of slow frames
+  of 2 seconds or more. The Direct3D device's Reset is logged.
+- Effect changes build their shaders in the background (the section above) as well; that
+  turned out to be 2 shaders and 23 pipelines here.
+
+Verified: the runtime builds and the game links. Not verified in the game.
