@@ -11,6 +11,10 @@
 // weights...) interpolated from the nearest point of the original triangles, then the
 // remodel's position, normal and UV. A relief remodel's colours (the game's lighting at
 // the original's corners) are then smoothed across it (a "smooth" file in its folder).
+// Brush remodels (files under brush/, tools/brush_panels.py: a door's faces with real
+// panels) are keyed by the points the draw uses instead, as the game builds a brush
+// model's indices anew every frame; their files list no original positions, and their
+// tangents and binormals are turned with the remodel's normals.
 #pragma once
 #include <stddef.h>
 
@@ -22,3 +26,11 @@ int prop_remodel_listed(uint32_t ntris);
 // 1 and out filled (out->moved and sharp unused), name set; 0 when the draw is no
 // remodelled prop.
 int prop_remodel(const struct prop_in *in, struct prop_out *out, char *name, size_t namelen);
+
+// The same for brush remodels: whether one has this many triangles, the draw's key by its
+// points (0 when its indices are past its positions), and the remodel for a draw.
+int prop_remodel_brush_listed(uint32_t ntris);
+uint64_t prop_remodel_brush_key(const struct prop_in *in);
+// Whether a brush remodel is listed with this key and triangle count.
+int prop_remodel_brush_known(uint64_t key, uint32_t ntris);
+int prop_remodel_brush(const struct prop_in *in, struct prop_out *out, char *name, size_t namelen);

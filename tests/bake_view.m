@@ -117,7 +117,8 @@ int main(int argc, char **argv)
                 o += 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
             }
             for (int k = 0; k < bf->w * bf->h; k++) {
-                const float *c = b->light[bf->offset + k][0];
+                float c[3];
+                bl_bake_unpack(b->light[bf->offset + k][0], c);
                 nw += 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
             }
             o /= n, nw /= bf->w * bf->h;
@@ -152,7 +153,8 @@ int main(int argc, char **argv)
                         o += (0.299 * cc[0] + 0.587 * cc[1] + 0.114 * cc[2]) / n;
                     }
                     for (int k = 0; k < bf->w * bf->h; k++) {
-                        const float *cc = b->light[bf->offset + k][0];
+                        float cc[3];
+                        bl_bake_unpack(b->light[bf->offset + k][0], cc);
                         nw += (0.299 * cc[0] + 0.587 * cc[1] + 0.114 * cc[2]) / (bf->w * bf->h);
                     }
                     const float *rf = w->texdata[w->texinfo[f->texinfo].texdata].reflectivity;
@@ -193,7 +195,8 @@ int main(int argc, char **argv)
                 }
             for (int y = 0; y < nh[i]; y++)
                 for (int x = 0; x < nw_[i]; x++) {
-                    const float *c = b->light[b->faces[i].offset + y * nw_[i] + x][0];
+                    float c[3];
+                    bl_bake_unpack(b->light[b->faces[i].offset + y * nw_[i] + x][0], c);
                     _Float16 *p = (_Float16 *)&na[4 * ((size_t)(ny[i] + y) * bw + nx[i] + x)];
                     p[0] = (_Float16)c[0], p[1] = (_Float16)c[1], p[2] = (_Float16)c[2], p[3] = 1;
                 }
@@ -214,7 +217,8 @@ int main(int argc, char **argv)
         // The faces as triangles, each corner with its place in both atlases.
         int nv = 0;
         for (int i = 0; i < w->nfaces; i++)
-            if (b->faces[i].offset >= 0) nv += 3 * (w->faces[i].count - 2);
+            if (b->faces[i].offset >= 0)
+                nv += w->faces[i].dside ? 6 * (w->faces[i].dside - 1) * (w->faces[i].dside - 1) : 3 * (w->faces[i].count - 2);
         struct vv *verts = calloc((size_t)nv + 1, sizeof *verts);
         int k = 0;
         for (int i = 0; i < w->nfaces; i++) {
@@ -222,6 +226,24 @@ int main(int argc, char **argv)
             const struct bl_bsp_face *f = &w->faces[i];
             const struct bl_bsp_texinfo *t = &w->texinfo[f->texinfo];
             const float *refl = w->texdata[t->texdata].reflectivity;
+            if (f->dside) {  // a displacement: its grid, each point with its lightmap coordinates
+                int n = f->dside;
+                const struct bl_bsp_dvert *dv = &w->dverts[f->dfirst];
+                for (int r = 0; r + 1 < n; r++)
+                    for (int q = 0; q + 1 < n; q++) {
+                        int cell[6] = {r * n + q, (r + 1) * n + q, (r + 1) * n + q + 1, r * n + q, (r + 1) * n + q + 1, r * n + q + 1};
+                        for (int j = 0; j < 6; j++) {
+                            const struct bl_bsp_dvert *d = &dv[cell[j]];
+                            struct vv *v = &verts[k++];
+                            memcpy(v->pos, d->pos, 12), memcpy(v->alb, refl, 12);
+                            float s = d->lux[0], u = d->lux[1];
+                            v->uo[0] = ((float)ox[i] + s + 0.5f) / (float)aw, v->uo[1] = ((float)oy[i] + u + 0.5f) / (float)ah;
+                            v->un[0] = ((float)nx[i] + (s + 0.5f) * (float)scale) / (float)bw;
+                            v->un[1] = ((float)ny[i] + (u + 0.5f) * (float)scale) / (float)bh;
+                        }
+                    }
+                continue;
+            }
             for (int c = 1; c + 1 < f->count; c++) {
                 int corner[3] = {0, c, c + 1};
                 for (int j = 0; j < 3; j++) {

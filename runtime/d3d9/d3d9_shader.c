@@ -332,10 +332,10 @@ struct gen {
     // Skin (variant skin): stage 0, the colour texture, read as white for now (its alpha
     // kept, which may mask the shine).
     int white_base;
-    char base_coord[96];  // what stage 0's 2D texture is read with (for the detail normal map)
+    char base_coord[256];  // what stage 0's 2D texture is read with (for the detail normal map)
     int alb_stage;        // the first plain 2D texture read, and its coordinate (variant albedo); -1 none yet
-    char alb_coord[96];
-    char pom_coords[8][96];  // the coordinates plain 2D textures are read with (ps_pom), npom of them
+    char alb_coord[256];
+    char pom_coords[8][256];  // the coordinates plain 2D textures are read with (ps_pom), npom of them
     int npom;
 };
 
@@ -521,7 +521,9 @@ static void sample(struct gen *g, uint32_t stage, const char *coord, const char 
         return;
     }
     if (g->v && stage < 8 && (g->v->lightmap & (1u << stage)) && k == D3D_TEX_2D) {
-        if (g->v->rebake) snprintf(buf, len, "bl_lightmap_rebaked(tex%u, smp%u, bl_lr, (%s).xy, bl_lh, bl_lo)", stage, stage, coord);
+        if (g->v->rebake)
+            snprintf(buf, len, "bl_lightmap_rebaked(tex%u, smp%u, bl_lr, (%s).xy, bl_lh, bl_lo, bl_ld, _lmd, %s)", stage,
+                     stage, coord, g->v->rebake == 2 ? "true" : "false");
         else snprintf(buf, len, "bl_lightmap(tex%u, smp%u, bl_lr, (%s).xy)", stage, stage, coord);
         return;
     }
@@ -556,7 +558,8 @@ static const char *const header =
     "struct BLVSParams { int4 i[16]; uint b[16]; float2 inv_viewport; float clip_y; float color_max; };\n"
     "struct BLPSParams { int4 i[16]; uint b[16]; float4 bumpenv[8]; float4 bumpenv_l[8]; float4 fog_color;\n"
     "    float fog_start, fog_end, fog_density; uint fog_mode; float alpha_ref; uint alpha_func; float gloss, pbr; float4 view;\n"
-    "    float bump, metal, spec, pom; float pom_dist, tag, out_max, stage_max; float out_gain, wet, cavity, grain; };\n"
+    "    float bump, metal, spec, pom; float pom_dist, tag, out_max, stage_max; float out_gain, wet, cavity, grain;\n"
+    "    float graze, pom_max, pad0, pad1; };\n"
     // A glow's bright parts times up to g (p.out_gain), its dim parts as drawn.
     "static float3 bl_gain(float3 c, float g) {\n"
     "    return g > 1.0 ? c * mix(1.0, g, smoothstep(0.5, 1.0, max(max(c.x, c.y), c.z))) : c; }\n"
@@ -617,19 +620,48 @@ static const char *const lightmap_msl =
     "    if (r.z <= r.x) return t.sample(s, uv);\n"
     "    return bl_lightmap_cubic(t, p, r);\n"
     "}\n"
-    // Where the rectangle says so (x0 + 0x8000), the game's page changed by the rebake: the
-    // new light (h: a bake, 4 times the size, or with HDR the map's own samples past white,
-    // the page's size) less the old (o, the map's own samples encoded), so what the game
-    // adds to its page as it runs (dynamic lights) stays.
+    // Where the rectangle says so (x0 + 0x8000), the rebaked light (metal_render.m, the
+    // lighting rebake), in linear light: h, the new steady light (a bake, `scale` times the
+    // page's size; or with HDR alone the map's own samples, unclamped), plus what the game
+    // adds to its page as it runs (lights that switch or flicker, dynamic lights such as the
+    // asylum's green neon): its page decoded less o, the map's own steady samples as the
+    // game encodes and decodes them, per texel. Then encoded as the game's page is (gamma
+    // 2.2, twice overbright), past white with HDR, else scaled down whole, keeping its hue,
+    // where a channel would pass it. d: the bake's light split between the three bump
+    // directions (their shares, a 1 where known), for the Chord bumps (ps_surface), into lmd.
+    "static float3 bl_lm_dec(float3 v) { return pow(2.0 * v, 2.2); }\n"
+    "static float4 bl_lightmap_dyn(texture2d<float> t, texture2d<float> o, float2 p, int4 r) {\n"
+    "    float2 q = p - 0.5, f = q - floor(q);\n"
+    "    float2 w[4] = {f * (-0.5 + f * (1.0 - 0.5 * f)), 1.0 + f * f * (-2.5 + 1.5 * f),\n"
+    "                   f * (0.5 + f * (2.0 - 1.5 * f)), f * f * (-0.5 + 0.5 * f)};\n"
+    "    int2 b = int2(floor(q)) - 1, lo = r.xy, hi = r.zw - 1;\n"
+    "    float4 sum = 0.0, mn = INFINITY, mx = -INFINITY;\n"
+    "    for (int y = 0; y < 4; y++)\n"
+    "        for (int x = 0; x < 4; x++) {\n"
+    "            uint2 at = uint2(clamp(b + int2(x, y), lo, hi));\n"
+    "            float4 g = t.read(at), c = float4(max(bl_lm_dec(g.rgb) - o.read(at).rgb, 0.0), g.a);\n"
+    "            sum += w[x].x * w[y].y * c;\n"
+    "            if ((x == 1 || x == 2) && (y == 1 || y == 2)) mn = min(mn, c), mx = max(mx, c);\n"
+    "        }\n"
+    "    return clamp(sum, mn, mx);\n"
+    "}\n"
     "static float4 bl_lightmap_rebaked(texture2d<float> t, sampler s, texture2d<ushort> lr, float2 uv, texture2d<float> h,\n"
-    "                                  texture2d<float> o) {\n"
+    "                                  texture2d<float> o, texture2d<float> d, thread float4 &lmd, bool hdr) {\n"
     "    float2 sz = float2(t.get_width(), t.get_height()), p = uv * sz;\n"
     "    int4 r = int4(lr.read(uint2(clamp(p, float2(0.0), sz - 1.0))));\n"
     "    if (r.x < 32768) return r.z <= r.x ? t.sample(s, uv) : bl_lightmap_cubic(t, p, r);\n"
     "    r.x -= 32768;\n"
-    "    float4 g = bl_lightmap_cubic(t, p, r);\n"
-    "    float3 n = bl_lightmap_cubic(h, uv * float2(h.get_width(), h.get_height()), r * int(h.get_width() / t.get_width())).rgb;\n"
-    "    return float4(max(g.rgb + n - bl_lightmap_cubic(o, p, r).rgb, 0.0), g.a);\n"
+    "    float4 g = bl_lightmap_dyn(t, o, p, r);\n"
+    "    int k = int(h.get_width() / t.get_width());\n"
+    "    float3 e = 0.5 * pow(max(bl_lightmap_cubic(h, p * float(k), r * k).rgb + g.rgb, 0.0), 1.0 / 2.2);\n"
+    "    if (!hdr) e /= max(1.0, max(max(e.x, e.y), e.z));\n"
+    "    if (d.get_width() > 1) {\n"
+    "        constexpr sampler ls(filter::linear, address::clamp_to_edge);\n"
+    "        float n = float(d.get_width() / t.get_width());\n"
+    "        float2 q = clamp(p * n, float2(r.xy) * n + 0.5, float2(r.zw) * n - 0.5);\n"
+    "        lmd = d.sample(ls, q / (sz * n));\n"
+    "    }\n"
+    "    return float4(e, g.a);\n"
     "}\n";
 
 // Soft shadows (variant shadow_receiver; metal_render.m, shadows): percentage-closer
@@ -1186,7 +1218,10 @@ static int pom_reg(const char *c)
 // the inputs: where the view ray into the surface meets the height map at [[texture(19)]]
 // (white high, p.pom deep as a share of the texture's shorter side, faded out towards
 // p.pom_dist and edge on), stepped 8 times head on to 24 edge on through the texture read
-// at in.t`alb` and refined between the last two steps. That register is moved there, and
+// at in.t`alb` and refined between the last two steps. The ground (p.graze) is seen
+// nearly edge on down a street, so its fades out at a shallower angle and takes up to 32
+// steps; its depth is at most p.pom_max world units, as road textures cover so much
+// ground that a share of their size would be knee-deep. That register is moved there, and
 // the other coordinates plain 2D textures are read with (`regs`, a bit each) by as much
 // on the screen, so they keep to the colour (their own scale: bump and detail textures);
 // the lightmap's are not, as the game's own bump directions light the surface.
@@ -1205,15 +1240,17 @@ static void ps_pom(struct out *o, int alb, unsigned regs)
     line(o, "float _pmdet = dot(_pmx, _pmr1);");
     line(o, "float3 _pmgu = (_pmr1 * _pmux.x + _pmr2 * _pmuy.x) / _pmdet, _pmgv = (_pmr1 * _pmux.y + _pmr2 * _pmuy.y) / _pmdet;");
     line(o, "float3 _pmV = -normalize(_pmP); float _pmvn = dot(_pmV, _pmN);");
-    line(o, "float _pmf = saturate((p.pom_dist - in.fogz) / (0.4 * p.pom_dist)) * saturate(_pmvn * 4.0);");
-    line(o, "float _pmd = p.pom * _pmf / max(max(length(_pmgu), length(_pmgv)), 1e-8);");
+    line(o, "float _pmf = saturate((p.pom_dist - in.fogz) / (0.4 * p.pom_dist)) * saturate(_pmvn * mix(4.0, 8.0, p.graze));");
+    line(o, "float _pmd = p.pom / max(max(length(_pmgu), length(_pmgv)), 1e-8);");
+    line(o, "if (p.graze > 0.0) _pmd = min(_pmd, p.pom_max);");
+    line(o, "_pmd *= _pmf;");
     line(o, "float _pmj = _pmux.x * _pmuy.y - _pmuy.x * _pmux.y;");
     line(o, "if (_pmd > 0.0 && abs(_pmdet) > 1e-12 && abs(_pmj) > 1e-14) {");
     o->indent++;
     line(o, "constexpr sampler _pms(filter::linear, mip_filter::linear, address::repeat);");
-    line(o, "float3 _pmD = -(_pmV - _pmN * _pmvn) / max(_pmvn, 0.25) * _pmd;");
+    line(o, "float3 _pmD = -(_pmV - _pmN * _pmvn) / max(_pmvn, mix(0.25, 0.2, p.graze)) * _pmd;");
     line(o, "float2 _pmt = float2(dot(_pmgu, _pmD), dot(_pmgv, _pmD));");
-    line(o, "int _pmn = int(mix(24.0, 8.0, saturate(_pmvn)));");
+    line(o, "int _pmn = int(mix(mix(24.0, 32.0, p.graze), 8.0, saturate(_pmvn)));");
     line(o, "float _pmst = 1.0 / float(_pmn), _pml = 0.0, _pmpl = 0.0;");
     line(o, "float _pmh = 1.0 - bl_ph.sample(_pms, _pmuv, gradient2d(_pmux, _pmuy)).r, _pmph = _pmh;");
     line(o, "for (int _pmi = 0; _pmi < _pmn && _pml < _pmh; _pmi++) {");
@@ -1243,15 +1280,28 @@ static void ps_pom(struct out *o, int alb, unsigned regs)
 // specular on the bumps with the map's roughness, each light's share of the game's light
 // here (its colour over the texture's, `stage` the texture), so it follows the game's
 // lighting and shadows; 4% head on, or for metal (p.metal) the texture's colour, with
-// less of the game's diffuse colour. p.spec its strength.
-static void ps_surface(struct out *o, const char *coord, int stage)
+// less of the game's diffuse colour. p.spec its strength. For the rain effects section
+// (metal_render.m wet_main), on hard ground, how deep the texture's cracks and potholes
+// are (_pbdip: darker than the texture around).
+static void ps_surface(struct out *o, const char *coord, int stage, int rebaked)
 {
     line(o, "float3 _pbp = float3((in.pos.x * p.view.z - 1.0) * in.fogz / p.view.x,");
     line(o, "                    (1.0 - in.pos.y * p.view.w) * in.fogz / p.view.y, in.fogz);");
     line(o, "float3 _pbx = dfdx(_pbp), _pby = dfdy(_pbp), _pbn = normalize(cross(_pbx, _pby));");
     line(o, "if (dot(_pbn, _pbp) > 0.0) _pbn = -_pbn;");
     line(o, "float4 _pbo = float4(_pbn, -1.0);");
+    line(o, "float _pbdip = 0.0;");
     if (!coord) return;
+    line(o, "if (p.wet > 1.5) {");
+    o->indent++;
+    line(o, "constexpr sampler _pbds(filter::linear, mip_filter::linear, address::repeat);");
+    line(o, "float2 _pbdu = (%s).xy;", coord);
+    line(o, "float _pbdl = dot(tex%d.sample(smp%d, _pbdu).rgb, float3(0.2126, 0.7152, 0.0722));", stage, stage);
+    line(o, "float _pbdm = max(log2(float(max(tex%d.get_width(), tex%d.get_height()))) - 4.0, 0.0);", stage, stage);
+    line(o, "float _pbdb = dot(tex%d.sample(_pbds, _pbdu, level(_pbdm)).rgb, float3(0.2126, 0.7152, 0.0722));", stage);
+    line(o, "_pbdip = saturate((1.0 - _pbdl / max(_pbdb, 0.02)) * 1.5);");
+    o->indent--;
+    line(o, "}");
     line(o, "if (p.pbr > 0.5) {");
     o->indent++;
     line(o, "constexpr sampler _pbs(filter::linear, mip_filter::linear, address::repeat);");
@@ -1265,8 +1315,10 @@ static void ps_surface(struct out *o, const char *coord, int stage)
     line(o, "_pbo = float4(_pbnb, _pbm.a);");
     // Crevices: the height map's low parts darker whatever the light, so rock reads in the
     // dark too, where no light of the map's reaches the bumps.
-    line(o, "if (p.cavity > 0.0 && p.pom > 0.0)");
-    line(o, "    oc0.xyz *= mix(1.0, 0.35 + 0.65 * smoothstep(0.05, 0.75, bl_ph.sample(_pbs, _pbuv).r), p.cavity);");
+    line(o, "if (p.cavity > 0.0 && p.pom > 0.0) {");
+    line(o, "    float _cv = mix(1.0, 0.35 + 0.65 * smoothstep(0.05, 0.75, bl_ph.sample(_pbs, _pbuv).r), p.cavity);");
+    line(o, "    oc0.xyz *= _cv;");
+    line(o, "}");
     // Grain: a texture stretched over a whole cliff is magnified close up, a texel over
     // several pixels. Its own brightness, read 4 times smaller, over its local mean (the
     // same read 4 mipmaps blurrier) gives the fine detail it lacks; only the brightness, so
@@ -1279,7 +1331,8 @@ static void ps_surface(struct out *o, const char *coord, int stage)
     line(o, "        float2 _gruv = _pbuv * 4.0;");
     line(o, "        float _grl = dot(tex%d.sample(_pbs, _gruv, gradient2d(_pbux * 4.0, _pbuy * 4.0)).rgb, float3(0.2126, 0.7152, 0.0722));", stage);
     line(o, "        float _grb = dot(tex%d.sample(_pbs, _gruv, gradient2d(_pbux * 64.0, _pbuy * 64.0)).rgb, float3(0.2126, 0.7152, 0.0722));", stage);
-    line(o, "        oc0.xyz *= mix(1.0, clamp(_grl / max(_grb, 0.02), 0.55, 1.6), _grf);");
+    line(o, "        float _grq = mix(1.0, clamp(_grl / max(_grb, 0.02), 0.55, 1.6), _grf);");
+    line(o, "        oc0.xyz *= _grq;");
     line(o, "    }");
     line(o, "}");
     line(o, "float _pbE = 0.0, _pbf = 0.0; float3 _pbS = float3(0.0), _pbSw = float3(0.0);");
@@ -1306,21 +1359,44 @@ static void ps_surface(struct out *o, const char *coord, int stage)
     line(o, "    float3 _c = _lc.xyz / max(dot(_lc.xyz, float3(0.2126, 0.7152, 0.0722)), 1e-6) * (_e * _D * _vis * _nl);");
     line(o, "    _pbS += _c, _pbSw += _c * pow(1.0 - _vh, 5.0);");
     line(o, "}");
+    line(o, "float _pbk = 1.0; float3 _pbsp = float3(0.0);");
     line(o, "if (_pbE > 1e-6) {");
     line(o, "    float3 _pbal = tex%d.sample(smp%d, _pbuv).rgb;", stage, stage);
     line(o, "    float _pbl = min(dot(oc0.xyz, float3(0.2126, 0.7152, 0.0722)) / max(dot(_pbal, float3(0.2126, 0.7152, 0.0722)), 0.04), 4.0);");
-    line(o, "    oc0.xyz *= clamp(1.0 + 2.0 * p.bump * (_pbf / _pbE - 1.0), 0.5, 1.6);");
+    line(o, "    _pbk = clamp(1.0 + 2.0 * p.bump * (_pbf / _pbE - 1.0), 0.5, 1.6);");
     line(o, "    float3 _pbF0 = mix(float3(0.04), _pbal, p.metal);");
-    line(o, "    float3 _pbsp = (_pbF0 * _pbS + (1.0 - _pbF0) * _pbSw) * (3.14159 * p.spec * _pbl / _pbE);");
-    line(o, "    oc0.xyz = oc0.xyz * (1.0 - 0.7 * p.metal) + min(_pbsp, float3(1.5));");
+    line(o, "    _pbsp = (_pbF0 * _pbS + (1.0 - _pbF0) * _pbSw) * (3.14159 * p.spec * _pbl / _pbE);");
     line(o, "}");
+    // Rebaked (the lighting rebake): the bumps lit by all the baked light, lamps, bounce and
+    // sky alike, from the share of it each of the three bump directions had (_lmd), as the
+    // game's own bump-mapped surfaces are: each direction's light by how much the bump faces
+    // it, over the same for the flat surface. The live lights' term only where none is known.
+    if (rebaked) {
+        line(o, "if (_lmd.w > 0.5) {");
+        line(o, "    float3 _nT = normalize(float3(_pbmn.x, -_pbmn.y, max(_pbmn.z, 0.05)));");
+        line(o, "    float3 _dp = float3(saturate(dot(_nT, float3(0.816497, 0.0, 0.57735))),");
+        line(o, "                        saturate(dot(_nT, float3(-0.408248, 0.707107, 0.57735))),");
+        line(o, "                        saturate(dot(_nT, float3(-0.408248, -0.707107, 0.57735))));");
+        line(o, "    _dp *= _dp;");
+        line(o, "    float _rt = 3.0 * dot(_dp, _lmd.xyz) / max(_dp.x + _dp.y + _dp.z, 1e-4);");
+        line(o, "    _pbk = clamp(1.0 + p.bump * (_rt - 1.0), 0.5, 1.6);");
+        line(o, "}");
+    }
+    line(o, "oc0.xyz *= _pbk;");
+    line(o, "if (_pbE > 1e-6) oc0.xyz = oc0.xyz * (1.0 - 0.7 * p.metal) + min(_pbsp, float3(1.5));");
     o->indent--;
     line(o, "}");
 }
 
 // Alpha test and fog on oc0, as the fixed-function back end does after any pixel shader.
 // _fog: the share of the colour the fog leaves.
-// Variant rain: oc0's colour lit by the world view around the pixel.
+// Variant rain: oc0's colour lit by the world view around the pixel. A falling drop's
+// texels (the renderer's finer drop, metal_render.m rain_sheet_hires, marked by no blue,
+// its shape in its colour) are water catching light instead: the game adds them to the
+// picture, so each adds its shape times a little of the view behind it (from a little
+// above, as a drop is a small lens) and of the light around it, eased off as it grows
+// (the game's own drop colours are dim, 1 to 80 of 255, hence the large factors). Dark
+// behind, the drop is faint; by a lamp or neon it is a soft streak of its colour.
 static void ps_rain_light(struct out *o)
 {
     line(o, "{");
@@ -1331,7 +1407,15 @@ static void ps_rain_light(struct out *o)
     line(o, "        float _a = float(_i) * 0.7853982;");
     line(o, "        _rl += 0.09375 * bl_rl.sample(_rsm, _ru + 0.04 * float2(cos(_a) * _rs.y / _rs.x, sin(_a))).rgb;");
     line(o, "    }");
-    line(o, "    oc0.xyz *= 0.2 + 3.0 * _rl;");
+    line(o, "    float _rd = oc0.x > 0.004 ? saturate(1.0 - 4.0 * oc0.z / oc0.x) : 0.0;");
+    line(o, "    if (_rd > 0.5) {");
+    line(o, "        float _px = _rs.y / 1080.0;  // the bend in pixels of a 1080-line view");
+    line(o, "        float2 _ro = float2(0.0, -3.0) * _px / _rs;");
+    line(o, "        float3 _rb = bl_rl.sample(_rsm, _ru + _ro).rgb;");
+    line(o, "        float3 _ra = oc0.x * (14.0 * _rb + 12.0 * _rl + 0.6);  // oc0.x: the drop's shape and strength");
+    line(o, "        oc0.xyz = _ra / (1.0 + 3.0 * _ra);  // soft at the top: no hard line by a lamp");
+    line(o, "    } else");
+    line(o, "        oc0.xyz *= 0.2 + 3.0 * _rl;");
     line(o, "}");
 }
 
@@ -1371,6 +1455,7 @@ static void ps_locals(struct gen *g)
                 "t7 = in.t7;");
     line(o, "float4 oc0 = 0, oc1 = 0, oc2 = 0, oc3 = 0; float odepth = in.pos.z; float3 _m = 0;");
     if (g->v && g->v->shadow_receiver) line(o, "float4 _sh = 0; bool _shd = false;");
+    if (g->v && g->v->lightmap && g->v->rebake) line(o, "float4 _lmd = 0;");
 }
 
 // The tessellated vertex shader (v->tess). Metal 4 has no tessellator: bl_pre runs the
@@ -1574,7 +1659,8 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (v && v->shadow_receiver) put(o, ",\n                         constant BLShadowParams &sp [[buffer(2)]]");
         if (v && v->lightmap) put(o, ",\n                         texture2d<ushort> bl_lr [[texture(13)]]");
         if (v && v->lightmap && v->rebake)
-            put(o, ",\n                         texture2d<float> bl_lh [[texture(16)]], texture2d<float> bl_lo [[texture(17)]]");
+            put(o, ",\n                         texture2d<float> bl_lh [[texture(16)]], texture2d<float> bl_lo [[texture(17)]],"
+                   " texture2d<float> bl_ld [[texture(21)]]");
         if (surface)
             put(o, ",\n                         texture2d<float> bl_pm [[texture(12)]], constant float4 *bl_wl [[buffer(4)]],"
                    " texture2d<float> bl_ph [[texture(19)]]");
@@ -1642,7 +1728,7 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
         if (g.ps.major == 1) line(o, "oc0 = r0;");
         if (g.env) line(o, "float3 _d = oc0.xyz - _e0, _w = _e1 - _e0;");
         if (detail && skin && g.base_coord[0]) ps_detail(o, g.base_coord, v->hair);
-        if (surface) ps_surface(o, g.alb_stage >= 0 ? g.alb_coord : NULL, g.alb_stage);
+        if (surface) ps_surface(o, g.alb_stage >= 0 ? g.alb_coord : NULL, g.alb_stage, v->lightmap && v->rebake);
         if (v && v->rain && (g.info.color_outputs & 1)) ps_rain_light(o);
         ps_alpha_and_fog(o);
         if (v && v->strand) ps_strand(o);
@@ -1672,9 +1758,13 @@ char *d3d_shader_msl(const uint32_t *code, const struct d3d_shader_variant *v, c
                  v->albedo == 2 ? "p.tag" : v->albedo == 3 ? "0.8" : "1.0");
         else if (albedo)
             line(o, "out.c2 = float4(0.5, 0.5, 0.5, %s);", v->albedo == 2 ? "p.tag" : v->albedo == 3 ? "0.8" : "1.0");
-        // The material's take on the rain (p.wet) rides on the roughness, 3 apart
-        // (metal_render.m surf_class).
-        if (surface) line(o, "out.c3 = float4(_pbo.xyz, _pbo.w + 3.0 * p.wet);");
+        // The material's take on the rain (p.wet) rides on the roughness, 3 apart, which is
+        // in 16 steps with 16 of the cracks' depth below them (-1 and the cracks when
+        // unknown; metal_render.m surf_class).
+        if (surface) {
+            line(o, "float _pbrq = _pbo.w < 0.0 ? -1.0 : floor(saturate(_pbo.w) * 15.0 + 0.5) / 16.0;");
+            line(o, "out.c3 = float4(_pbo.xyz, _pbrq + floor(_pbdip * 15.0 + 0.5) / 256.0 + 3.0 * p.wet);");
+        }
         if (g.info.writes_depth) line(o, "out.depth = odepth;");
         line(o, "return out;");
         put(o, "}\n");

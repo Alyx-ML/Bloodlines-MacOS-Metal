@@ -71,10 +71,10 @@ static const char *label(int action)
 static double unit(void *cpu) { return (double)(int)call(cpu, client_ScreenTall, 0, 0, NULL) / 1080; }
 
 // The layout, in mockup pixels: the logo 560x280 at 160, 96; the divider 560 wide, 22
-// under it; the items 44 under that, 30-pixel Cinzel with 10 above and below, the text 44
+// under it; the items 44 under that, 33-pixel Cinzel with 10 above and below, the text 44
 // in from the column.
 enum { COL_X = 160, LOGO_Y = 96, LOGO_W = 560, LOGO_H = 280, RULE_Y = LOGO_Y + LOGO_H + 22 + 12,
-       ITEMS_Y = RULE_Y + 12 + 44, TEXT_X = 44, EM = 30, PAD = 10 };
+       ITEMS_Y = RULE_Y + 12 + 44, TEXT_X = 44, EM = 33, PAD = 10 };
 
 static int row_for(double u) { return gothic_tall(EM * u) + (int)lround(2 * PAD * u); }
 static int track_for(double u) { return (int)lround(EM * u * 0.24); }

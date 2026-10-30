@@ -44,9 +44,9 @@ void bl_vgui_GetCursorLine_c(_cpu *cpu)
 
 // The options dialog gets an "Enhanced" tab after "Visual", holding the renderer's
 // effects as check boxes in three headed columns: "Lighting" (Global Illumination, Bounced
-// Light, Ambient Occlusion, Volumetric Light), "Camera" (HDR, Bloom, Eye Adaptation,
+// Light, Ambient Occlusion, Volumetric Light, Night Mist), "Camera" (Bloom, Eye Adaptation,
 // Sharpening, Lens Glare, Depth of Field, Motion Blur) and "Surfaces & Characters" (Reflections, Skin Scattering, Smooth
-// Characters, Skin Detail, Rain Effects). The renderer's shadows are not a box: they are "Enhanced", a fifth choice
+// Characters, Skin Detail, Rain Effects, Full-Size Textures). The renderer's shadows are not a box: they are "Enhanced", a fifth choice
 // in the Visual tab's Shadows drop-down, after "Soft".
 // Like the Visual tab's settings they take effect as soon as they are clicked:
 // bl_vgui_poll, once a frame, passes a change to the renderer, which saves it
@@ -99,13 +99,16 @@ static const char *const box_names[] = { "AmbientOcclusion", "Reflections", "HDR
                                          "SkinScattering", "Shadows", "Bloom", "EyeAdaptation",
                                          "BouncedLight", "GlobalIllumination", "SmoothCharacters",
                                          "SharpenAfterAA", "SkinDetail", "QuestCompass", "RainEffects",
-                                         "LensGlare", "DepthOfField", "MotionBlur" };
+                                         "LensGlare", "DepthOfField", "MotionBlur", "NightMist",
+                                         "FrameGeneration", "MetalHUD", "RebakedLighting", "FullSizeTextures" };
 static const char *const box_texts[] = { "Ambient Occlusion", "Reflections", "HDR", "Volumetric Light",
                                          "Skin Scattering", "Shadows", "Bloom", "Eye Adaptation",
                                          "Bounced Light", "Global Illumination", "Smooth Characters",
                                          "Sharpening", "Skin Detail", "Quest compass", "Rain Effects",
-                                         "Lens Glare", "Depth of Field", "Motion Blur" };
-#define NBOXES 18
+                                         "Lens Glare", "Depth of Field", "Motion Blur", "Night Mist",
+                                         "Frame Generation", "Metal HUD", "Rebaked Lighting",
+                                         "Full-Size Textures" };
+#define NBOXES 23
 static uint32_t box_page, enhanced_page, boxes[NBOXES];
 // The Gameplay tab gets one more: the quest compass (bl_compass.c), the renderer's setting
 // after the Enhanced tab's (BL_EFFECT_COMPASS), under the tab's "Damage floaters" box.
@@ -140,16 +143,23 @@ static uint32_t vcall(void *cpu, uint32_t self, uint32_t slot, int nargs, const 
 // Places in optionssubvisual.res units (scaled to the screen like the Visual tab, where
 // "Combat effects" is at 336,160 and 28 tall; the page runs from about -120 to 935
 // across and -15 to 300 down): three columns 300 apart around the page's middle, each a
-// heading and its boxes 40 apart (four in the first, seven in the second, five in the third). x, y.
+// heading and its boxes 40 apart (six in each). x, y.
+// Frame Generation, HDR and the Metal HUD are on the Video tab instead, under the
+// upscaling drop-downs (VIDEO_BOX).
 #define COLUMN_W 290
 static const int heading_x[3] = { -24, 276, 576 };
 #define HEADING_Y 45
 static const char *const heading_texts[3] = { "Lighting", "Camera", "Surfaces & Characters" };
-static const int box_place[NBOXES][2] = { { -24, 165 }, { 576, 85 },  { 276, 85 },  { -24, 205 },
-                                           { 576, 125 }, { 0, 0 },     { 276, 125 }, { 276, 165 },
-                                           { -24, 125 }, { -24, 85 },  { 576, 165 }, { 276, 205 },
-                                           { 576, 205 }, { 0, 0 },     { 576, 245 }, { 276, 245 },
-                                           { 276, 285 }, { 276, 325 } };
+static const int box_place[NBOXES][2] = { { -24, 165 }, { 576, 85 },  { 0, 0 },     { -24, 205 },
+                                           { 576, 125 }, { 0, 0 },     { 276, 85 },  { 276, 125 },
+                                           { -24, 125 }, { -24, 85 },  { 576, 165 }, { 276, 165 },
+                                           { 576, 205 }, { 0, 0 },     { 576, 245 }, { 276, 205 },
+                                           { 276, 245 }, { 276, 285 }, { -24, 245 }, { 0, 0 },
+                                           { 0, 0 },     { -24, 285 }, { 576, 285 } };
+#define FRAMEGEN_EFFECT 19
+#define HDR_EFFECT 2
+#define METAL_HUD_EFFECT 20
+#define VIDEO_BOX(i) ((i) == FRAMEGEN_EFFECT || (i) == HDR_EFFECT || (i) == METAL_HUD_EFFECT)
 
 // The Shadows drop-down (the Visual page's +0x80) is a CCvarLabeledComboBox: +0x58 its
 // ComboBox, +0x6c its item count, +0x7c the cvar's value at the last reset; AddItem(text,
@@ -175,10 +185,10 @@ static void add_enhanced_shadows(void *cpu, uint32_t combo)
     if (field(combo, 0x7c) == 3 && bl_effect_enabled(SHADOWS_EFFECT)) vcall(cpu, combo, 0x1bc, 1, &n);
 }
 
-// Drop-downs of the renderer's settings: on the Visual tab the upscaling ones
-// (bl_upscaler_get/set in metal_render.m), the scaler and the world view's resolution,
-// under the Shadows drop-down; on the Video tab Display Mode (bl_display_mode_get/set),
-// under Resolution. Each is a CLabeledCommandComboBox (0x78 bytes, built with (parent,
+// Drop-downs of the renderer's settings, on the Video tab under Resolution: Display Mode
+// (bl_display_mode_get/set) and the upscaling ones (bl_upscaler_get/set in metal_render.m),
+// the scaler and the world view's resolution; under them the Frame Generation, HDR and
+// Metal HUD boxes (make_boxes, VIDEO_BOX). Each is a CLabeledCommandComboBox (0x78 bytes, built with (parent,
 // name, label text) at 0x1000fe40, aliased GameUI_LabeledCombo_ctor), laid out like the
 // game's; its items' commands are empty, and the choice is read from the box's text
 // (bl_vgui_poll).
@@ -190,7 +200,7 @@ static const char *const combo_items[NCOMBOS][5] = {
     { "Ultra Performance (33%)", "Performance (50%)", "Balanced (59%)", "Quality (67%)", "Native" },
     { "Windowed", "Borderless", "Fullscreen" } };
 static const int combo_count[NCOMBOS] = { 3, 5, 3 };
-static uint32_t upscale_page, combos[NCOMBOS];
+static uint32_t video_page, combos[NCOMBOS];
 
 // The items' order to the renderer's: None first (the renderer's 2: MetalFX at full size,
 // for its anti-aliasing alone), then MetalFX (0) and FSR 4 (1); the qualities run low to
@@ -245,13 +255,6 @@ static void make_combo(void *cpu, uint32_t page, int i, uint32_t like, uint32_t 
     combos[i] = combo;
 }
 
-static void make_upscale_combos(void *cpu, uint32_t page)
-{
-    upscale_page = page;
-    make_combo(cpu, page, UPSCALER_COMBO, field(page, 0x80), 1);
-    make_combo(cpu, page, QUALITY_COMBO, field(page, 0x80), 2);
-}
-
 // `page`: the Visual tab, whose "Combat effects" box gives the scale and the font.
 static void make_boxes(void *cpu, uint32_t page)
 {
@@ -283,15 +286,22 @@ static void make_boxes(void *cpu, uint32_t page)
         call_this(cpu, GameUI_Panel_SetSize, label, 2, wh);
         vcall(cpu, label, 0x1d8, 1, &font);
     }
+    // The Video tab's boxes go in Resolution's column, after the drop-downs under it.
+    uint32_t res = video_page ? field(video_page, 0x1a0) : 0, res_pos[2] = { 0, 0 };
+    if (res) {
+        call_this(cpu, GameUI_Panel_GetPos, res, 2, p);
+        res_pos[0] = field(out, 0), res_pos[1] = field(out, 4);
+    }
     for (int i = 0; i < NBOXES; i++) {
-        if (i == SHADOWS_EFFECT || i == COMPASS_EFFECT) continue;
+        if (i == SHADOWS_EFFECT || i == COMPASS_EFFECT || (VIDEO_BOX(i) && !res)) continue;
         uint32_t size = 0xfc;
         uint32_t box = bl_call_guest(cpu, bl_h2g(GameUI_operator_new), BL_CDECL, 0, 1, &size);
         if (!box) return;
-        uint32_t a[3] = { enhanced_page, names[i], texts[i] };
+        uint32_t a[3] = { VIDEO_BOX(i) ? video_page : enhanced_page, names[i], texts[i] };
         call_this(cpu, GameUI_CheckButton_ctor, box, 3, a);
         uint32_t at[2] = { pos[0] + (uint32_t)(int32_t)floor((box_place[i][0] - 336) * k + 0.5),
                            pos[1] + (uint32_t)(int32_t)floor((box_place[i][1] - 160) * k + 0.5) };
+        if (VIDEO_BOX(i)) at[0] = res_pos[0], at[1] = res_pos[1] + (i == FRAMEGEN_EFFECT ? 4 : i == HDR_EFFECT ? 5 : 6);
         uint32_t wh[2] = { (uint32_t)(COLUMN_W * k + 0.5), sz[1] };
         call_this(cpu, GameUI_Panel_SetPos, box, 2, at);
         call_this(cpu, GameUI_Panel_SetSize, box, 2, wh);
@@ -355,7 +365,6 @@ void bl_vgui_VisualReset_c(_cpu *cpu)
     call_this(cpu, GameUI_CommandCombo_Reset, field(page, 0x80), 0, NULL);
     call_this(cpu, GameUI_CvarToggle_Reset, field(page, 0x84), 0, NULL);
     if (field(page, 0x80) != shadow_combo) add_enhanced_shadows(cpu, field(page, 0x80));
-    if (upscale_page != page) make_upscale_combos(cpu, page);
     if (enhanced_page && (box_page != page || !boxes[0])) make_boxes(cpu, page);
 }
 
@@ -368,9 +377,13 @@ void bl_vgui_AddPage_c(_cpu *cpu)
     vcall(cpu, field(dialog, 0xe4), 0x1ac, 3, a);
     if (title && !strcmp((const char *)bl_g2h(title), "#GameUI_Gameplay"))
         gameplay_page = page, compass_box = intro_box = body_box = fov_slider = 0;
-    // The Video tab: Display Mode under Resolution (+0x1a0).
-    if (title && !strcmp((const char *)bl_g2h(title), "#GameUI_Video") && field(page, 0x1a0))
+    // The Video tab: Display Mode and the upscaling drop-downs under Resolution (+0x1a0).
+    if (title && !strcmp((const char *)bl_g2h(title), "#GameUI_Video") && field(page, 0x1a0)) {
+        video_page = page;
         make_combo(cpu, page, DISPLAY_COMBO, field(page, 0x1a0), 1);
+        make_combo(cpu, page, UPSCALER_COMBO, field(page, 0x1a0), 2);
+        make_combo(cpu, page, QUALITY_COMBO, field(page, 0x1a0), 3);
+    }
     // The options dialog's Visual tab (by name: the module is not loaded at its own base).
     if (!title || strcmp((const char *)bl_g2h(title), "#GameUI_Visual")) return;
     static uint32_t name;
@@ -422,8 +435,8 @@ void bl_vgui_VisualDestroy_c(_cpu *cpu)
         box_page = 0, enhanced_page = 0, memset(boxes, 0, sizeof boxes), gameplay_page = 0,
         compass_box = intro_box = body_box = fov_slider = 0;
     if (shadow_combo == field(page, 0x80)) shadow_combo = 0;
-    // The dialog deletes its pages together: the Video tab's drop-down goes with these.
-    if (upscale_page == page) upscale_page = 0, memset(combos, 0, sizeof combos);
+    // The dialog deletes its pages together: the Video tab's drop-downs go with these.
+    memset(combos, 0, sizeof combos), video_page = 0;
     call_this(cpu, GameUI_PropertyPage_dtor, page, 0, NULL);
 }
 

@@ -1,0 +1,53 @@
+;; The zlib1.dll exports the game calls, natively (runtime/bl_zlib.c), under the names the
+;; recompiled modules import them by. All cdecl.
+include llasm.llinc
+include asm-calls.llinc
+
+funcv bl_zlib_inflateInit_c $
+funcv bl_zlib_inflate_c $
+funcv bl_zlib_inflateEnd_c $
+funcv bl_zlib_deflateInit_c $
+funcv bl_zlib_deflate_c $
+funcv bl_zlib_deflateEnd_c $
+funcv bl_zlib_compress2_c $
+funcv bl_zlib_uncompress_c $
+
+proc zlib1_inflateInit__ public
+        call bl_zlib_inflateInit_c $
+        Call_Asm_Return 0
+endp
+
+proc zlib1_inflate public
+        call bl_zlib_inflate_c $
+        Call_Asm_Return 0
+endp
+
+proc zlib1_inflateEnd public
+        call bl_zlib_inflateEnd_c $
+        Call_Asm_Return 0
+endp
+
+proc zlib1_deflateInit__ public
+        call bl_zlib_deflateInit_c $
+        Call_Asm_Return 0
+endp
+
+proc zlib1_deflate public
+        call bl_zlib_deflate_c $
+        Call_Asm_Return 0
+endp
+
+proc zlib1_deflateEnd public
+        call bl_zlib_deflateEnd_c $
+        Call_Asm_Return 0
+endp
+
+proc zlib1_compress2 public
+        call bl_zlib_compress2_c $
+        Call_Asm_Return 0
+endp
+
+proc zlib1_uncompress public
+        call bl_zlib_uncompress_c $
+        Call_Asm_Return 0
+endp

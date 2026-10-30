@@ -4434,3 +4434,1203 @@ Both are in `runtime/d3d9/metal_render.m`.
 - An earlier black frame in a headless run was the frame dump itself: each saved frame
   made a new 64 MB copy of the shadow atlas, and the GPU ran out of time
   (`MTL4CommandQueueErrorDomain error 1`). Not a game fault.
+
+## 2026-10-28 — A damp sheen on dry streets; wet ground smoother
+
+**Why.** Outside the streets looked flat. On dry ground the reflections had nothing to
+show: asphalt, concrete and pavements have no gloss of their own. The rain section's wet
+look was there on the maps that rain, but its rough ground blurred the lamps away.
+- **Damp on every map.** `wet_on` is now the Rain Effects box alone. On a map that rains
+  the hard ground under the open sky is wet as before. Elsewhere it is damp:
+  `WET_DAMP` (0.35) of the wet, with no puddles. What the height map finds under a roof
+  stays dry, so rooms are unchanged.
+- **Smoother.** Wet and damp hard ground reflects at 0.3 of its roughness (0.5 before);
+  walls and other wet surfaces keep 0.5. Its reflectance head on rises from 0.03 to 0.05,
+  and at a grazing angle from 0.48 to 0.55, so lamps, neon and lit windows streak along
+  the street.
+- The Rain Effects hint now says the streets keep a faint damp sheen on dry nights.
+- Verified: both shaders compile offline, the build links. Not yet seen on screen (the
+  user checks it in a window).
+- Seen in passing: `+map sm_hub_2` straight from the command line crashed in
+  `bl_hud_Ammo` (`gothic_field`), the HUD's ammo field. Not looked into.
+
+## 2026-10-28: Gothic HUD crash on a straight-to-map start
+
+`+map sm_hub_2` from the command line crashed at about frame 230 with a segmentation
+fault in `gothic_field`, called from `bl_hud_Ammo`. The fault address was guest
+0x103EEF48, the ammo fade's address in the original client DLL.
+- **Cause.** `bl_hud.c` read three client globals (the player 0x104A0D50, the HUD's
+  sprites 0x104CFE38 and the ammo fade 0x103EEF48) at their original DLL addresses. In
+  the port those addresses are not the globals: they fall in the guest heap's window, so
+  the reads saw whatever was there, or faulted where nothing was mapped yet. That is also
+  why the player pointer "held garbage around level loads".
+- **Fix.** `modules/client/instruction_replacements.manual.sci` adds three small procedures
+  (`client_HudPlayer`, `client_HudSprites`, `client_HudAmmoFade`) that return the globals'
+  real addresses, as `GameUI_OptionsVtable` does for the options screen. `bl_hud.c` asks
+  for them once and reads through them. `bl_hud_Ammo` now also keeps eax, ecx and edx
+  around its guest calls.
+- Rebuilt: client (SRW, 108 s), runtime and boot.
+- Verified: one headless run, `BL_AUDIO=0 BL_MAX_FRAMES=382 ./boot "<game dir>" "-game
+  Unofficial_Patch -window +map sm_hub_2"`, reaches 382 frames with no crash. The HUD's
+  look is not yet checked on screen.
+
+## 2026-10-28: Lamp glints on wet ground; puddles in the road's cracks; two bugs that kept the streets dry
+
+The user saw no change on `sm_hub_1`'s streets after the rain work. A wet-mask debug view
+(since removed) found two bugs behind it, both older than today's changes.
+- **Streets classed as trees.** `material_wet`'s soft words include "tree", and every
+  "street" texture has "tree" in it (`materials/ground/streetb`, `streetc`, `streetdsan`).
+  So the roads were soft and stayed dry, along with any draw using them. Only the
+  pavements (`concrete/`) got wet. A "tree" right after an "s" no longer counts.
+- **The effects' camera was the 3D sky's.** `note_projection` takes the first world-view
+  draw after a depth clear. On the hub that is the map's 3D sky (its small copy of the
+  city near z 5000), drawn first with its own camera and no clear after it. So
+  `view_rows`, and with them the map's lights (`view_lights`), sat round the sky's camera
+  at (-1331, 66, 4978) instead of the player's at (-1446, 696, -16). The TAA's camera
+  list showed both. Every effect that uses the map's lights or world positions was off
+  on such maps: the haze's lights, the characters' lights and shine, the bumps' shine
+  and the rain's cover. Now `taa_frame_end` remembers where most of the frame's draws had
+  the camera (matrices within 64 units counted together). A draw whose camera is more
+  than 512 units from that one no longer sets the projection, which also rules out a
+  prop drawn first in its own space. A camera cut loses the effects' camera for one frame.
+- **Glints.** `wet_main` now also takes the frame's map lights and adds each lamp's bulb as
+  seen in the wet ground: GGX on the wet facing, roughness eased from dry to wet by how wet
+  the pixel is (never below 0.1), and water's Fresnel (0.02 head on). A street lamp is a
+  spot pointing down, and its light ends under 400 units away, so neither the cone nor
+  that radius limits the glint, only the fall-off with distance. That way a lamp up the
+  street, or out of the picture, still streaks on the road in front.
+  - The map compiler's intensities match the game's light to within a factor of about 2,
+    measured on the hub street (the lit colour over the texture's, against the lights'
+    sum), so the glint is used at its own strength.
+  - It goes in a new half-resolution texture (`wet_glints`). `post_apply` adds whichever
+    is brighter, the reflection or the glint, so a lamp in the reflection is not counted
+    twice.
+- **Puddles in the cracks.** The street textures have normal maps but no height maps.
+  Instead, on hard ground, `ps_surface` compares each texel's brightness with the
+  texture's local mean (a 16x16 mip level). Texels well darker than it (cracks, seams and
+  potholes) give a crack depth from 0 to 1, which rides in the facing's fourth channel:
+  roughness in 16 steps, the crack depth in 16 steps below it, the material's rain class
+  3 apart as before (`surf_class`, `surf_rough`, `surf_dip`). `wet_main` fills the deeper
+  cracks with water on flat open ground where a second noise lets them. These are added
+  to the existing large noise puddles. The first version flooded nearly the whole road on
+  `sm_hub_2`, so it now needs a texel 30 to 53% darker than its surroundings.
+- **Patchy wetness.** The ground's wetness now varies between 0.6 and 1 over a slow noise.
+- Verified headless, loading the user's autosave on `sm_hub_1` outside the diner. With the
+  camera fixed, the light list is the street lamps (spots of about 1e5 pointing down) and
+  not the sky's 16 to 32 unit lights. The road is wet, and frame 600 shows a glossy
+  pavement, a lamp's streak at the pole's foot and the road reflecting. `ssr_source` and
+  `wet_source` compile offline with no warnings. Not yet seen by the user in a window.
+
+## 2026-10-28: Chord material maps for the Santa Monica streets (sm_hub_1)
+
+Step 1 of the surface overhaul. Two material estimators were tried on the road texture
+(`ground/streete`):
+- Marigold's appearance model (prs-eth/marigold-iid-appearance-v1-1) read the dark asphalt
+  as a white surface in shadow and called it half metal. It was trained on photos of
+  rooms, not flat textures, so it was dropped.
+- Ubisoft La Forge's Chord kept the texture's colours, gave no metal and found the cracks.
+  On brick, painted metal and wood it found mortar, door panels and planks.
+
+**What was made.** sm_hub_1's textures were exported (`tex_extract.py --map sm_hub_1`, 507).
+`tools/tex_chord.py` (new) made Chord maps for its wall, floor, ground, wood, metal, tile
+and asphalt textures: 259 of them, about 10 s each on the GPU, in batches under 10
+minutes. Each texture's `_n.png` and `_r.png` are replaced where the renderer already
+found one (so the height maps beside them stay paired), or written beside the user's
+`-replace` picture, or in sm_hub_1. Copies of the same name in other map folders are
+removed.
+- **Pictures read.** The user's `-replace` pictures are read where they exist: the roads,
+  pavements and diner.
+- **Bumps.** Chord's bumps follow PBRify's convention (green down). They get the depth the
+  right way round; PBRify had brick mortar standing out. They are about a third as
+  steep, so the tool makes them 2.5 times steeper.
+- **Metalness.** Each texture's average metalness goes in
+  `build/textures/maps/chord_metal.txt`. `material_metal` (metal_render.m) uses it for the
+  metal folder in place of the blanket 0.8. Painted metal now reads as paint: the 28 metal
+  textures average 0.03, and the black rails and cast iron are about 0.37. Outside the
+  metal folder Chord's metal is ignored, as it finds a little in plaster.
+- **Not used:** Chord's base colour (shading taken out). The game's own texture is still
+  drawn.
+
+**Setup.** Chord's code and model are the player's own downloads under `build/matai`
+(research-only licence; never committed). The code needs "cuda" changed to "mps". The
+model is gated on Hugging Face; it was taken from a public copy of the same file
+(camenduru/ubisoft-laforge-chord) after the user's account was granted access.
+- Verified: the runtime builds, links, and runtime_unit passes 85 of 85.
+- Not verified in game. The user checks the Santa Monica streets in a window run.
+
+## 2026-10-28: Streets wet only after rain has fallen
+
+**Why.** The user saw the hub streets shining like glass on a dry night. Two things did it:
+the damp sheen on maps without rain, and Santa Monica's hub counting as a rain map
+(its entities hold a rain emitter, but rain falls there only part of the time).
+- **No damp sheen.** `WET_DAMP` is gone; `wet_on` is the Rain Effects box and a map that
+  rains. The options hint no longer mentions a sheen on dry nights.
+- **Wet once rain has fallen.** `wet_soak` (0..1) rises with a time constant of 6 s while
+  the rain's particle sheet is drawn and falls with one of 120 s after. A map opened
+  with rain falling in its first three seconds starts wet. Below 0.01, `wet_run` does
+  nothing. Puddles fade in from half soaked to fully soaked (they needed full wet before).
+- **Lamp haze on the bulb.** The user saw the haze start beside some lamps' globes. The
+  map's lights sit off the bulb: the pier-style lamps' (`pierlightb.mdl`) 10 units out
+  along the arm, others' 21. Each bulb has a glow sprite (`env_sprite`, `glowa.vmt`)
+  at its centre. `bl_bsp.c` (`snap_to_glows`) now moves a light onto its nearest glow
+  sprite when that sprite is within 24 units. That covers 170 of sm_hub_1's 667 lights.
+  The baked lightmaps are untouched; the haze, glints and character lights follow.
+- Verified headless on the autosave (sm_hub_1, frame 600): the street is dry and matte
+  again, as before the wet work. The log reports 170 lights moved. The rain case and the
+  haze at a lamp were not checked on screen (the user checks in a window).
+
+**Roads kept rough.** The user does not want smooth roads. Chord had made `ohstreeta`
+nearly glassy (roughness 0.10), and others smoother along worn tracks. `tex_chord.py` now
+squeezes the ground's roughness into 0.75 to 1 (`--ground-rough`): roads, pavements,
+kerbs, the ground and asphalt folders. The worn tracks still show a little, and the rain
+effects still wet the ground when it rains. The 18 such sm_hub_1 maps were remade, and
+the other 24 textures in `roads` were given Chord maps the same way (283 in all). Not
+verified in game.
+
+## 2026-10-28: Depth for the roads (height maps and parallax looking down the street)
+
+The user wants roads with real depth, not a flat surface. The renderer's parallax
+(`ps_pom`) already gives surfaces with a height map depth: cracks and potholes sink, and
+raised parts hide what is behind them. The roads had no height maps, and the parallax
+faded out when the view was below about 14 degrees off the surface. That is how a road
+is seen down a street.
+- **Height maps.** `tex_chord.py` now makes `<name>_h.png` for the ground (roads,
+  pavements, kerbs, the ground and asphalt folders) from its Chord bumps:
+  - `height_from_normals` integrates the slopes over the texture as a tile
+    (Frankot-Chellappa, FFT).
+  - Swells wider than about a sixth of the texture are taken out, so cracks, potholes
+    and grit make the relief, not tile-wide hills.
+  - The sign was checked on brick: the white mortar comes out low.
+  - `--heights` makes them alone, without the model. All 42 ground textures with Chord
+    maps have one. sidewalka's older PBRify height map was replaced.
+- **Parallax along the ground.**
+  - `d3d_ps_params` gains `graze` (with padding to keep the MSL struct's 16-byte size), 1
+    for the ground's draws with a height map (`material_wet` 2).
+  - In `ps_pom` the ground's parallax fades out only below about 4 degrees, not 14. Its
+    offset may run longer before being capped (0.1 of the view's angle, not 0.25), and it
+    takes up to 48 steps edge on, not 24.
+  - It is 1.5 times deeper than walls' (`BL_POM_GROUND`).
+- Verified: runtime builds and links, runtime_unit 85 of 85, and shader_test compiles
+  7184 shader variants with none failed (it does not cover the surface variant).
+- Not verified in game.
+
+**Road depth fixed after the first look.** The user's screenshot showed the road as
+spiky, stretched ridges with stepped layers, several times deeper than a pothole. There
+were three causes:
+- **Too deep.** Depth was a share of the texture's size, and road textures cover so much
+  ground that 1.5 times the walls' share was about knee-deep. The ground's depth is now
+  capped in world units (`pom_max`, `BL_POM_GROUND`, default 2 inches). `BL_POM_GROUND`
+  is no longer a multiplier.
+- **Too far edge on.** Parallax smears at shallow angles. The ground now fades out below
+  about 7 degrees (it was 4; walls stay at 14). Its offset is capped at 0.2 of the
+  view's angle (walls 0.25), and it takes up to 32 steps.
+- **Spiky grit.** The height maps are now blurred by 2 pixels (`height_from_normals`),
+  so fine grit no longer stands up in spikes. All 42 were remade.
+
+Builds, links, runtime_unit 85 of 85. Not verified in game.
+
+## 2026-10-28: Posters no longer flicker
+
+The user saw the posters on the Asylum's outside wall flicker in and out. Posters and
+other decals are see-through lightmapped draws, so since the shore fix they also got the
+second pass that writes their depth (`overlay_depth`, dithered). Where two posters overlap,
+the later one's depth test hit the earlier one's depth. Since the dither pattern changes
+every frame, it passed on some frames and failed on others. Decals are drawn with a depth
+bias (D3DRS_DEPTHBIAS / SLOPESCALEDEPTHBIAS) and the shore's sand is not, so a draw with a
+depth bias now skips that pass (`metal_render.m`). The wall under them has written its
+depth already. Verified: the runtime builds, boot links, and runtime_unit passes 85/85.
+Not verified: in the game (handed to the user).
+
+## 2026-10-28: Night mist outdoors
+
+**Why.** The user asked for a heavier night atmosphere outdoors: fog that hides the
+distance and glows round the lamps.
+- **Night Mist** is a new box in the Enhanced tab's Lighting column (`BL_MIST`, registry
+  `NightMist`, default on), with a hint in the options screen.
+- It works inside the haze's trace (`fog_at`), so it runs with or without Volumetric Light.
+  At each of the 16 steps, `mist_at` gives the density:
+  - It is `BL_MIST_DENSITY` (0.002 a unit) at the ground (the camera's height less 64),
+    thinning over `BL_MIST_HEIGHT` (300) units upwards.
+  - Two octaves of 3D value noise about 650 units across break it into banks and gaps,
+    drifting on a slow wind.
+  - It is none under a roof: the rain's height map (`wet_height`) decides. With no height
+    map there is no mist, so rooms stay clear.
+- The mist hides what lies behind it in a dim amber-grey (0.17, 0.13, 0.085), the
+  warm glow of a city's sodium lamps in smog. The first try was a cool blue-grey
+  (0.12, 0.13, 0.15); the user found it too cool. The lamps
+  and windows light it `MIST_LAMPS` (0.5) times its density over the haze's own, and their
+  haze dims with the mist between them and the camera.
+- Verified headless on the autosave (sm_hub_1):
+  - The far end of the street fades into grey mist.
+  - The lamp at the corner throws a clear cone of light.
+  - The street near the camera stays clear.
+  - The shader compiles offline and the build links.
+  - The drift (in motion) and the frame-time cost were not checked. The user checks in a
+    window.
+- **Toned down after the user's first look.** Near the lamps the mist washed everything
+  out to a bright cream, and the people glowed white. Changes:
+  - The lamps' extra light in the mist is now capped at four times the haze's own
+    density, at `MIST_LAMPS` 0.35 (it was 0.5 with no cap, up to about 9 times).
+  - The mist's colour is darker: (0.085, 0.065, 0.045).
+  - Its density is now 0.0015 a unit.
+  - Checked headless on the autosave: the far street fades to dark amber, the corner
+    lamp's cone is soft, and nothing is washed out.
+- **The mist no longer touches the lamps.** The user had not asked for the lamps' haze to
+  change. The extra lamp light in the mist (`MIST_LAMPS`) and the mist's dimming of the
+  haze are both gone. The lamps' and windows' haze is exactly what it was before the
+  mist. The mist only covers the view with its own colour (one pass over the 16 steps
+  for how much gets through). The shader compiles offline and the build links.
+- **Subtler.** The user wants a subtle night fog. Its density is down to 0.0008 a unit,
+  so about half the view gets through 1000 units on the ground.
+- **Fizzle round the lamps; too faint.** At 0.0008 the user saw nothing, and there was
+  speckle round the lamp heads. Cause: the height map holds the lamps' heads and arms, so
+  the air just under them counted as under a roof and had no mist. The jittered steps
+  then flickered between mist and none.
+  - `mist_at` now counts a point as covered only where at least four of five height-map
+    reads 24 units apart are above it: roofs and awnings, not a lamp head or a wire.
+  - Density is now 0.0012 and the colour a little lighter (0.12, 0.095, 0.065).
+  - Checked headless (crop of the corner lamp): the cone is clean and the street behind
+    it fades softly.
+- Flicker on far lamps' haze: a light without shadow views was lit only on the ray's 16
+  steps, about 125 units apart over a long street, so a far lamp's stretch of air was hit
+  by one step on some frames and by none on others. Every light now takes steps of its
+  own over its stretch: 24 with shadow views, as before, and 12 without.
+- The mist still did not show, because its colour was about as bright as the dark
+  street behind it. It is now lighter (0.18, 0.145, 0.1) and denser (0.0018 a unit). It
+  starts 150 units out, at full strength from 600, so what is near stays clear and the
+  distance fades. The options hint no longer says it glows round the lamps.
+- Checked headless (frames 600 and 660 on the autosave): the street's far end fades into
+  a warm haze, and the near street is clear. The flicker can only be judged in motion and
+  was not checked.
+- A little flicker remained. Windows' beams were still lit only on the ray's 16 steps,
+  so a far window's short beam flickered the same way the lamps had. Each window now
+  takes 12 steps over the stretch of the ray in front of it, out to where its beam has
+  faded to a fiftieth. Lights without shadow views now take 16 steps instead of 12.
+  Checked headless (frame 600): overall brightness is within 1% of the frame before the
+  change, and the look is unchanged. Motion was not checked.
+
+## 2026-10-28: Santa Monica streets measured (load, hitches, PBR maps)
+
+Headless runs one at a time (M4 Pro, 1920x1080, `BL_HITCH=34 BL_HITCH_STACKS=60
+BL_GPU_STATS=1`), walking with `BL_KEYS` (W held 1700 frames, 400-pixel turns, a 360-degree
+spin). `+map sm_hub_1` starts in the scripted alley dialogue, so the walk was measured on
+`sm_hub_2` (the same streets).
+- **Steady play:** at the game's cap (15.9 ms a frame, about 63 fps) the whole walk. GPU
+  7.0 to 9.7 ms a frame. Three slow frames in 1700: 45, 51 and 106 ms, each on the frame
+  of a sudden 400-pixel turn (new props and textures seen for the first time).
+- **The 106 ms turn** (frame 1301, 304 draws): the game's own code and x87 helpers, prop
+  remodels, `bl_hires_texture` hashing the texture again with SHA-1 on the game thread
+  (the prefetch already hashed it on another thread) and appending to
+  `logs/not_upscaled.txt` (fopen and fclose per texture), the character normal map search,
+  a texture upload compressed by the driver, and a residency set commit.
+- **PBR maps:** 0.0 to 0.3 ms a frame on the game thread (loaded ahead). They are PNGs
+  decoded, high-pass filtered and mipmapped on the CPU at each load, into uncompressed
+  RGBA8 (normal and roughness) and R8 (height): 1269 maps, about 1.5 GB of GPU memory if
+  all were loaded, about 0.45 GB as BC7/BC4. `build/textures/maps` is 2.3 GB, but the game
+  reads only the `_n`, `_r` and `_h` maps (558 MB); the other 1.7 GB is colour sources
+  and `-replace.png` pictures for the tools.
+- **Load:** program start to the first world frame 7.7 s on sm_hub_2, 11.8 s on sm_hub_1.
+  The first world frames waited 4.0 s for shaders on sm_hub_1 (the first run after
+  today's renderer changes: macOS's shader cache was cold) and 0.45 s on sm_hub_2 a run
+  later. The loading screen's 1.05 s frame is the game's file searches (`bl_fs_FindMatch`).
+
+## 2026-10-28: PBRify maps baked for the GPU; no log file writes in draws
+
+**PBRify maps stored ready for the GPU.** The surfaces' maps were PNGs that each load
+decoded, high-pass filtered and mipmapped on the CPU into uncompressed RGBA8 (normal and
+roughness) or R8 (height).
+- `tools/tex_bake_maps.sh` (builds `tools/tex_bake_maps.m`) writes beside every
+  `<name>_n.png` a `<name>_n.tex` (BC7, roughness in alpha) and beside every
+  `<name>_h.png` a `<name>_h.tex` (R8), all mipmaps included. File: "BLPM", pixel format
+  (98 BC7, 61 R8), width, height, mipmap count, then the mipmaps. Only maps whose PNGs
+  are newer than their .tex are baked again (`--force` for all, `--only <png>` for one).
+  **Run it after making or changing maps.**
+- The work is the renderer's own code, moved out of `tex_detail.m` into
+  `runtime/d3d9/map_levels.{h,m}`, which the tool and the game share. The characters'
+  normal maps still use it at load. BC7 comes from `tools/bc7_encode.c` (as for the
+  upscaled textures).
+- The game now loads the PBRify maps only from the .tex files (`bl_load_normal_map`,
+  `bl_load_height_map`): a map without one is left out and named once in the log
+  (`[pbr] ...: not baked`). The renderer still finds the maps by their PNGs.
+- All 1270 maps (1186 normal, 84 height) bake in 13 s: 328 MB of BC7 and 237 MB of R8.
+  The normal maps take a quarter of the GPU memory they did. Loading one is a file read.
+- Quality, `roads/ground/NewTex/streetb_n` (2048x2048) against the uncompressed map:
+  mean difference 0.3 of 255 per channel (99th percentile 2), normals 0.26 degrees off
+  on average (99th percentile 1.0). Side by side they look the same.
+- Heights stay R8 (the parallax would show block steps); as files they are larger than
+  their PNGs (237 against 63 MB).
+
+**Not upscaled list.** `tex_hires.m` wrote `logs/not_upscaled.txt` (fopen, append, fclose)
+in the draw that first met each texture without an upscale. That now happens on a queue
+of its own.
+
+Measured as before (sm_hub_2, headless, the same walk): no `[pbr]` misses, no crash; GPU
+7.36 ms a frame against 7.45 (within run-to-run noise); the turn hitches are about the
+same (102 ms against 106 on the big turn). Those are the game's own code: re-hashing the
+textures on the game thread (`bl_hires_texture`) would need the renderer to pass on the
+prefetch's hash, which is in `metal_render.m`, so it is left. Not yet seen in a window.
+
+## 2026-10-28: First sight of a texture: the prefetch's work reused
+
+When a texture first came into view, the game thread hashed it again for its upscale
+(`bl_hires_texture`) and matched it again against the character normal maps
+(`bl_detail_normal`), although the prefetch had done both on another thread when the game
+filled it.
+- Textures count the game's changes to their top level (`fills`, `d3d9_objects.h`, in
+  `d3d_image_changed`). The prefetches keep their hash and match by the texture's serial
+  and that count (`tex_hires.m`, `tex_detail.m`); the first draw uses them only when the
+  count is still the same, so a level the game changed since is worked out again.
+- `BL_HITCH` lines now also give the time copying the game's textures to the GPU
+  (`uploads`): at most 1.1 ms on the walk's turns, 3.5 ms on the first world frame, so
+  they are left as they are.
+- Same walk as before (sm_hub_2, headless). Upscale lookups on the turns' frames 2.5 to
+  0.7 ms, character maps 3.5 to 0.1 ms (first world frame: 10.5 to 1.6 and 11.7 to 0.1).
+  The turns: 48 to 37, 102 to 97, 44 to 36.5 and 48.5 to 39 ms. The same 14 character maps
+  found. What is left on those frames is the game's own code.
+- Seen in passing: on the spin, frame 1606 spent 23 ms in present. Not looked into.
+- Not yet seen in a window.
+
+## 2026-10-28: The spin's 23 ms present is inside MetalFX (left as it is)
+
+Frame 1606 of the sm_hub_2 walk (the first quick turn with characters coming into view)
+spends 20 to 25 ms in present, once a session. `BL_HITCH_STACKS` puts it in `commit`:
+Metal runs the MetalFX scaler's machine learning work there (`MTL4MachineLearningCommandEncoder`,
+MPSGraph), which waits on a Neural Engine request that frame. Tried, each in one headless
+run, and all taken out again since none moved it:
+- The characters' motion pipelines (`motion_run`) built on another thread: no change.
+  With the motion pass switched off altogether the stall is still there, so it is not ours.
+- `requiresSynchronousInitialization` on the scaler's descriptor: no change.
+- Running the scaler two or three times when it is made, on cleared textures with the
+  picture moving (and its depth changing): the stall only moved to the next frame with
+  characters (1609).
+A walk without the spin has no such frame. FSR 4 (the Upscaler setting) does not go
+through MetalFX and would not have it; not measured.
+
+## 2026-10-29: Traced lighting, step 1 (AMD FidelityFX Brixelizer and Brixelizer GI)
+
+A new option, "Traced Lighting" (Enhanced tab, Lighting column, off by default;
+`BL_TRACED`), lights the map's lightmapped surfaces again each frame instead of using the
+baked lightmaps. AMD's Brixelizer and Brixelizer GI (FidelityFX SDK 1.1.4, MIT, in
+`third_party/ffx` with its LICENSE) do the tracing: software ray tracing through a sparse
+distance field, no ray-tracing hardware.
+- `tools/ffx_shaders.py`: the SDK's 50 GLSL compute passes go to Metal source through
+  glslang and spirv-cross, with argument buffers. The renderer's own pass,
+  `runtime/d3d9/bx_direct.glsl`, is built the same way so it can use AMD's traversal code.
+  The output is `build/runtime/ffx/ffx_shaders_gen.h`, compiled when the game starts.
+- `runtime/d3d9/ffx_metal.mm`: a Metal 4 backend for the SDK, which the SDK has none of.
+  Its command list is the renderer's compute pass (BLCompute). `ffxm_dispatch` runs own
+  passes, with bindings looked up by name.
+- `runtime/d3d9/bx_gi.mm`, run from `post_run` (`traced_run`) after the motion vectors:
+  - The object shadows' casters (map faces, displacements, props) are cut into 256-unit
+    cells. Each cell becomes a static instance in 7 cascades round the camera, from
+    8-unit voxels, each cascade twice the last.
+  - GI at half size bounces light from last frame's lit picture, plus the sky light
+    (light_environment's ambient, the new `bl_bsp_sky`) where rays leave the map.
+  - The lamps (`char_lights`, up to 64) are drawn at half size with one shadow ray each
+    through the field, towards a random point on a 6-unit ball round the lamp. They fall
+    off as `lm_bake.m` computes it.
+  - Compose step: on surfaces drawn with albedo alpha 0.8 (lightmapped), the colour is
+    albedo × (k × lamps^(1/2.2) + GI). k is set from GPU sums read back three frames
+    later, so those surfaces are as bright overall as the game's lightmaps. Characters
+    and props keep the game's own light.
+- While the option is on, the G-buffer's surface colour and facing are drawn (`albedo`,
+  `surface`, with `info`).
+- Build: clang++ for the SDK's host code and the .mm files (`build_runtime.sh`), and
+  `-lc++` in `link_boot.sh` and `build_tests.sh`.
+
+Verified: every pass and the new kernels compile on the M4 Pro, and the runtime and boot
+build and link. The first build lit nothing: it took the depth's alpha for a near limit, but
+beta is negative (depth 1.00002 - 8 / w), so every pixel counted as sky. Fixed. The log now
+gives counters every 300 frames.
+
+One headless run (sm_hub_1, `BL_TRACED=1`, 1500 frames):
+- 518400 half-size pixels, about 97000 lightmapped ones sampled.
+- About 461000 lamp shadow rays a frame, 6% of them blocked.
+- 17 lamps, most with a 256-unit radius. The brightness match settled at 1.03.
+- Brixelizer scratch is 423 MB.
+- The dumped frame (1400) is the alley dialogue, so it shows nothing of the street.
+
+Not yet seen in a window, and no timings.
+Not in step 1: reflections (the SDK's specular is computed but switched off with roughness
+1), the sun, lights with a style, and maps other than sm_hub_1 (it is not limited to that
+map, but nothing else was looked at).
+
+## 2026-10-29: Frame generation, and the effects back on maps with a 3D sky
+
+**Frame generation** ("Frame Generation" on the Video tab, on by default; `BL_FRAMEGEN`). The game stays capped at 60 (its doors, physics and scripts expect it);
+MetalFX's frame interpolator (`MTL4FXFrameInterpolator`) makes a picture between each two,
+so a 120 Hz screen shows 120 a second.
+- Inputs: the TAA's render-size depth and motion (`taa_z`, `taa_mv`), and the world view as
+  the temporal scaler (or FSR 4) left it, copied in `world_up` before the view model and
+  HUD (`fg_note`). The whole frame goes in as the UI texture with the world under it
+  (`uiTextureComposited`), so the HUD, compass and crosshair stay put on the in-between
+  picture rather than being moved with the world.
+- Shown in present: the in-between picture first, then the game's, each held half a frame
+  (`present_held`; `next_frame` now presents up to two drawables, each after the one before
+  has been up for its hold). It costs half a frame of delay (about 8 ms).
+- Only with a world view this frame and the last, no camera cut, and a screen whose
+  refresh is a whole multiple of twice the cap (120 or 240 Hz at the 60 cap); otherwise
+  the frame is shown alone as before. Headless, with `BL_DUMP_DIR`, it runs too and
+  `BL_DUMP_FRAME` also writes `frame_<n>_between.png`.
+- Cost on the sm_hub_2 walk (1920x1080, M4 Pro): 2.5 to 3 ms of GPU a frame.
+
+**The effects were off on sm_hub_2.** `taa_frame_end` took the frame's camera as the one
+most draws had. On this street the map's 3D sky (its small copy of the city, drawn first,
+no depth clear after it) had 44 to 69 draws against the street's 12 to 52, so the sky's
+camera won, `note_projection` then turned every world draw away, and `post_run` never
+ran: no TAA, ambient occlusion, reflections or any other effect, most of the walk (TAA on
+46 of 2700 frames, only while spinning). Now `taa_world_cam` picks, of the cameras with at
+least 8 draws or a quarter of them, the one drawn with last (the sky is drawn first);
+`taa_motion` uses the same camera for the motion vectors, which also took the sky's.
+TAA now runs on every frame of the walk after loading.
+- So the earlier Santa Monica measurements (7 to 9.7 ms of GPU a frame) were without the
+  effects. With them, the walk takes 16 to 17.5 ms of GPU a frame (19 ms with frame
+  generation): at the 60 cap's limit. Traced Lighting (on in this registry) is 6.7 ms of
+  it (`traced_run` 3.2 to 3.5, `post_traces` 3.2 to 3.4).
+- Not yet seen in a window.
+
+## 2026-10-29: Options menu text a little bigger
+
+At the user's request (it read a little small), `bl_options.c`: setting labels 15 to 17
+pixels (in the mockup's units), tabs 19 to 21, Cancel/OK 21 to 23, page buttons 19 to 21,
+values 26 to 29 in rows (30 to 33 in columns), the description's title 22 to 24 and its
+text 26 to 29, the page notes 24 to 27. The title stays 40. The main and pause menu's
+items too (`bl_menu.c`), 30 to 33. Not yet seen in a window.
+
+## 2026-10-29: Traced lighting keeps the game's decals and lit windows
+
+In the user's screenshots of the Asylum's street, Traced Lighting lost the lit windows'
+glow and the posters under the arches, and the facade looked flat: `bx_compose` replaced
+the colour with the surfaces' base texture times the traced light, and the base texture
+has none of what the game draws over or into the walls.
+
+- New shader variant `lmcap` (`d3d9_shader.h`): every `bl_lightmap` read is also summed
+  (`bl_lm_keep`) and the mean written to `[[color(4)]]`, alpha 1 (0 where none is read;
+  the fixed-function stages write 0). The renderer (`metal_render.m`) gives the world's
+  pass a fifth attachment, `lmcap_texture` (RGBA16F), whenever the surfaces' colour is
+  drawn and Traced Lighting is on, written by the draws that write the surfaces' colour.
+- `bx_compose` now scales the game's own colour by the traced lamps' light over that
+  lightmap light, per channel, at most 6 times (the lightmap taken as at least 1/64), plus
+  albedo times the bounce as before. The brightness match is unchanged in form.
+- `shader_test` covers the new variant (lightmap with albedo 3 and lmcap). It found the
+  generator's coordinate copies (`alb_coord`, `base_coord`, `pom_coords`) cut long bump
+  offset coordinates at 96 characters; now 256. 7184 variants compile, none failed.
+- Verified: builds and links; shader_test. Not yet seen in a window.
+
+## 2026-10-29: Video tab holds the display settings
+
+At the user's request (Enhanced was getting full), `bl_vgui.c`: the Video tab now has,
+under Resolution, Display Mode, Upscaler, Upscaling Quality, then the Frame Generation and
+HDR boxes. The upscaling drop-downs left the Visual tab and HDR the Enhanced tab's Camera
+column (its other boxes moved up a row). The two boxes are still made with the Enhanced
+ones (`make_boxes`, `VIDEO_BOX`), placed in Resolution's column after the drop-downs.
+Not yet seen in a window.
+
+## 2026-10-29: Metal HUD toggle
+
+A "Metal HUD" box on the Video tab, under HDR (off by default; `BL_METAL_HUD`): Apple's
+performance overlay. First tried live through the layer's `developerHUDProperties`: the box
+saved, but nothing showed. A test program showed why: Metal loads `libMTLHud.dylib` only
+when `MTL_HUD_ENABLED` is set as the device is made, and the layer's properties alone never
+load it (nor does `dlopen` of it). So `ensure_device` now sets `MTL_HUD_ENABLED=1` before
+`MTLCreateSystemDefaultDevice` when the box is on, and the box takes effect at the next
+start (its description says so). `MTL_HUD_ENABLED=1` at launch still works with the box off.
+
+## 2026-10-29: Traced lighting adds shadows only
+
+The ratio relight above still looked worse than the game in the user's screenshot of the
+Asylum: the facade washed flat, and the posters and ground-floor windows under the arcade
+lost again. The lightmaps already hold the lamps' shadows and the bounced light, and the
+traced lamps are only the 64 near ones, so inside the arcade (lit by lights not traced)
+the traced light was near nothing and Brixelizer GI's bounce, the bare wall texture times
+the bounce, was all that was left.
+
+- The game now keeps its own light. `bx_direct.glsl` writes how bright the traced lamps'
+  light is at each pixel, all of it and the part its shadow ray lets through.
+  `bx_compose` darkens a lightmapped pixel (lmcap alpha 1) by the blocked lamps' share of
+  the lightmap's light there: share = k x lamps / lightmap (linear, at most 1), picture x
+  (1 - share x blocked fraction)^(1/2.2). Where the lamps get through, or where other
+  light dominates, it stays exactly as the game drew it.
+- k (the lamps' units against the lightmaps') is fitted where the lamps get through,
+  weighted to where they are brightest: sum(lightmap x lamps) / sum(lamps^2). The picture
+  is left alone until it is measured.
+- Brixelizer GI is no longer run (its bounce doubled the lightmaps' own); the backend
+  still builds its shaders, for reflections later. The sky light read (`bl_bsp_sky`) it
+  needed is gone, and the surfaces' colour and motion no longer go to `bx_gi_run`.
+- Verified: builds and links; the compose kernels and the lamps pass compile with Metal.
+  Not yet seen in a window.
+
+## 2026-10-29: Upscaler None no longer upscales through MetalFX
+
+The Metal HUD showed 3600x2025 and MetalFX scaling with the game at 1920x1080 and the
+Upscaler at None. The world view was drawn at 1920x1080, but MetalFX, there only for its
+anti-aliasing, also brought it up to the window's Retina pixels. Tried first: the back buffer
+at the screen's points (1800x1012), then at the resolution itself with None. Both made the
+menu text pixelated (macOS scaled it up), which is what 2026-10-28's "Menus and HUD at the
+screen's own detail" had fixed, so both were undone: the back buffer is the window's pixels again.
+
+Now with None, MetalFX runs at the world view's own size in and out (`taa_motion` from the
+TAA section's caller), and `taa_resolve` copies its picture back into the world view's texture
+and stretches that to the window (`stretch_draw`, bilinear). MetalFX and FSR 4 upscaling are as
+before. The HUD's resolution is the window's (where the menus are drawn); the 3D is drawn at
+the resolution. Built; not yet checked on screen.
+
+## 2026-10-29: Traced lighting no longer blows out beside lamps
+
+The first full relight blew out near lamps (white patches on the gas station's sidewalk
+and low walls, orange ones on the fence by the fire barrel) and its highlights were too
+strong. Changes:
+
+- The glowing surfaces (lights lump type 0) are no longer lights: they are area lights
+  in the bake, and as points beside a wall they blew it out.
+- Lights are traced from where the map compiler lit the map from, not where they were
+  moved onto their lamp's glow sprite for the haze (bl_bsp.c keeps both).
+- No light is taken as nearer than 16 units (a luxel).
+- Per pixel, the lights' light eases to at most about twice the lightmaps' there
+  (linear), and k is fitted only from pixels below that cap.
+- The shine is added as linear light (it was gamma-encoded on its own, which made faint
+  shine bright), easing to at most 0.6.
+
+Verified: the runtime and boot build; the compose kernel compiles standalone. Not yet
+verified: how it looks (the user's test). The hard-edged stripes on the fences are not
+yet explained.
+
+## 2026-10-29: Traced lighting is bounced light and traced AO, not a relight
+
+The relight (the map's lamps lit again with shadow rays over the lightmaps) looked like
+the old game with blotches, and the part that gives the ray-traced look was effectively
+off: Brixelizer GI was fed the gamma picture and divided down, about 0.4% of the light.
+Replaced outright:
+
+- Gone: the lights list for it (bl_bsp_lights_all, the baked positions), the shadow-ray
+  pass (bx_direct.glsl), and the lightmap capture (variant lmcap: two extra render
+  targets on every world draw, the shader body run twice more per lightmapped draw, the
+  clear shader's c4/c5).
+- Brixelizer GI now gathers from last frame's picture as linear light (its own RGBA16F
+  copy), so the fire, the lamps, neon and lit windows light what is round them and dim
+  walls barely do. Added as surface colour (linear) × bounce × 1.5.
+- New bx_ao.glsl: 4 cosine-weighted rays per half-size pixel through the distance field,
+  48 units, nearer hits closing more; faded out where the field's voxels are coarser than
+  a third of that. The picture is darkened by it at strength 0.7.
+- shader_test runs 8 variants now (the lmcap ones gone): 7184 compiled, 0 failed. The
+  compose kernel and ffx_bl_ao compile standalone. Not yet seen on screen.
+
+## 2026-10-29: Traced lighting is now a port of Bevy Solari (Brixelizer removed)
+
+- AMD's Brixelizer GI (third_party/ffx, bx_gi.mm, ffx_metal.mm, tools/ffx_shaders.py) is
+  gone, with its build steps.
+- runtime/d3d9/rt_solari.metal is a hand port to Metal of Bevy Solari 0.20's real-time
+  lighting (MIT/Apache, third_party/bevy_solari): ReSTIR (temporal and spatial reuse) over
+  a path from each pixel (light samples, up to three bounces) ended in Solari's
+  world-space radiance cache, which updates itself with light samples and bounce rays.
+  Solari's defaults, with ReSTIR on; lengths turned from metres to inches.
+- The scene (rt_solari.m): one acceleration structure of the object shadows' casters (the
+  map's faces and static props) plus the sky's faces; each face with its texture's
+  reflectivity. The lights are the map compiler's own (style 0 points, spots, glowing
+  surfaces' sample points, the sun; the sky's ambient light for rays that leave the map),
+  falling off as the rebake has them. Each frame they are picked from an alias table
+  weighted by their light near the camera, without those the map's visibility hides.
+- The frame's surfaces are traced at half size along each side, the light filtered over
+  frames and by an a-trous blur within the edges, then laid on the frame: each surface's
+  colour times the light, plus its shine. The world draws now also write their own colour
+  as drawn (d3d_shader_variant base, [[color(4)]]), so decals, glass, smoke and fire drawn
+  over a surface are laid on again. Light-giving textures and the sky are left as drawn.
+  The light's overall level is matched to the game's own over the frame.
+- Verified: the runtime builds and links; shader_test 7184 compiled, 0 failed (two
+  variants with the new output); all 14 Solari kernels compile at run time (1.5 s, once).
+- Not verified: how it looks, and its frame rate (not run). Not yet: MetalFX's denoising
+  scaler (the filter is the port's own), characters in the scene (they are lit but cast
+  no traced shadows), alpha-tested cut-outs (fences block light whole), and lights with a
+  style (flickering or switched lights are left out).
+
+## 2026-10-29: Traced lighting goes through MetalFX's temporal denoised scaler
+
+With Traced Lighting on, MetalFX's temporal denoised scaler takes the place of the
+temporal scaler (and of FSR 4 when that is chosen) in `taa_setup`/`taa_resolve`. It
+anti-aliases, upscales and clears the tracing's noise in one step.
+
+- **Guides:** the traced pass's composite (`rt_composite`) now also writes the denoiser's
+  guides at the world view's size: diffuse albedo (the surface colour as drawn), specular
+  albedo (the split-sum F_AB with F0 0.04), world-space normal and roughness. Pixels that
+  were not lit again get the frame's own colour, no shine, and a normal facing the camera.
+- **Frames with no traced pass** (no scene yet): `rt_guides` clears the guides so the
+  colour passes through as it is.
+- **Matrices:** the game's camera is handed over as `worldToViewMatrix` (`view_rows`) and
+  `viewToClipMatrix` (p00, p11, alpha, beta).
+- **Filtering removed:** the port's own à-trous filter is gone. Its temporal accumulation
+  now keeps 8 frames instead of 32, and the denoiser keeps the longer history.
+
+Verified:
+- The runtime builds and boot links.
+- All the Solari kernels and the five-attachment composite pipeline compile at run time.
+- The denoiser is created for 1280x720 to 1920x1080 on this Mac. Its input can be from 1
+  to 3 times smaller than its output.
+
+Not verified: the look and the fps in the game.
+
+## 2026-10-29: With traced lighting, the denoiser always upscales
+
+The user tested the denoiser at the window's own size (no upscaling, or Native), and the
+whole picture flickered. With MetalFX upscaling it was steady. So while Traced Lighting
+is on, the world view is drawn at Quality's size (2/3 of the window on each side) or
+smaller, and the denoiser always brings it up. This also applies when the upscaler is
+set to None. Verified: builds and links. Not yet verified in the game.
+
+## 2026-10-29: Traced lighting traced for every pixel; the denoiser outputs at the resolution
+
+The first test with the denoiser came out soft and fizzy. It ran at 40 fps with the GPU
+taking 22 ms a frame (BL_GPU_STATS=2):
+
+- traced lighting: 3.7 ms
+- the game's own drawing: 4 to 8 ms
+- post_traces: 2 ms
+- MetalFX's denoiser: about 6 ms
+
+The denoiser was bringing 1280x720 up to the whole 3600x2025 window. Its input was
+lighting traced at only 640x360 and smoothed over 8 frames, so it had about one traced
+pixel for every 32 it made.
+
+Changes:
+- The lighting is now traced once for each pixel of the world view. Our own temporal
+  accumulation is gone, so raw ReSTIR goes straight to the denoiser, as Solari intends.
+- With traced lighting, the denoiser's output is the chosen resolution (for example
+  1920x1080), not the window. It is then stretched to the window (`taa_out_size`).
+- The traced compute is now timed in two parts ("world cache" and "ReSTIR") to show
+  where its time goes.
+
+Verified: builds and links; the kernels compile; the denoiser is created.
+Not verified: the look and the fps.
+
+## 2026-10-29: Traced lighting keeps the chosen resolution; frames fail on the GPU
+
+- **Resolution:** forcing Traced Lighting to Quality's size (2/3) is undone. The world view
+  is drawn at the resolution the user chose (1920x1080).
+- **What the flicker was:** the timing log showed every frame with the denoiser failing
+  on the GPU (MTL4CommandQueueErrorDomain error 1, a timeout; MetalFX reports it twice a
+  frame). It started as soon as the denoiser was made, even before the traced scene
+  existed.
+- **Denoiser alone:** in a standalone program, the denoiser ran 60 frames without an
+  error. That was with the same formats, fence, residency set, three frames in flight,
+  and both one command buffer and three. So the failure comes from something else in the
+  game's frame.
+- **Logging:** failed frames are now counted every 100 frames, not logged once only.
+
+## 2026-10-29: MetalFX's denoiser removed from traced lighting (too slow for 60 fps)
+
+**What went wrong in the window.** With every pixel traced, a frame took 48 to 55 ms of
+GPU time. In a window, 60 to 99 of every 100 frames failed on the GPU (a timeout). The
+picture broke up, and the user's Mac froze. Headless runs at the same cost never failed,
+so the window adds its own limit.
+
+**What the denoiser costs on its own.** Measured on the M4 Pro in a standalone program,
+frames 30 to 60:
+- 1920x1080 to 1920x1080: 24.7 ms
+- 1280x720 to 1920x1080: 12.1 ms
+- 960x540 to 1920x1080: 8.5 ms
+
+On top of the tracing, none of these can fit in 16.7 ms.
+
+**Removed:** the denoised scaler, its guides (`rt_guides`), the extra composite outputs and
+`taa_out_size`. With traced lighting on, the temporal scaler and the chosen upscaler are
+back as they were.
+
+**Restored:** the port's own filter. The lighting is traced at half the world view's size
+along each side, kept over up to 32 frames, then blurred three times within each surface's
+edges. The traced compute is still timed in two parts.
+
+**Verified:** one headless run on sm_hub_2 with BL_TRACED=1, the 1280x720 world view
+(MetalFX Quality) brought to 1920x1080, and no window:
+- no frame failed on the GPU;
+- 11.8 ms of GPU a frame: ReSTIR 4.0, the game's drawing 2.6, post_traces 1.4, world
+  cache 0.6, composite 0.3;
+- frame 850 is clean.
+
+**Not verified:** in a window.
+
+## 2026-10-29: Traced lighting's level held per map (the picture pumped when turning)
+
+- **Cause:** the traced light's overall level is matched to the game's own each frame, from
+  sums over the pixels on screen (`rt_calibrate`). It moved 4% a frame towards what the
+  current view asked for, so it followed the view. Headless on `sm_hub_2`'s Asylum street
+  (teleported with the console's `FindPlayer().SetOrigin(...)`, `-console`), a 360-degree
+  turn moved the level from 1.84 to 3.68 and back to 2.0 within a few seconds. The whole
+  picture brightened and darkened as lamps came in and out of view.
+- **Fix:** the level is the map's. It is the average (in log terms) over every view since
+  the map loaded: `scale[1]` counts the views, and a new view weighs 1/count but never less
+  than 1/1800 (about half a minute of frames). `RTP.new_scene` (from `scene.fresh`) starts
+  it again on a new map. The same turn now moves the level smoothly from 1.0 to 1.43 over
+  7 seconds as it settles from the alley's level towards the street's.
+- **Ruled out, headless (upscaler none, 1920x1080):**
+  - History rejection while turning. A view of the filter's history length showed
+    floors, walls and ceilings keep it; only edges and the newly revealed strips lose it.
+    Testing history against the faces' own normals (no bumps) changed nothing and was
+    taken out again.
+  - Temporal noise. Frame-to-frame change after aligning for the turn: 3.6 with traced
+    lighting against 3.9 without in the alley, and 5.8 against 7.4 on the Asylum street.
+    Standing still on the street: temporal std 0.79 against 0.55.
+- **Not verified:** the look in a window (handed to the user). GPU time is unchanged:
+  headless 23-24 ms a frame at native 1920x1080, so 60 fps is still not met there.
+
+## 2026-10-29: Traced lighting's GPU time split by stage; the 60 fps budget measured
+
+- `rt_run` now opens one compute encoder per stage, so `BL_GPU_STATS` shows each:
+  `traced lighting: surfaces`, `paths` (first paths with last frame's reservoirs),
+  `neighbours` (spatial reuse and shading), `filter` (temporal and a-trous), next to the
+  `world cache` and `on the frame` (the composite).
+- Headless, `sm_hub_2` at the Asylum (teleported there), M4 Pro, 1920x1080, frames 800-1100:
+  - Upscaler none (MetalFX at full size), traced off: 15.7 ms a frame.
+  - The same with traced on: 25.0 ms. Paths 4.10, filter 1.92, neighbours 1.31, world
+    cache 0.95, composite 0.67, surfaces 0.38 (9.3 ms in all). `post_traces` rose from
+    2.88 to 3.98.
+  - MetalFX Quality (1280x720 to 1920x1080), traced on: 14.4 ms. Paths 1.65, world cache
+    0.92, filter 0.83, neighbours 0.59, composite 0.33, surfaces 0.23.
+- So at native 1920x1080 the game alone already uses nearly all of a 60 fps frame on this
+  street, and traced lighting fits 60 fps only with upscaling. The user's window adds a
+  few ms over headless (3600x2025 drawable, composited).
+- Light candidates per world cache cell halved (32 to 16): world cache 0.94 to 0.75 ms a
+  frame at MetalFX Quality, with stillness unchanged (temporal std 0.59 against 0.63 over
+  frames 880-887 at the Asylum). Halving the first hit's candidates (8 to 4) saved nothing
+  (paths 1.79 against 1.78 ms: the rays are the cost) and was put back.
+- Headless at MetalFX Quality, traced on: 13.5 to 14.0 ms a frame. Not verified: the
+  user's window, where MetalFX upscales to the 3600x2025 window rather than 1920x1080.
+
+## 2026-10-29: Traced lighting's fizz while walking, and lit areas going dark
+
+Found by looking at the traced light on its own (a temporary view of it without the
+surfaces' colour, and one of each point's history length), on `sm_hub_2`'s Asylum street
+while walking forward (W held), headless at upscaler none.
+- **Fizz on the road.** Walking forward, the rough, normal-mapped ground lost its history
+  at random, pixel by pixel, and its light sparkled. The test for "the same surface as last
+  frame" (`pixel_dissimilar`, in ReSTIR's temporal and spatial reuse and in the filter) used
+  the bumpy shading normal. A new half-size target, `ggeo` (texture 10, last frame's 11),
+  holds the face's own normal from the camera ray's hit (the shading normal where the ray
+  meets nothing, as on characters), and the tests use it. The a-trous filter's edges use it
+  too, with the bumps only weighing a little (`pow(dot, 4)`). The composite measures each
+  traced point's distance from its own face. The road now keeps its history evenly.
+  Turning alone had not shown this (the earlier test of 2026-10-29 had only turned).
+- **Sparkle where the history is short.** The a-trous filter's brightness weight kept a
+  noisy pixel's dark and bright neighbours apart. It now only counts once a point has 4 to
+  12 frames of history.
+- **Lit areas going dark and lighting up again.** `pick_lights` left out lights the camera's
+  part of the map cannot see (beyond 768 units) and lights the camera is over 1024 units
+  beyond. Crossing from one part of the map to the next while walking switched them in and
+  out of the sampling, and the far wall under a lamp went from lit to dark between frames.
+  Those lights are now made 20 times less likely, never left out.
+- Tried and taken out: holding each frame's light to 4 times its neighbours' mean. It wiped
+  out light found by only a few pixels, and the near road went black for a frame.
+- **Not verified:** the look in a window at the user's frame rate. Headless frame captures
+  stall the game, so frames captured one after another have the camera jump far between
+  them, which is harsher than real play.
+
+## 2026-10-29: Traced lighting removed
+
+The user asked for traced lighting to be removed entirely. In their window it warbled,
+fizzed and flickered, the exposure kept shifting, characters showed broken triangles, and
+there were no visible reflections or bounced light. Real-time path tracing of this kind
+relies on a strong denoiser, and the Mac has none fast enough. MetalFX's denoised scaler
+was measured too slow and taken out earlier.
+
+**Removed:**
+- `rt_solari.metal`, `rt_solari.m` and `rt_solari.h`, and `third_party/bevy_solari`.
+- The option (`TracedLighting`, `BL_TRACED`) and its box on the Enhanced tab.
+- `traced_run` and the scene handed to it from `bl_shadow_note_map`: materials, sky faces
+  and lights.
+- The fifth colour output that draws wrote for it (`d3d_shader_variant.base`,
+  `base_texture`).
+- `bl_bsp_clusters_seen`.
+- The `BLCompute` methods that only it used (acceleration structures, indirect dispatch,
+  buffer copies).
+- The build step that embedded its shaders, and `-lc++`.
+
+The object shadows, reflections, bounced light, the global illumination probes and the
+other effects are as they were before it.
+
+**Verified:** the runtime builds and links with no warnings.
+
+**Not verified:** in a window.
+
+## 2026-10-29: Traced lighting back as a test, denoised by Apple's MPSSVGF
+
+The user asked for a simple tracer run through Apple's MPSSVGF, as a test only. It is the
+Enhanced tab's "Traced Lighting (test)" box (`TracedLighting`, `BL_TRACED`), off by default.
+
+- **What it does** (`runtime/d3d9/rt_trace.h`, `.m`, `.metal`): the map's lightmapped
+  surfaces only (albedo mark 0.8; characters, props and glowing textures are left as drawn)
+  are lit again each frame from the map's own lights as the map compiler left them (style 0):
+  two lights a pixel, each picked from 16 drawn from a per-frame alias table, with a soft
+  shadow ray; the sun where a ray reaches sky; and one bounce ray that takes the lightmap
+  where it lands. The result goes onto the frame as a ratio to the lightmap's own light
+  (capped at 4), so the overall level is the game's by construction. Samples above 16
+  times the lightmap's light are cut, which removed sparkles under the neon signs without
+  darkening (a cap of 4 darkened the street).
+- **Scene:** world and brush-entity faces (at their entities' origins), displacements and
+  the static props, built into an acceleration structure in the background when a map
+  opens. Without brush entities, a pillar let a lamp through as a bright wedge on the
+  asylum floor and the bar's neon strips were dimmed.
+- **MPSSVGF** takes only Metal 3 command buffers: the frame's Metal 4 work so far is
+  committed, the denoiser runs on a Metal 3 queue of its own after an event, and the
+  Metal 4 queue waits for it before the composite. One denoiser each for direct and
+  indirect light: its two-source call asserted ("Previous texture 2 must not be nil").
+  Its outputs are returned to the allocator each frame (keeping them leaked two textures
+  a frame).
+- **The surfaces' colour as drawn** (`base_texture`, colour attachment 4) is back for it.
+- **Verified headless** (upscaler default, one run at a time): `sm_asylum_1` standing,
+  walking and turning, and `sm_hub_2`'s street walking and turning. Brightness within a
+  few percent of traced off; no fizz, smears or sparkles in the frames checked; frame-to-
+  frame change standing still is near zero; the allocator holds 11 textures throughout.
+  `BL_GPU_STATS=2` now also logs MPSSVGF's own GPU time.
+- **Not verified:** a window, and the box on the Enhanced tab (not clicked headless).
+
+## 2026-10-29: The MPSSVGF traced lighting test removed
+
+In the user's window the test changed almost nothing (their screenshots on and off were
+nearly identical). That is what it was built to do: it traced the same lights the map's
+lightmaps were baked from, so it reproduced the bake. Removed at the user's request:
+`rt_trace.h`/`.m`/`.metal`, the option and its box, the surfaces' colour as drawn
+(`base_texture`, colour attachment 4, `d3d_shader_variant base`),
+`BLCompute setAccelerationStructure`, the MetalPerformanceShaders link and the embedded
+shader header. Built clean; nothing of it is left in the binary.
+
+## 2026-10-29: Chord material maps for the rest of Santa Monica
+
+`tools/tex_chord.py` was run, unchanged, on the other Santa Monica maps, one map per run:
+sm_pier_1 (25), sm_asylum_1 (26), sm_beachhouse_1 (27), sm_pawnshop_1 (18) and
+sm_apartment_1 (8). That is 104 more textures, about 10 s each, and 387 with Chord maps
+in all. It used the same folders and settings as the hub: the bumps, the roughness, the ground's
+height maps and roughness kept at 0.75 or more (the pier sand), and metalness in
+`chord_metal.txt`. Maps go where the renderer already looked, so some went to
+sp_tutorial_1's and sm_pawnshop_1's folders. Textures already done were skipped, so the
+diner's and the roads' PBRify maps stay.
+- Chord put nearly no metal in the bare metal: brushedcounter, elevdoorsa, galvanizedb,
+  piergalv and the chain-link fences are 0 to 0.005. The metal folder's textures take that
+  value, so these read as paint. fireescape1ladder_clr is 0.76.
+- Not verified in game.
+- **Bare steel made metal again** (the user asked): `tex_chord.py` now keeps textures whose
+  name has brushed, galv, chainlink or elevdoor at a metalness of 0.8 or more
+  (`BARE_METAL`), and `chord_metal.txt` was changed to match. Painted metal is unchanged.
+
+## 2026-10-29: Chord maps for Santa Monica's carpets, curtains and objects
+
+`tex_chord.py --folders carpet drapery objects` was run on all six Santa Monica maps: 38
+textures (the rugs and carpets, curtains, blinds and nets, the shop signs, the ovens,
+flyers, the oil rig, the garage door and other objects), 425 with Chord maps in all.
+Rugs and curtains get their weave and folds, blinds their slats, and the oven its rust and
+panel. Flat printed things (flyers, the arcade screen) came out nearly flat, as they should.
+Chord's metalness is used only in the metal folder, so these keep none. Not verified in game.
+
+## 2026-10-29: Rebaked Lighting for the whole game
+
+The map's lighting is baked again on the GPU (`lm_bake.m`) and replaces the game's own
+steady light surface by surface (`metal_render.m`, "the lighting rebake in the game";
+`d3d9_shader.c` `bl_lightmap_rebaked`). It is the "Rebaked Lighting" box on the Enhanced
+tab's Lighting column (`RebakedLighting`, on until unticked; `BL_REBAKE` overrides).
+- **The bake:** every lit face, brush entities' and displacements' (the outdoor ground)
+  included, at 4 luxels per game luxel along each side (2 on the biggest maps, kept under
+  8 million luxels), with soft shadows (16 jittered rays per luxel, soft sun, lights given
+  a size), sky light and 3 bounces. Shadows come from the world, brush entities,
+  displacements and props. Each luxel keeps the flat light and the three bump directions,
+  packed as RGB9E5.
+- **The cache:** each bake is saved to `~/Library/Caches/Vampire The Masquerade -
+  Bloodlines/lightmaps` (LZFSE; 11 MB for the asylum, about 80 MB for a hub), keyed by the
+  map's size and date, trimmed oldest first past 3 GB. Later loads read it at once. A map
+  not baked yet shows its old lighting until the bake is done, then switches
+  (Hollywood: 16.5 s, Santa Monica: 10.7 s, the asylum: 1.7 s).
+- **The colour blotches fixed:** the old attempt mixed the bake with the game's page in
+  gamma space through a learnt encoding. The game's encoding is now known exactly (per
+  channel: 1/1024ths clamped at 4091, gamma 2.2, twice overbright; 96.8% of bytes exact,
+  the rest one off), so it all happens in linear light: the bake plus the game's page
+  decoded less the map's own steady samples as the game encodes them. What the game adds
+  as it runs stays: dynamic lights (the asylum's green neon) and lights that flicker or
+  switch (light styles, which the bake leaves out). The learnt encoding is gone.
+- **The Chord bumps:** where a surface is rebaked, its bumps are lit by all of the baked
+  light (lamps, bounce and sky), from each bump direction's share of it (a texture at half
+  the bake's scale), instead of by the nearby live lights only. Their shine is unchanged.
+- **HDR alone** uses the same path: the map's own samples unclamped, so highlights go
+  past white.
+- **Checked headless:** the asylum (625 faces, all matched; neon kept; the bar's frieze and
+  front get proper pools of light instead of a flat wash), Santa Monica's hub (213 faces,
+  all matched), Hollywood (454 faces, 23 of them displacements, 2 surfaces unmatched), the
+  plaguebearer sewer (690 faces, 1 unmatched; sharper shadows). One first-time asylum bake
+  had one frame fail on the GPU (a timeout); a second fresh bake and every other run had
+  none.
+- **Not verified:** a window, clicking the box, a room with flickering lights in view, the
+  bump directions' orientation on a close-up wall. The sewer's water draws magenta with the
+  option on or off (not from this).
+
+## 2026-10-29: The plaguebearer sewer's water
+
+- **Why it was magenta:** the water's first pass draws the picture under its surface (the
+  refraction, a 1024x1024 A8R8G8B8 render target the game draws the view below the water
+  into) tinted green. The shadow code took every 1024x1024 A8R8G8B8 render target for the
+  character shadow atlas, so the refraction was made at 4 times the size in the atlas's
+  format, and the atlas pointer went to whichever such target was made last. What the water
+  read was never what the game drew; it came out magenta. With the better shadows off it
+  was already right.
+- **The fix:** the atlas is the first of those targets the game draws or clears in part (a
+  caster's cell at a time, `shadow_spot`); a target drawn whole, like the refraction, stays
+  an ordinary one. When the atlas is found after its texture was made, it is remade at the
+  shadows' size and format at once (`shadow_atlas_fit`, shared with the setting's change).
+- **New render targets start black:** Metal's start with whatever the memory held,
+  Direct3D's with zeros. The game never clears the refraction's colour, and above the
+  waterline nothing is drawn in it: the water's edges kept a thin magenta line. A target's
+  first pass now clears it to 0 (`blank` on the object, `blank_of`), unless a copy wrote it
+  first.
+- **Checked headless:** the sewer at frame 900 has dark water with the tunnel's
+  reflections and no magenta, its edges included; the shadow atlas is still 4096x4096 with
+  the casters in it. The asylum looks the same as before (two cached runs within 3,000
+  pixels of each other; against the earlier frame a sub-pixel shift of the view, same
+  brightness).
+- **Not verified:** in a window, other maps with water (the beach house, the warrens).
+
+## 2026-10-29: SeedVR2 for map textures (first sample: the Asylum's red wall)
+
+The user wanted more detail in the pictures themselves, which Chord's maps do not give.
+SeedVR2 (ByteDance Seed's restoration model, through numz/ComfyUI-SeedVR2_VideoUpscaler,
+Apache 2.0) was tried on 8 textures at 2x:
+- Clearly sharper: tile patterns (bradfloora), brick, the scratched paint, the rug.
+- Little change: siding and parquet.
+- Worse: rock (smoothed). The tiny, blotchy oven (256 px) kept its compression blocks.
+
+`tools/tex_seedvr2.py` (new) enlarges a map's brick, tile, plaster and carpet textures by
+default. It skips textures with the user's -replace pictures and textures of 1024 or more.
+- Each texture is wrapped around itself by an eighth of its size, enlarged, and trimmed
+  back, so it repeats without seams. Without this, the edges jumped about three times
+  more than inside the picture.
+- Alpha is kept.
+- It writes `<name>-seedvr2.png` and removes that name's PBRify upscale, then
+  `tex_pack.py` packs it with its colour fix.
+- It loads the model once per texture size.
+- Setup: `build/seedvr2` (the code, a uv venv and the 3B fp16 model with its VAE,
+  7.3 GB; never committed). It must run from the user's own Terminal, because the GPU is not
+  reachable from the sandbox.
+
+First sample: `plaster/aswlla` (sm_asylum_1), 512 to 1024, in place of its 2048 PBRify
+upscale. Packed. Not yet seen in game.
+
+## 2026-10-29: A map's first rebake no longer stalls play
+
+The slowdown on first stepping out into Santa Monica (`sm_hub_1`) was the Rebaked Lighting
+bake: the street had no bake in the cache yet, so it baked on the GPU in the background, in
+pieces of 32768 luxels that each held the GPU for about 20 ms. For the 20 s it took, the
+game's frames waited behind it (headless, the GPU time per frame went from about 18 ms to
+40-90 ms; the user's window showed the same).
+- **Paced:** each piece now goes in slices of 4096 luxels, one command buffer each
+  (`lm_bake.m`, `BAKE_SLICE`). While the game draws the world, the renderer ticks the bake
+  once a frame (`bl_bake_world_frame`, from `lightmap_rebake_begin`) and the bake sends one
+  slice a frame (`pace_wait`); with no world frame for a quarter second (loading screen,
+  menus) it runs flat out. Slices are about 2 ms on an M4 Pro for direct light, 3.5 ms for a
+  bounce. Smaller ones were tried (256 to 2048 luxels, sized by GPU time): each luxel's rays
+  take long, so small slices leave most of the GPU idle and the bake crawled (under a fifth
+  of direct light in a minute). 16384-luxel slices took about 14 ms a bounce and slowed the
+  frames by half.
+- **Started at load:** the renderer now asks for the bake every frame (`bl_rebake_get`
+  after `gi_frame_start`), so a new map's bake begins while its loading screen is up rather
+  than at its first world frame.
+- **Checked headless** (`+load autosave` on `sm_hub_1`, `BL_BAKE_CACHE=0`): the bake took
+  163 s of play instead of 20 s, the old lighting showing until it switched; the frames'
+  GPU time stayed close to the street's own while it ran (direct light: no change; bounces:
+  about 3 ms more). The switched picture looked right. Cached maps are unchanged (read at
+  once).
+- **Not verified:** a window; a map change in the middle of a bake (the old bake runs on,
+  paced, and is dropped as before).
+
+## 2026-10-29: SeedVR2 moved to the 7B model in MLX
+
+- The 3B model (PyTorch, `build/seedvr2`) is deleted. `tools/tex_seedvr2.py` now runs
+  mlx-gen 0.38.0 (`mlxgen upscale`) with AbstractFramework/seedvr2-7b-8bit, set up in
+  `build/mlxgen` (a venv and the 8.7 GB model; not committed). Pillow is pinned to 12.1.1
+  there: Pillow 13 needs a newer Python than the venv's 3.12.
+- The 7B ran out of GPU memory decoding a whole 1280-pixel picture on a 24 GB Mac; it now
+  decodes in tiles (`--vae-tiling`).
+- The 7B recolours fine detail (the Asylum wall's beige scratches came out green, a brown
+  rug's ground blue), so the tool keeps only its brightness and takes the colour from the
+  original, enlarged.
+- About 80 s a texture in the Asylum (many get the model's extra four-step pass). Runs do
+  6 per model load and stop starting new ones after 4 minutes, so each ends within 10.
+- First 6 of the Asylum (two ceilings, the arch, two walls, the door) packed and seen in
+  the game by the user: fine. 148 to go.
+
+## 2026-10-29: Full-Size Textures option
+
+**Why.** The port has to run on every Apple silicon Mac, down to an 8 GB M1, and the
+upscaled textures had no memory limit (796 MB packed so far, each about 8 times its
+original's GPU memory).
+- **Full-Size Textures** is a new box in the Enhanced tab's "Surfaces & Characters" column
+  (`BL_FULL_TEXTURES`, registry `FullSizeTextures`), with a hint. Its default is on with
+  more than 12 GB of memory, off with 8 GB.
+- Off, `tex_hires.m` leaves out an upscale's largest mipmap when it loads (never going below
+  the original's size): a 2x upscale comes in at the original's size with its cleaner
+  picture, a quarter of the memory. It is read as each texture loads, so a change shows from
+  the next area.
+- Kept as BC7: neural texture compression was looked at and left out (it decodes in the
+  shader on every read, which costs most on the M1 it would be for).
+- Verified: the runtime builds, boot links, runtime_unit passes 85/85. Not verified: the box
+  in the options screen and the smaller textures in the game.
+
+## 2026-10-29: Frame generation shown from its own thread
+
+The user reported that the Metal HUD never showed more than 60 with Frame Generation on.
+In the window (sm_hub_2 autosave, 3600x2025 window, every effect on), `BL_PACING_STATS`
+counters showed the interpolator made its picture on 599 of 600 frames, but `present`
+asked for two drawables a frame on the game's own thread. With the layer's three
+drawables, each held for its minimum duration, the thread waited for them about 9 ms a
+frame. On top of that, the interpolator's own GPU work at the window's size (about 7 ms)
+held the game well below the cap, so the pictures shown stayed near 60.
+
+- New present thread (`shown_thread`, Apple's design for the frame interpolator). `present`
+  draws the frame's pictures into one of three slots in the layer's format
+  (`shown_start`, `copy_to_shown`; HDR tone mapping as before), and `next_frame` hands the
+  slot over after the commit (`shown_hand_over`, with a shared event). The thread waits for
+  the GPU, copies each picture into its own drawable on its own Metal 4 queue and shows it:
+  the in-between one at once, the game's half the (smoothed) time between the game's frames
+  later. Paced presents keep their hold (half the cap's frame with two pictures). Every
+  present goes this way (menus and movies too), so the game's thread never waits for a
+  drawable; it waits only when all three slots are still queued.
+- The old drawable code (`present_held`, `present_drawables`, the drawable waits in
+  `next_frame`, `copy_to_drawable`) is gone.
+- `BL_PACING_STATS=1` also logs, every 600 frames, how many frames had a picture between
+  (and why the others did not), the wait for a slot, and how many pictures were shown.
+  The drawables' `presentedTime` now works too (it was 0 for every drawable before, so
+  the refresh histogram never printed).
+- Window check, same autosave: 600 of 600 frames with a picture between, 1198 pictures
+  shown in 16.8 s (the game's 600 frames in the same time), the slot wait 0.1 to 2.9 ms
+  per 600 frames. Pictures 1 or 2 refreshes apart at 120 Hz. The game's own rate is still
+  limited by the GPU's work in this scene at this window size.
+- Not checked: frame generation off, the main menu and movies through the new path (same
+  code with one picture), HDR toggled live, window resizing.
+
+## 2026-10-29: The window drawn at the game's resolution
+
+At the user's request ("I've never played a game at retina resolution and never will"),
+the back buffer and depth are no longer made at the window's Retina pixels: they are the
+game's resolution (1920x1080 here), and macOS scales the window's picture to the screen
+with its usual smooth filter, as games under a compatibility layer at 1080p do. Removed:
+`out_w`/`out_h`, `out_follow_window` and the back buffer's re-making in `out_apply`
+(which now only takes up a live resolution from the Video tab); `d3d_render_resize` sets
+the drawable to the game's size. 2026-10-28's "Menus and HUD at the screen's own detail"
+is undone by this; its blockiness was at much lower resolutions.
+
+- Window check (same sm_hub_2 autosave): the Metal HUD shows 1920x1080, MetalFX scaling
+  1920x1080 to 1920x1080, the frame interpolator 1920x1080 to 1920x1080, every frame with a
+  picture between, about 72 pictures a second. The HUD's text, compass and bars in the
+  screenshot look clean. The game's own rate is still held by the GPU's effects work in
+  this scene.
+- Not checked: menus' text up close, other resolutions, full screen.
+
+## 2026-10-30: FSR 4's faster prepass
+
+The FSR4Metal folder next to the game's folder now has the new Lite prepass (from the updated
+FSR4Metal project in `FSR4Lite2/FSR4Metal`): only `prepass.json` and `prepass.metallib` in the
+four `fsr4_assets` sets changed; the library and every other file are the same. Its project
+checked that the picture still matches AMD's exactly. Nothing in this repository changed.
+Not yet seen in a window.
+
+Later the same day the FSR4Metal folder was replaced in place with a newer build
+(`FSR4Metal-Lite.zip`, unpacked there): it adds a faster postpass (`postpass.json`,
+`postpass.metallib` and a new `postpass.native.metallib` in each of the four sets). The folder
+matches the zip exactly. The game builds its own copy in (`third_party/fsr4metal`, its model
+copied to `build/fsr4_assets` by `tools/link_boot.sh`), so the twelve new postpass files went into
+both of those; the source and header are unchanged, so nothing needed relinking.
+
+## 2026-10-30: The asylum's front doors with real panels
+
+The asylum's front doors are brush entities (`func_door_rotating` `*18` and `*19`): flat
+boxes with a photo of a panelled door on them, given depth only by parallax. They now get
+real panels.
+
+- `tools/brush_panels.py` reads the brush models from the map and cuts each panel the
+  texture shows (`tools/props/asylum_door.json`, rectangles in the texture's pixels) into
+  the door's faces as a moulded recess with a raised field, 0.8 units deep, lined up with
+  the photo, on both sides. Each leaf goes from 4 triangles to 428 (624 vertices).
+  The door's edges are not remodelled.
+- The game builds a brush model's indices anew every frame, so these remodels are keyed by
+  the points the draw uses (`prop_remodel_brush_key`), not by vertex numbers. There is one
+  file for the faces drawn together and one for each face alone. They are drawn in the model's
+  own space, so the door swings as before. Every other attribute (the lightmap
+  coordinates) is interpolated from the flat face as for props. The tangents and binormals
+  are turned with the remodel's normals. The door keeps its lightmap pass
+  (`lightmap_for`) and gets no parallax (`draw_brush_remodelled`).
+- Built; not run. A window run's log should show
+  `[remodel] brush/sm_asylum_1/18_all.msh: 4 triangles drawn as 428 (...)`.
+
+
+Later that day, the door lookup kept a cache entry for every draw of 2 or 4 triangles: most sprites, decals and particles, whose points change all the time. Now a draw's key is checked against the listed doors first (`prop_remodel_brush_known`), and only real door draws are cached.
+
+## 2026-10-30: FSR 4 built into the game
+
+FSR 4 stopped being offered: the FSR4Metal folder next to the game's had been moved away,
+and when it came back (unzipped with Keka) macOS refused its library ("library load
+disallowed by system policy": the quarantine mark). At the user's request FSR 4 no longer
+depends on that folder.
+
+- FSR4Metal's source, header, Apple's `metal_irconverter_runtime` header and its four model
+  sets are copied into `third_party/fsr4metal/`, which `.gitignore` keeps out of the
+  repository (FSR4Metal's code is GPL, its model AMD's).
+- `tools/link_boot.sh` compiles `FSR4Metal.mm` into `build/fsr4/FSR4Metal.o` (again only
+  when the source is newer), links it into the game (not into `libbl_runtime.a`), and copies
+  the model to `build/fsr4_assets`. Without `third_party/fsr4metal` the game is linked with
+  the `fsr4mtl_*` functions null (`-U`, `weak_import` in `metal_render.m`) and FSR 4 says it
+  was not built in. `tools/build_tests.sh` passes the same `-U`.
+- `fsr4_try` calls `fsr4mtl_create` directly with `build/fsr4_assets` (found from the
+  game's own path). The `dlopen`, `BL_FSR4_DIR` and its README row are gone.
+- Checked: `nm` shows `fsr4mtl_create` and `fsr4mtl_encode` in the game; a headless run with
+  `BL_UPSCALER=fsr4` on the sm_hub_2 autosave loads it ("FSR 4: built in") and upscales
+  through it for 400 frames. Not yet seen in a window.
+- `tools/build_tests.sh` currently stops at `tests/shader_test.m` (`d3d_shader_variant` has
+  no `base`), from shader changes in progress elsewhere, before its pilot links.
+
+## 2026-10-30: Falling rain that looks like water
+
+The falling drops were thin white streaks, all the same. Now each one is drawn as clear water and the scene shows through it. Its pixels read the lit world view behind it (bl_rl), shifted by the slope of the drop's own alpha and slightly downward, so the drop bends the view like a lens. It is a little brighter at its fuller edge. The splash rings keep their old look. To tell the two apart, the 4× sheet's drop texel now has no blue (ps_rain_light).
+
+In rain_hold, rain_vary reads every drop quad in a held rain draw (6 indices, 4 vertices on the drop's place on the sheet). It gives each drop its own length (0.55 to 1.65 times), width (0.5 to 1.2) and strength (0.45 to 1). These values come from a hash of where its head falls, to 8 units, so a drop keeps them as it falls.
+
+Each drop also gets two fainter, thinner copies, placed close by from the same hash, so the rain is denser. The copies are added to the held draw's own vertex and index copies; it skips them if 16-bit indices would run out. Every drop and copy leans with a light, steady wind: it moves 0.07 / 0.03 units across for each unit it is below the camera.
+
+Splashes, puddles and wet streets are unchanged. Lines to look for: `[metal] rain: N drops varied, M copies added`.
+
+Later that day, the drops softened after the first look, which was harsh and jagged.
+
+The cause, found from a saved frame: the game adds the rain's colour to the picture and ignores the texture's alpha. Its drop colours are dim, 1 to 80 of 255, with alpha 0. The finer drop's shape was only in its alpha, so each drop filled its whole quad. The clear-water look then added a copy of the view behind it, which came out as flat bars twice as bright as the background.
+
+- **Shape in colour:** the finer drop's red and green are now its brightness times its shape: a soft bell across (RAIN_SIGMA 0.15 of the quad), fading in from the tail and out at the head. Drop strength scales the vertex colour, not just its alpha.
+- **Added light:** in ps_rain_light a drop adds its shape times `14 × view behind (from 3 pixels above) + 12 × light around + 0.6`, eased off as `x / (1 + 3x)` so a drop by a lamp is a soft warm streak, not a hard line.
+- **Width:** a drop is never thinner than 2.2 pixels across its middle. Most are 4 to 15 times thinner than that, so each is widened and made fainter by the square root of as much.
+- **Copies:** each drop has four copies at half strength, spread 60 units across and 120 up or down. Drops are 0.35 to 0.8 strong.
+
+## 2026-10-30: Where a frame goes on sm_beachhouse_1 (investigation, no change)
+
+This is a 10 s `sample` of the user's own focused window, walking in the rain with frame generation off. The game thread is busy all the time, at about 17 to 37 ms a frame with 250 to 340 draws, and never waits for the GPU. Profiles of windows left in the background are not usable: macOS slows them down, and that makes AppKit's event handling look expensive.
+
+The stacks through translated code are partly cut off, so these shares are approximate:
+- **Translated game code:** about half, including the x87 helpers. The helpers alone are about a quarter (x87_fld_float 8%, fstp 4%, fmul 3%, faddp 2%, ...), mostly called from engine, MaterialSystem and StudioRender. See 2026-10-26: inlining them gained nothing, because the x87 stack lives in the `_cpu` struct. Making them faster would need a different translation that keeps the stack in registers.
+- **The renderer's draw handling:** about 19% (DrawIndexedPrimitive). That is roughly 16 µs a draw.
+  - setup_draw's dictionary lookups (pipelines, shader functions, keyed by NSData).
+  - texture_of → bl_hires_texture hashing texture levels (SHA-1).
+  - The prop and door remodel keys, and `rain_vary` (1.6%: NSData copies per copied vertex).
+- **Present:** about 3%. Event handling: under 1%.
+
+## 2026-10-30: Faster loading (file searches indexed, native zlib)
+
+The user reported 15 to 30 seconds per load from the main menu's Load Game. Measured
+headless and in a window on an M4 Pro, loading `autosave` (sm_pawnshop_1) from the main
+menu through the console: 5.8 s from the command to the first world frame (5.4 s in a
+window). The user's own window run showed the same, about 6 s. A 15 to 30 s load was not
+reproduced.
+- **File searches:** the game's wildcard search (FindFirst/FindNext over its pack files,
+  `bl_fs_FindMatch`) walked each pack's whole tree for every call: 86,000 calls and 188
+  million steps for a start and one load, one 1.06 s frame in the load. Each tree now gets a
+  name-sorted index once, and each pattern its matches once per tree; a call is a binary
+  search. The index is made again if the tree's header changes. Checked against the old walk
+  on all 86,000 calls of a start and load: no differences. That frame is now 0.36 s.
+- **zlib:** MaterialSystem's texture unpacking (`inflate`) and the engine's `compress2` and
+  `uncompress` ran as translated x86. The eight exports the game calls now go to macOS's zlib
+  (`runtime/bl_zlib.c`, `modules/zlib1`). A guest stream's `state` holds a slot number for
+  its native stream; buffers and counters are copied across each call. A frame dumped at
+  the same point with the old and new zlib shows the same textures.
+- **Result:** the menu load 5.8 s to 4.6 s headless.
+- **What's left:** the game's own translated code, spread thin (the loading screen's
+  frames are about 19 ms of game work each, about 210 of them for this map). The clock
+  (`QueryPerformanceCounter`, called millions of times) is about 6% of it. First visits to a
+  map also compile shaders macOS hasn't cached yet (up to about 2.5 s, once).
+- **Not verified:** a load in a window after these changes; other maps' loads.

@@ -22,10 +22,26 @@ for m in $(grep -v '^#' "$HERE/modules/modules.txt"); do
         exit 1
     fi
 done
+# FSR 4 (third_party/fsr4metal, kept out of git: FSR4Metal's code is GPL and its model AMD's)
+# goes into the game only, never the runtime library, and its model to build/fsr4_assets.
+# Without it the game is linked with its functions null (-U, weak in metal_render.m).
+FSR4="$HERE/third_party/fsr4metal"
+FSR4_U="-Wl,-U,_fsr4mtl_create -Wl,-U,_fsr4mtl_encode -Wl,-U,_fsr4mtl_error -Wl,-U,_fsr4mtl_describe"
+if [ -f "$FSR4/src/FSR4Metal.mm" ]; then
+    mkdir -p fsr4
+    if [ ! -f fsr4/FSR4Metal.o ] || [ "$FSR4/src/FSR4Metal.mm" -nt fsr4/FSR4Metal.o ]; then
+        clang++ -std=c++20 -O2 -arch arm64 -mmacosx-version-min=26.0 -fobjc-arc -w -I"$FSR4/include" \
+            -c "$FSR4/src/FSR4Metal.mm" -o fsr4/FSR4Metal.o
+    fi
+    rsync -a --delete "$FSR4/assets/" fsr4_assets/
+    objs="$objs fsr4/FSR4Metal.o -lc++"
+else
+    echo "link_boot: no third_party/fsr4metal, so the game has no FSR 4" >&2
+fi
 rm -f tests/boot
 # shellcheck disable=SC2086
 clang -std=c2x -g -O2 -arch arm64 -mmacosx-version-min=26.0 -Wall -I../runtime -I runtime \
-    ../tests/boot.c $objs -Wl,-export_dynamic -Wl,-force_load,runtime/libbl_runtime.a -Wl,-alias_list,tests/aliases.txt \
-    -framework Metal -framework MetalFX -framework QuartzCore -framework AppKit -framework CoreGraphics -framework CoreText -framework AudioToolbox -framework GameController -framework ImageIO -framework AVFoundation -framework CoreMedia -framework CoreVideo -o tests/boot 2>&1 | grep -v xcrun_db || true
+    ../tests/boot.c $objs $FSR4_U -Wl,-export_dynamic -Wl,-force_load,runtime/libbl_runtime.a -Wl,-alias_list,tests/aliases.txt \
+    -framework Metal -framework MetalFX -framework QuartzCore -framework AppKit -framework CoreGraphics -framework CoreText -framework AudioToolbox -framework GameController -framework ImageIO -framework AVFoundation -framework CoreMedia -framework CoreVideo -lcompression -lz -o tests/boot 2>&1 | grep -v xcrun_db || true
 test -x tests/boot
 echo "built: $HERE/build/tests/boot"

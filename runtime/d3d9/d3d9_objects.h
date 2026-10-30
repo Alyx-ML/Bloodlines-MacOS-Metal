@@ -41,6 +41,7 @@ struct obj {
     uint32_t input_kind, input_state_size;  // DirectInput devices (dinput8.c)
     void *gpu;                 // renderer's texture or buffer (metal_render.m)
     int gpu_scale;             // gpu is this many times the size (the shadow atlas; 0 = 1)
+    int blank;                 // render targets: gpu not written yet; the first pass on it clears it to 0
     void *hires;               // upscaled texture drawn in place of gpu (tex_hires.h), or NULL
     float gloss;               // textures: how much its material reflects (metal_render.m material_gloss)
     void *pbr;                 // textures: its PBRify normal and roughness map (metal_render.m pbr_map), or NULL
@@ -56,6 +57,7 @@ struct obj {
     int rewrites;              // static vertex buffers: times rewritten after first use
     int used;                  // textures: bound for a draw since the last upload
     int prefetched;            // textures: their upscale and maps asked for ahead (d3d_image_changed)
+    uint32_t fills;            // textures: times the game changed the top level (d3d_image_changed)
     uint64_t serial;           // never reused, unlike the address once freed: what the renderer's
                                // caches remember objects by
 };

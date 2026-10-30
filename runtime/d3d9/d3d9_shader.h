@@ -75,10 +75,12 @@ struct d3d_shader_variant {
     // reads become bl_lightmap, a smooth (Catmull-Rom) read kept inside the
     // surface's rectangle of the page, which [[texture(13)]] holds for each of its texels.
     uint8_t lightmap;
-    // Pixel, with lightmap: the lighting rebake's page at [[texture(16)]], 4 times the
-    // size of the game's, and the old light it replaces at [[texture(17)]], the game's size.
-    // Where texture(13) marks a texel's rectangle as rebaked (0x8000 added to x0), the
-    // game's page is read changed by the difference (in the rectangle 4 times as large).
+    // Pixel, with lightmap: the lighting rebake (1; 2 with HDR, past white). Its light at
+    // [[texture(16)]] (linear, the bake's scale times the page's size), the map's own steady
+    // light as the game has it at [[texture(17)]] (linear, the page's size), and the bake's
+    // shares of the three bump directions at [[texture(21)]] (1x1: none). Where texture(13)
+    // marks a texel's rectangle as rebaked (0x8000 added to x0), the page is read as the new
+    // light plus what the game adds to the page as it runs.
     uint8_t rebake;
     // Pixel: also write [[color(2)]] for the bounced light (metal_render.m ssil_run): the
     // surface's own colour, the first 2D texture it reads that is not a lightmap or
@@ -192,6 +194,11 @@ struct d3d_ps_params {
     float grain;              // variant surface: how much fine grain from the colour texture itself,
                               // read 4 times smaller, sharpens it where it is stretched past
                               // the screen's pixels (cliffs: metal_render.m material_rock; 0 none)
+    float graze;              // variant surface: 1 for the ground (roads, pavements), whose parallax
+                              // holds up looking along it, 0 the rest (ps_pom)
+    float pom_max;            // variant surface: with graze, the most its parallax goes deep, in
+                              // world units
+    float pad[2];             // to the MSL struct's 16-byte size
 };
 
 // Fixed-function pixel stages (draws with no pixel shader): the texture stage states

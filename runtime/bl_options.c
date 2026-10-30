@@ -87,21 +87,21 @@ enum { P_GET_NAME = 0x48, P_IS_VISIBLE = 0x58, P_SCREEN_TO_LOCAL = 0x6c, P_PAINT
        TI_GET_TEXT = 0x70, LIST_CELL_BOUNDS = 0x224, COMBO_ACTIVATE_ROW = 0x2d4, MENU_IS_VISIBLE = 0x58 };
 
 // The mockup, in its pixels: the title (40-pixel Cinzel) at 160, 92, its divider at 171;
-// the tabs (19-pixel) from 160, 206, 46 apart; the page from 300 to 200 from the bottom;
-// Cancel and OK (21-pixel, 64 apart) 160 from the right and 96 from the bottom.
-enum { LEFT = 160, TITLE_Y = 92, TITLE_EM = 40, RULE_Y = 171, TABS_Y = 206, TAB_EM = 19, TAB_GAP = 46,
-       TAB_PAD = 14, PAGE_Y = 300, PAGE_FOOT = 40, BTN_EM = 21, BTN_GAP = 64, BTN_PAD = 10,
+// the tabs (21-pixel) from 160, 206, 46 apart; the page from 300 to 200 from the bottom;
+// Cancel and OK (23-pixel, 64 apart) 160 from the right and 96 from the bottom.
+enum { LEFT = 160, TITLE_Y = 92, TITLE_EM = 40, RULE_Y = 171, TABS_Y = 206, TAB_EM = 21, TAB_GAP = 46,
+       TAB_PAD = 14, PAGE_Y = 300, PAGE_FOOT = 40, BTN_EM = 23, BTN_GAP = 64, BTN_PAD = 10,
        BTN_BOTTOM = 96, FOOT = 160 };
-// A setting: its 15-pixel label, 16 under it the control (30-pixel Cormorant); 54 between
+// A setting: its 17-pixel label, 16 under it the control (33-pixel Cormorant); 54 between
 // settings; two columns 640 wide and 160 apart, or three 80 apart.
-enum { SET_LABEL_EM = 15, SET_GAP = 16, SET_TALL = 76, SET_SPACE = 54, COL_W = 640, COL_GAP = 160,
-       COL3_GAP = 80, VALUE_EM = 30, ARROW_EM = 22, COMBO_W = 320, SLIDER_W = 600, PAGE_BTN_EM = 19 };
+enum { SET_LABEL_EM = 17, SET_GAP = 16, SET_TALL = 76, SET_SPACE = 54, COL_W = 640, COL_GAP = 160,
+       COL3_GAP = 80, VALUE_EM = 33, ARROW_EM = 22, COMBO_W = 320, SLIDER_W = 600, PAGE_BTN_EM = 21 };
 // The rows: 960 wide, up to 56 tall (a heading's slot up to 60), less when they don't all
 // fit down to 40 from the bottom of the sheet; the label 22 in, the control in the last 380
-// (a slider's value in its last 70), its value 26-pixel. The description 120 right of them,
-// its title 22-pixel.
+// (a slider's value in its last 70), its value 29-pixel. The description 120 right of them,
+// its title 24-pixel.
 enum { ROW_W = 960, ROW_H = 56, ROW_MIN = 38, ROW_TIGHT = 30, ROW_HEAD = 60, ROW_PAD = 22, CTRL_W = 380, NUM_W = 70,
-       ROW_VALUE_EM = 26, DESC_GAP = 120, DESC_EM = 22 };
+       ROW_VALUE_EM = 29, DESC_GAP = 120, DESC_EM = 24 };
 
 static const int IVORY[3] = { 236, 226, 207 }, GOLD[3] = { 176, 143, 88 }, GOLD_HI[3] = { 230, 201, 143 },
                  BLOOD_HI[3] = { 224, 40, 58 }, MUTED[3] = { 166, 153, 132 };
@@ -540,17 +540,28 @@ static const char *const descriptions[][2] = {
     { "Ambient Occlusion", "Soft shade in corners, in creases and where objects meet the ground." },
     { "Volumetric Light", "Haze in the light of lamps and windows, with beams where walls, pillars and "
                           "railings cut it." },
+    { "Night Mist", "A low amber mist outdoors that drifts in banks along the streets and fades the "
+                    "distance, leaving what is near clear." },
     { "HDR", "Brighter lights and richer colour on a screen that shows high dynamic range." },
     { "Bloom", "A soft glow around bright lights." },
     { "Eye Adaptation", "The picture brightens in dark places and dims in bright ones, the way eyes "
                         "adjust." },
     { "Sharpening", "Sharpens the picture after its edges are smoothed." },
+    { "Metal HUD", "Apple's performance overlay in the corner of the screen: frames a second, how "
+                   "long each frame takes and how much memory the game uses. Shows from the next "
+                   "time the game starts." },
+    { "Frame Generation", "A picture made between each two of the game's, so a 120 Hz screen shows 120 "
+                          "frames a second while the game runs at its usual 60. Moving fast, small things "
+                          "can smear a little, and what you do shows about a hundredth of a second later." },
     { "Reflections", "Shiny floors, glass and puddles reflect what is around them." },
     { "Skin Scattering", "Light passing softly into skin, so faces look less waxy." },
     { "Smooth Characters", "Rounder characters, without the corners of their original shapes." },
     { "Skin Detail", "Fine pores and creases on faces and hands." },
     { "Rain Effects", "Where it rains, streets and pavements turn dark and shiny, with puddles that "
                      "reflect the lights and ripple in the rain. Grass, dirt and sand stay as they are." },
+    { "Full-Size Textures", "The sharper, upscaled walls, floors and objects at their full size. Off, they "
+                            "load a size smaller and take a quarter of the memory: for Macs with 8 GB. "
+                            "Shows from the next area loaded." },
     { "Lens Glare", "Bright lamps streak and glow at night, as through a camera's lens." },
     { "Depth of Field", "The picture focuses on what you look at, as a camera's lens does: what is near "
                         "stays sharp and the distance goes soft. In conversations the one you talk to "
@@ -718,7 +729,7 @@ static void layout_page(void *cpu, uint32_t s, uint32_t pg)
             char t[256], lines[6][160];
             int w = pw < px(rows ? ROW_W : 1200) ? pw : px(rows ? ROW_W : 1200);
             label_text(cpu, it[i].p, t, sizeof t);
-            int k = wrap(cpu, s, body_font(cpu, s, 24 * unit()), t, w, lines, 6);
+            int k = wrap(cpu, s, body_font(cpu, s, 27 * unit()), t, w, lines, 6);
             int h = k * body_tall(24 * unit());
             set_bounds(cpu, it[i].p, 0, top, w, h > 0 ? h : 1);
             top += h + px(36);
@@ -846,7 +857,7 @@ static void paint_dialog(void *cpu, uint32_t s)
         gothic_line(cpu, s, desc_x, desc_x + desc_w, ly, gold_fade, 3, 0.8);
         const char *d = description(desc_name);
         if (d) {
-            uint32_t bf = body_font(cpu, s, 26 * unit());
+            uint32_t bf = body_font(cpu, s, 29 * unit());
             int n = wrap(cpu, s, bf, d, desc_w, lines, 8);
             for (int i = 0; i < n; i++)
                 text3(cpu, s, bf, lines[i], desc_x, ly + px(22) + i * body_tall(26 * unit()), 0, MUTED, 1);

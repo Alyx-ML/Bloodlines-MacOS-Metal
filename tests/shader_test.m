@@ -2,7 +2,8 @@
 // writes them) to MSL and compiles each with Metal, in the default variant and the
 // variants the renderer can ask for: every sampler cube or volume, ps_1_x texcoords
 // projected, vertex inputs integer, sampler 0 reading a lightmap page (smooth, and from the
-// lighting rebake's page). Needs GPU access.
+// lighting rebake's page) with the surfaces' colour and lightmap light written too. Needs
+// GPU access.
 //   shader_test <dir> [-v]     -v prints the MSL of failures
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -58,8 +59,9 @@ int main(int argc, char **argv)
         for (int i = 0; i < D3D_SHADER_MAX_INPUTS; i++) vars[1].input_kind[i] = D3D_IN_UINT, vars[2].input_kind[i] = D3D_IN_SINT;
         vars[5].reflection_info = vars[5].albedo = vars[5].surface = 1;
         vars[6].lightmap = vars[7].lightmap = 1, vars[7].rebake = 1;
+        vars[6].albedo = vars[7].albedo = 3, vars[6].surface = 1, vars[6].base = vars[5].base = 1;
         static const char *const names[] = {"default", "cube/uint", "volume/sint", "projected3", "projected4",
-                                            "info/albedo/surface", "lightmap", "lightmap/rebake"};
+                                            "info/albedo/surface/base", "lightmap/albedo/surface/base", "lightmap/rebake/albedo"};
         for (int k = 0; k < 8; k++) {
             char *msl = d3d_shader_msl(code, k ? &vars[k] : NULL, err, sizeof err);
             if (!msl) {

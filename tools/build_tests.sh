@@ -18,16 +18,18 @@ CC="clang -std=c2x -O2 -arch arm64 -mmacosx-version-min=26.0 -Wall -fobjc-arc -I
 R=../runtime
 # The map hooks bl_bsp.c calls when they are linked in (weak; the game has them, the tools not).
 HOOKS="-Wl,-U,_bl_compass_note_map -Wl,-U,_bl_shadow_note_map"
+# FSR 4's functions, built into the game only (link_boot.sh): null here.
+FSR4_U="-Wl,-U,_fsr4mtl_create -Wl,-U,_fsr4mtl_encode -Wl,-U,_fsr4mtl_error -Wl,-U,_fsr4mtl_describe"
 # shellcheck disable=SC2086
-$CC ../tests/shader_test.m runtime/libbl_runtime.a -framework Metal -framework Foundation -o tests/shader_test
+$CC ../tests/shader_test.m runtime/libbl_runtime.a $FSR4_U -framework Metal -framework Foundation -lcompression -o tests/shader_test
 # shellcheck disable=SC2086
 $CC ../tests/bsp_check.c $R/bl_bsp.c $R/bl_props.c $HOOKS -o tests/bsp_check
 # shellcheck disable=SC2086
-$CC ../tests/bake_view.m $R/d3d9/lm_bake.m $R/d3d9/mtl4.m $R/bl_bsp.c $R/bl_props.c $HOOKS -framework Metal -framework Foundation \
+$CC ../tests/bake_view.m $R/d3d9/lm_bake.m $R/d3d9/mtl4.m $R/bl_bsp.c $R/bl_props.c $HOOKS -framework Metal -framework Foundation -lcompression \
     -framework CoreGraphics -framework ImageIO -o tests/bake_view
 # shellcheck disable=SC2086
 $CC ../tests/gi_view.m $R/d3d9/gi_probes.m $R/d3d9/lm_bake.m $R/d3d9/mtl4.m $R/bl_bsp.c $R/bl_props.c $HOOKS -framework Metal \
-    -framework Foundation -o tests/gi_view
+    -framework Foundation -lcompression -o tests/gi_view
 echo "built: shader_test bsp_check bake_view gi_view in $HERE/build/tests"
 
 objs=""
@@ -44,11 +46,11 @@ for m in $(grep -v '^#' "$HERE/modules/modules.txt"); do
 done
 for t in zlib_pilot fs_smoke; do
     # shellcheck disable=SC2086
-    clang -std=c2x -g -O2 -arch arm64 -mmacosx-version-min=26.0 -Wall -I../runtime -I runtime ../tests/$t.c $objs \
+    clang -std=c2x -g -O2 -arch arm64 -mmacosx-version-min=26.0 -Wall -I../runtime -I runtime ../tests/$t.c $objs $FSR4_U \
         -Wl,-export_dynamic -Wl,-force_load,runtime/libbl_runtime.a -Wl,-alias_list,tests/pilot_aliases.txt \
         -framework Metal -framework MetalFX -framework QuartzCore -framework AppKit -framework CoreGraphics \
         -framework CoreText -framework AudioToolbox -framework GameController -framework ImageIO \
-        -framework AVFoundation -framework CoreMedia -framework CoreVideo -o tests/$t 2>&1 | grep -v xcrun_db || true
+        -framework AVFoundation -framework CoreMedia -framework CoreVideo -lcompression -lz -o tests/$t 2>&1 | grep -v xcrun_db || true
     test -x tests/$t
 done
 echo "built: zlib_pilot fs_smoke in $HERE/build/tests"

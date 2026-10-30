@@ -43,6 +43,65 @@ static void free_map(struct map *m)
     free(m);
 }
 
+// A key's value in one entity's text ("key" "value" pairs), or 0.
+static int ent_value(const char *e, const char *key, char *out, size_t outlen)
+{
+    size_t kl = strlen(key);
+    for (const char *q = strchr(e, '"'); q; q = strchr(q + 1, '"')) {
+        if (strncasecmp(q + 1, key, kl) || q[1 + kl] != '"') continue;
+        const char *v = strchr(q + 2 + kl, '"'), *w = v ? strchr(v + 1, '"') : NULL;
+        if (!w || (size_t)(w - v - 1) >= outlen) return 0;
+        memcpy(out, v + 1, (size_t)(w - v - 1)), out[w - v - 1] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+// The map's lamps carry a glow sprite (env_sprite, a glow material) at the bulb, but the
+// mapper put the light itself a little off it: the pier lamps' 10 units out along the
+// arm, others' 20. A light whose nearest glow sprite is within 24 units moves onto it,
+// so the haze and glints start at the bulb.
+static void snap_to_glows(struct map *m, const uint8_t *ents, int len)
+{
+    char *t = malloc((size_t)len + 1);
+    if (!t) return;
+    memcpy(t, ents, (size_t)len), t[len] = 0;
+    float (*g)[3] = NULL;
+    int ng = 0, cap = 0;
+    for (char *b = strchr(t, '{'); b; b = strchr(b + 1, '{')) {
+        char *end = strchr(b, '}');
+        if (!end) break;
+        *end = 0;
+        char cls[64], model[256], org[96];
+        float o[3];
+        if (ent_value(b, "classname", cls, sizeof cls) && !strcasecmp(cls, "env_sprite") &&
+            ent_value(b, "model", model, sizeof model) && strcasestr(model, "glow") &&
+            ent_value(b, "origin", org, sizeof org) && sscanf(org, "%f %f %f", &o[0], &o[1], &o[2]) == 3) {
+            if (ng == cap) {
+                cap = cap ? 2 * cap : 64;
+                float (*n)[3] = realloc(g, (size_t)cap * sizeof *g);
+                if (!n) break;
+                g = n;
+            }
+            memcpy(g[ng++], o, sizeof o);
+        }
+        *end = '}';
+        b = end;
+    }
+    int moved = 0;
+    for (int i = 0; i < m->nlights; i++) {
+        float *p = m->lights[i].pos, best = 24.0f * 24.0f;
+        int at = -1;
+        for (int j = 0; j < ng; j++) {
+            float dx = g[j][0] - p[0], dy = g[j][1] - p[1], dz = g[j][2] - p[2], d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 < best) best = d2, at = j;
+        }
+        if (at >= 0 && best > 1.0f) memcpy(p, g[at], sizeof g[at]), moved++;
+    }
+    if (moved) fprintf(stderr, "[bsp] %d lights moved onto their lamp's glow\n", moved);
+    free(g), free(t);
+}
+
 static struct map *load(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -88,8 +147,8 @@ static struct map *load(const char *path)
     }
     // dworldlight_t, 88 bytes: origin, intensity, normal, cluster, type, style, stopdot,
     // stopdot2, exponent, radius, constant, linear and quadratic attenuation, flags,
-    // texinfo, owner. Types 1 (point) and 2 (spot) only: 0 is a glowing surface, 3 and 5
-    // the sky.
+    // texinfo, owner. Types 1 (point) and 2 (spot) as the lights; 0 (a glowing surface)
+    // and 3 and 5 (the sky) not.
     int n = len[15] / 88;
     m->lights = calloc((size_t)n + 1, sizeof *m->lights);
     m->light_cluster = calloc((size_t)n + 1, sizeof *m->light_cluster);
@@ -107,9 +166,10 @@ static struct map *load(const char *path)
         if (l->color[0] <= 0 && l->color[1] <= 0 && l->color[2] <= 0) continue;
         m->light_cluster[m->nlights++] = rd32(p + 36);
     }
+    snap_to_glows(m, lump[0], len[0]);
     free(d);
-    fprintf(stderr, "[bsp] %s: %d lights, %d clusters\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path, m->nlights,
-            m->nclusters);
+    fprintf(stderr, "[bsp] %s: %d lights, %d clusters\n",
+            strrchr(path, '/') ? strrchr(path, '/') + 1 : path, m->nlights, m->nclusters);
     return m;
 }
 

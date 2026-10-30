@@ -5,6 +5,7 @@
 // so only the aspect has to agree. BL_TEX_DIR names the folder (default:
 // native/build/textures/characters, beside the boot binary's build folder).
 #import "tex_detail.h"
+#import "map_levels.h"
 #include "char_remodel.h"
 #import <ImageIO/ImageIO.h>
 #include <mach-o/dyld.h>
@@ -106,78 +107,6 @@ static int signature(uint32_t w, uint32_t h, uint32_t format, const uint8_t *dat
     return 1;
 }
 
-// A box blur of n floats `stride` apart, radius r, in place (edges clamped).
-static void box(float *v, size_t n, size_t stride, int r, float *tmp)
-{
-    for (size_t i = 0; i < n; i++) tmp[i] = v[i * stride];
-    double sum = 0;
-    for (int k = -r; k <= r; k++) sum += tmp[k < 0 ? 0 : (size_t)k >= n ? n - 1 : (size_t)k];
-    for (size_t i = 0; i < n; i++) {
-        v[i * stride] = (float)(sum / (2 * r + 1));
-        long out = (long)i - r, in = (long)i + r + 1;
-        sum += tmp[in >= (long)n ? n - 1 : (size_t)in] - tmp[out < 0 ? 0 : (size_t)out];
-    }
-}
-
-// Keeps only the map's middle detail (creases, pores): its broad slopes, guessed from the
-// shading painted into the texture, are the model's shape, which the mesh already has,
-// and laid on the mesh's flat triangles they show them; its finest grain (the model
-// learnt from stone and brick) makes skin and cloth look like concrete. Half strength.
-static void high_pass(uint8_t *px, size_t w, size_t h)
-{
-    int r = (int)(w > h ? w : h) / 128;
-    if (r < 2) r = 2;
-    int fine = (int)(w > h ? w : h) / 512;
-    if (fine < 1) fine = 1;
-    float *xy[2], *sharp[2], *tmp = malloc(sizeof(float) * (w > h ? w : h));
-    for (int c = 0; c < 2; c++) {
-        float *b = xy[c] = malloc(sizeof(float) * w * h), *f = sharp[c] = malloc(sizeof(float) * w * h);
-        for (size_t i = 0; i < w * h; i++) b[i] = px[i * 4 + c] / 127.5f - 1;
-        memcpy(f, b, sizeof(float) * w * h);
-        for (size_t y = 0; y < h; y++) box(f + y * w, w, 1, fine, tmp);
-        for (size_t x = 0; x < w; x++) box(f + x, h, w, fine, tmp);
-        for (int pass = 0; pass < 2; pass++) {
-            for (size_t y = 0; y < h; y++) box(b + y * w, w, 1, r, tmp);
-            for (size_t x = 0; x < w; x++) box(b + x, h, w, r, tmp);
-        }
-    }
-    for (size_t i = 0; i < w * h; i++) {
-        float x = (sharp[0][i] - xy[0][i]) * 0.5f, y = (sharp[1][i] - xy[1][i]) * 0.5f;
-        float l = x * x + y * y;
-        if (l > 0.9f) x *= sqrtf(0.9f / l), y *= sqrtf(0.9f / l), l = 0.9f;
-        float z = sqrtf(1 - l);
-        px[i * 4] = (uint8_t)lrintf(x * 127.5f + 127.5f);
-        px[i * 4 + 1] = (uint8_t)lrintf(y * 127.5f + 127.5f);
-        px[i * 4 + 2] = (uint8_t)lrintf(z * 127.5f + 127.5f);
-    }
-    free(xy[0]), free(xy[1]), free(sharp[0]), free(sharp[1]), free(tmp);
-}
-
-// The roughness map beside the normal map (<name>_r.png for <name>_n.png) into px's alpha,
-// w x h; 0.6 (between skin and cloth) without one.
-static void load_rough(const char *path, uint8_t *px, size_t w, size_t h)
-{
-    for (size_t i = 0; i < w * h; i++) px[i * 4 + 3] = 153;
-    char rp[1600];
-    snprintf(rp, sizeof rp, "%s", path);
-    char *u = strstr(rp, "_n.png");
-    if (!u) return;
-    memcpy(u, "_r", 2);
-    NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:rp]];
-    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
-    if (!src) return;
-    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
-    CFRelease(src);
-    if (!img) return;
-    uint8_t *g = calloc(w * h, 1);
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
-    CGContextRef cg = CGBitmapContextCreate(g, w, h, 8, w, cs, (CGBitmapInfo)kCGImageAlphaNone);
-    CGContextSetInterpolationQuality(cg, kCGInterpolationHigh);
-    CGContextDrawImage(cg, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
-    CGContextRelease(cg), CGColorSpaceRelease(cs), CGImageRelease(img);
-    for (size_t i = 0; i < w * h; i++) px[i * 4 + 3] = g[i];
-    free(g);
-}
 
 static id<MTLTexture> load_map_at(id<MTLDevice> dev, const char *path);
 static void make_skin_mask(id<MTLDevice> dev, const char *rel);
@@ -189,112 +118,79 @@ static id<MTLTexture> load_map(id<MTLDevice> dev, const char *rel)
     return load_map_at(dev, path);
 }
 
-id<MTLTexture> bl_load_normal_map(id<MTLDevice> dev, const char *path) { return load_map_at(dev, path); }
-
-id<MTLTexture> bl_load_height_map(id<MTLDevice> dev, const char *path)
+// The surfaces' PBRify maps as tools/tex_bake_maps.m stores them, beside the PNGs the
+// renderer lists (<name>_n.png's in <name>_n.tex, BC7; <name>_h.png's in <name>_h.tex,
+// R8): "BLPM", then the pixel format (98 BC7, 61 R8), width, height and mipmap count as
+// 32-bit numbers, then each mipmap in turn. Nil, said once, for a map not baked.
+static id<MTLTexture> load_baked(id<MTLDevice> dev, const char *png)
 {
-    NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
-    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
-    if (!src) return nil;
-    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
-    CFRelease(src);
-    if (!img) return nil;
-    size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
-    uint8_t *g = calloc(w * h, 1);
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
-    CGContextRef cg = CGBitmapContextCreate(g, w, h, 8, w, cs, (CGBitmapInfo)kCGImageAlphaNone);
-    CGContextDrawImage(cg, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
-    CGContextRelease(cg), CGColorSpaceRelease(cs), CGImageRelease(img);
-    // The model's heights keep to a narrow band of greys: stretched, every material gets
-    // the whole depth.
-    size_t hist[256] = {0}, n = w * h, lo = 0, hi = 255, acc = 0;
-    for (size_t i = 0; i < n; i++) hist[g[i]]++;
-    for (lo = 0, acc = 0; lo < 255 && (acc += hist[lo]) < n / 100; lo++) {}
-    for (hi = 255, acc = 0; hi > 0 && (acc += hist[hi]) < n / 100; hi--) {}
-    if (hi > lo)
-        for (size_t i = 0; i < n; i++) {
-            int v = ((int)g[i] - (int)lo) * 255 / (int)(hi - lo);
-            g[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
-        }
-    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
-                                                                                    width:w height:h mipmapped:YES];
+    char path[1600];
+    size_t n = strlen(png);
+    if (n < 4 || n >= sizeof path) return nil;
+    memcpy(path, png, n - 4);
+    strcpy(path + n - 4, ".tex");
+    FILE *f = fopen(path, "rb");
+    uint32_t hd[5];
+    if (!f || fread(hd, 4, 5, f) != 5 || memcmp(hd, "BLPM", 4) || (hd[1] != 98 && hd[1] != 61) || !hd[2] || !hd[3] ||
+        !hd[4] || hd[4] > 16) {
+        if (f) fclose(f);
+        static NSMutableSet<NSString *> *said;
+        static os_unfair_lock said_lock = OS_UNFAIR_LOCK_INIT;
+        os_unfair_lock_lock(&said_lock);
+        if (!said) said = [NSMutableSet set];
+        int first = ![said containsObject:@(path)];
+        [said addObject:@(path)];
+        os_unfair_lock_unlock(&said_lock);
+        if (first) fprintf(stderr, "[pbr] %s: not baked (tools/tex_bake_maps.sh)\n", path);
+        return nil;
+    }
+    int bc7 = hd[1] == 98;
+    uint32_t w = hd[2], h = hd[3], mips = hd[4];
+    MTLTextureDescriptor *td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:bc7 ? MTLPixelFormatBC7_RGBAUnorm : MTLPixelFormatR8Unorm
+                                                           width:w
+                                                          height:h
+                                                       mipmapped:mips > 1];
+    td.mipmapLevelCount = mips;
     td.usage = MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [dev newTextureWithDescriptor:td];
-    size_t pw = w, ph = h;
-    for (NSUInteger level = 0;; level++) {
-        [t replaceRegion:MTLRegionMake2D(0, 0, pw, ph) mipmapLevel:level withBytes:g bytesPerRow:pw];
-        if (level + 1 >= t.mipmapLevelCount) break;
-        size_t lw = pw > 1 ? pw / 2 : 1, lh = ph > 1 ? ph / 2 : 1;
-        for (size_t y = 0; y < lh; y++)
-            for (size_t x = 0; x < lw; x++) {
-                unsigned v = 0;
-                for (int j = 0; j < 4; j++) {
-                    size_t sx = x * 2 + (j & 1), sy = y * 2 + (j >> 1);
-                    v += g[(sy < ph ? sy : ph - 1) * pw + (sx < pw ? sx : pw - 1)];
-                }
-                g[y * lw + x] = (uint8_t)((v + 2) / 4);  // in place: row y reads rows 2y, 2y+1
-            }
-        pw = lw, ph = lh;
+    uint8_t *buf = NULL;
+    for (uint32_t l = 0; t && l < mips; l++) {
+        uint32_t lw = w >> l ? w >> l : 1, lh = h >> l ? h >> l : 1;
+        size_t row = bc7 ? (lw + 3) / 4 * 16 : lw, rows = bc7 ? (lh + 3) / 4 : lh;
+        buf = realloc(buf, row * rows);
+        if (fread(buf, 1, row * rows, f) != row * rows) {
+            fprintf(stderr, "[pbr] %s is cut short\n", path);
+            t = nil;
+            break;
+        }
+        [t replaceRegion:MTLRegionMake2D(0, 0, lw, lh) mipmapLevel:l withBytes:buf bytesPerRow:row];
     }
-    free(g);
+    free(buf);
+    fclose(f);
     return t;
 }
 
+id<MTLTexture> bl_load_normal_map(id<MTLDevice> dev, const char *path) { return load_baked(dev, path); }
+
+id<MTLTexture> bl_load_height_map(id<MTLDevice> dev, const char *path) { return load_baked(dev, path); }
+
+// A character's normal map (map_levels.h), RGBA8 with its mipmaps.
 static id<MTLTexture> load_map_at(id<MTLDevice> dev, const char *path)
 {
-    NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
-    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
-    if (!src) return nil;
-    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
-    CFRelease(src);
-    if (!img) return nil;
-    size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
-    uint8_t *px = calloc(w * h, 4);
-    // Raw values: no colour management (the map holds directions, not colours).
-    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceLinearSRGB);
-    CGContextRef cg = CGBitmapContextCreate(px, w, h, 8, w * 4, cs, kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big);
-    CGContextSetBlendMode(cg, kCGBlendModeCopy);
-    CGContextDrawImage(cg, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
-    CGContextRelease(cg), CGColorSpaceRelease(cs), CGImageRelease(img);
-    high_pass(px, w, h);
-    load_rough(path, px, w, h);
+    struct bl_map_levels m;
+    if (!bl_normal_map_levels(path, &m)) return nil;
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                                    width:w height:h mipmapped:YES];
+                                                                                    width:m.w height:m.h mipmapped:YES];
     td.usage = MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [dev newTextureWithDescriptor:td];
-    [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px bytesPerRow:w * 4];
-    free(px);
-    // Smaller levels by box filter on the CPU, renormalised as directions.
-    uint8_t *prev = NULL;
-    size_t pw = w, ph = h;
-    for (NSUInteger level = 1; level < t.mipmapLevelCount; level++) {
-        size_t lw = pw > 1 ? pw / 2 : 1, lh = ph > 1 ? ph / 2 : 1;
-        if (!prev) {
-            prev = malloc(pw * ph * 4);
-            [t getBytes:prev bytesPerRow:pw * 4 fromRegion:MTLRegionMake2D(0, 0, pw, ph) mipmapLevel:0];
-        }
-        uint8_t *cur = malloc(lw * lh * 4);
-        for (size_t y = 0; y < lh; y++)
-            for (size_t x = 0; x < lw; x++) {
-                float v[3] = {0, 0, 0}, rough = 0;
-                for (int j = 0; j < 4; j++) {
-                    size_t sx = x * 2 + (j & 1), sy = y * 2 + (j >> 1);
-                    if (sx >= pw) sx = pw - 1;
-                    if (sy >= ph) sy = ph - 1;
-                    for (int k = 0; k < 3; k++) v[k] += prev[(sy * pw + sx) * 4 + k] / 127.5f - 1;
-                    rough += prev[(sy * pw + sx) * 4 + 3];
-                }
-                float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-                for (int k = 0; k < 3; k++) cur[(y * lw + x) * 4 + k] = (uint8_t)lrintf(fminf(fmaxf((l > 0 ? v[k] / l : 0) * 127.5f + 127.5f, 0), 255));
-                cur[(y * lw + x) * 4 + 3] = (uint8_t)lrintf(rough / 4);
-            }
-        [t replaceRegion:MTLRegionMake2D(0, 0, lw, lh) mipmapLevel:level withBytes:cur bytesPerRow:lw * 4];
-        free(prev);
-        prev = cur, pw = lw, ph = lh;
+    for (uint32_t l = 0; t && l < m.count && l < t.mipmapLevelCount; l++) {
+        uint32_t lw = m.w >> l ? m.w >> l : 1, lh = m.h >> l ? m.h >> l : 1;
+        [t replaceRegion:MTLRegionMake2D(0, 0, lw, lh) mipmapLevel:l withBytes:m.level[l] bytesPerRow:lw * 4];
     }
-    free(prev);
+    bl_map_levels_free(&m);
     return t;
 }
 
@@ -457,8 +353,8 @@ static void make_skin_mask(id<MTLDevice> dev, const char *rel)
     free(px);
     int r = (int)lrint(5.0 * (double)w / 1024.0 / (double)f);
     if (r < 1) r = 1;
-    for (size_t y = 0; y < mh; y++) box(m + y * mw, mw, 1, r, tmp);
-    for (size_t x = 0; x < mw; x++) box(m + x, mh, mw, r, tmp);
+    for (size_t y = 0; y < mh; y++) bl_map_box(m + y * mw, mw, 1, r, tmp);
+    for (size_t x = 0; x < mw; x++) bl_map_box(m + x, mh, mw, r, tmp);
     uint8_t *out = malloc(mw * mh);
     size_t skin = 0;
     for (size_t i = 0; i < mw * mh; i++) {
@@ -517,16 +413,16 @@ static void face_mask(id<MTLDevice> dev, const char *rel, const uint8_t *px, siz
     }
     int r = (int)lrint(3.0 * (double)mw / 512.0);
     if (r < 1) r = 1;
-    for (size_t y = 0; y < mh; y++) box(amt + y * mw, mw, 1, r, tmp);
-    for (size_t x = 0; x < mw; x++) box(amt + x, mh, mw, r, tmp);
+    for (size_t y = 0; y < mh; y++) bl_map_box(amt + y * mw, mw, 1, r, tmp);
+    for (size_t x = 0; x < mw; x++) bl_map_box(amt + x, mh, mw, r, tmp);
     for (size_t k = 0; k < n; k++) amt[k] = smooth01(0.3f, 0.7f, amt[k]), size[k] *= amt[k];
     // The size averaged over the skin alone (weighted by the pores' strength).
     int rs = (int)lrint(12.0 * (double)mw / 512.0);
     if (rs < 2) rs = 2;
     float *wt = lum;  // no longer needed
     memcpy(wt, amt, n * sizeof *wt);
-    for (size_t y = 0; y < mh; y++) box(size + y * mw, mw, 1, rs, tmp), box(wt + y * mw, mw, 1, rs, tmp);
-    for (size_t x = 0; x < mw; x++) box(size + x, mh, mw, rs, tmp), box(wt + x, mh, mw, rs, tmp);
+    for (size_t y = 0; y < mh; y++) bl_map_box(size + y * mw, mw, 1, rs, tmp), bl_map_box(wt + y * mw, mw, 1, rs, tmp);
+    for (size_t x = 0; x < mw; x++) bl_map_box(size + x, mh, mw, rs, tmp), bl_map_box(wt + x, mh, mw, rs, tmp);
     uint8_t *out = malloc(n * 2);
     size_t on = 0;
     for (size_t k = 0; k < n; k++) {
@@ -617,15 +513,23 @@ static int best_match(uint32_t w, uint32_t h, uint32_t format, const uint8_t *da
 static NSMutableDictionary<NSString *, NSArray *> *ready;
 static NSMutableSet<NSString *> *loading;
 static os_unfair_lock ready_lock = OS_UNFAIR_LOCK_INIT;
+// The prefetch's matches by texture serial: the fill matched, the entry (-1 none) and its
+// difference, until the texture is first drawn.
+static NSMutableDictionary<NSNumber *, NSArray<NSNumber *> *> *matched;
 
-void bl_detail_prefetch(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch)
+void bl_detail_prefetch(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch,
+                        uint64_t key, uint32_t fills)
 {
     if (!loaded) load_list();
     if (!nentries || !data) return;
-    if (!ready) ready = [NSMutableDictionary new], loading = [NSMutableSet new];
+    if (!ready) ready = [NSMutableDictionary new], loading = [NSMutableSet new], matched = [NSMutableDictionary new];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         float err;
         int best = best_match(w, h, format, data, pitch, &err);
+        os_unfair_lock_lock(&ready_lock);
+        if (matched.count > 16384) [matched removeAllObjects];  // textures never drawn
+        matched[@(key)] = @[@(fills), @(best), @(err)];
+        os_unfair_lock_unlock(&ready_lock);
         if (best < 0) return;
         NSString *path = @(entries[best].path);
         double now = CFAbsoluteTimeGetCurrent();
@@ -683,7 +587,7 @@ static NSArray *cache_find(uint64_t key, uint32_t stamp, uint32_t w, uint32_t h)
     return hit;
 }
 
-id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, uint64_t key, uint32_t stamp, uint32_t w, uint32_t h,
+id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, uint64_t key, uint32_t stamp, uint32_t fills, uint32_t w, uint32_t h,
                                 uint32_t format, const uint8_t *data, uint32_t pitch, id<MTLTexture> *color)
 {
     *color = nil;
@@ -698,7 +602,16 @@ id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, uint64_t key, uint32_t stamp,
     id<MTLTexture> result = nil;
     const char *name = NULL;
     float best_err;
-    int best = best_match(w, h, format, data, pitch, &best_err);
+    NSArray<NSNumber *> *pre = nil;
+    if (matched) {
+        os_unfair_lock_lock(&ready_lock);
+        pre = matched[@(key)];
+        if (pre) [matched removeObjectForKey:@(key)];
+        os_unfair_lock_unlock(&ready_lock);
+    }
+    // The prefetch's match only for the fill it matched: a level changed since is matched again.
+    int best = pre && pre[0].unsignedIntValue == fills ? (best_err = pre[2].floatValue, pre[1].intValue)
+                                                      : best_match(w, h, format, data, pitch, &best_err);
     if (best >= 0) {
         NSArray *r = take_ready(entries[best].path);
         result = r ? (r[0] == [NSNull null] ? nil : r[0]) : load_map(dev, entries[best].path);

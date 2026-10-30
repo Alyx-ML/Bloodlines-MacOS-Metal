@@ -25,6 +25,9 @@
 //     The weapon's ammo type is +0x7a4 (none 0 or less), its clip +0x7ac, the player's
 //     reserve of the type at player +0xfdc + 4 * type; the fade is the global 0x103EEF48 (0
 //     to 255). bl_hud_Health draws the noted ammo, since its panel covers the screen.
+// The globals read here (the player 0x104A0D50, the HUD's sprites 0x104CFE38 and the ammo
+// fade) are not at their original addresses: client_HudPlayer, client_HudSprites and
+// client_HudAmmoFade, in the same file, return where they are.
 // The vials are images drawn here in software, as the mockup's were, and put on the screen
 // by the renderer (bl_metal_hud_image); the ammo and the symbol go through vgui. The health
 // panel is moved to cover the screen, so the ammo isn't clipped to the game's place.
@@ -40,11 +43,11 @@
 #include "llasm_cpu.h"
 
 extern char client_Surface[], client_PanelSetPos[], client_PanelSetSize[], client_HudSprite[],
-    client_ImageDraw[];
+    client_ImageDraw[], client_HudPlayer[], client_HudSprites[], client_HudAmmoFade[];
 
 #define field gothic_field
 
-enum { PLAYER = 0x104a0d50, HUD_SPRITES = 0x104cfe38, AMMO_FADE = 0x103eef48, NO_DISCIPLINE = 0x1f };
+enum { NO_DISCIPLINE = 0x1f };
 // The player's fields read here end before this; a weapon's before WEAPON_SIZE.
 enum { PLAYER_SIZE = 0x14e4, WEAPON_SIZE = 0x7b0 };
 
@@ -67,11 +70,22 @@ static int ammo_shown, ammo_clip, ammo_reserve;
 static double ammo_fade;
 static uint64_t ammo_ns;
 
-// The player, or 0 while the global holds no object of the heap's: around level loads it
-// was seen holding garbage.
-static uint32_t player_now(void)
+// The globals' addresses in the module, asked for once.
+static uint32_t player_global, sprites_global, fade_global;
+
+static void find_globals(void *cpu)
 {
-    uint32_t p = field(PLAYER, 0);
+    if (player_global) return;
+    player_global = gothic_call(cpu, bl_h2g(client_HudPlayer), 0, 0, NULL);
+    sprites_global = gothic_call(cpu, bl_h2g(client_HudSprites), 0, 0, NULL);
+    fade_global = gothic_call(cpu, bl_h2g(client_HudAmmoFade), 0, 0, NULL);
+}
+
+// The player, or 0 while the global holds no object of the heap's.
+static uint32_t player_now(void *cpu)
+{
+    find_globals(cpu);
+    uint32_t p = field(player_global, 0);
     return p && !(p & 3) && bl_guest_heap_has(p, PLAYER_SIZE) ? p : 0;
 }
 
@@ -239,13 +253,13 @@ void bl_hud_Blood(_cpu *cpu)
 void bl_hud_Discipline(_cpu *cpu)
 {
     static uint32_t name;
-    uint32_t sa = eax, sc = ecx, sd = edx, panel = esi, player = player_now();
+    uint32_t sa = eax, sc = ecx, sd = edx, panel = esi, player = player_now(cpu);
     int id = player ? (int)field(player, 0x14d8) : -1;
     double a = fmin(gothic_ffield(panel, 0x198) / 255.0, 1);
     if (id >= 0 && id != NO_DISCIPLINE && a > 0) {
         if (!name) name = bl_guest_calloc(1, 32);
         snprintf((char *)bl_g2h(name), 32, "discipline_unsel_%d", id);
-        uint32_t entry = gothic_call(cpu, bl_h2g(client_HudSprite), HUD_SPRITES, 1, &name);
+        uint32_t entry = gothic_call(cpu, bl_h2g(client_HudSprite), sprites_global, 1, &name);
         uint32_t sprite = entry ? field(entry, 0x84) : 0;
         if (sprite) {
             uint32_t *th = (uint32_t *)bl_g2h(sprite + 0x14), keep = *th;
@@ -268,7 +282,7 @@ void bl_hud_Discipline(_cpu *cpu)
 // bl_hud_Health. The replacement then goes on to the crosshair.
 void bl_hud_Ammo(_cpu *cpu)
 {
-    uint32_t weapon = ebx, player = player_now();
+    uint32_t sa = eax, sc = ecx, sd = edx, weapon = ebx, player = player_now(cpu);
     int type = weapon && !(weapon & 3) && bl_guest_heap_has(weapon, WEAPON_SIZE) ? (int)field(weapon, 0x7a4) : 0;
     ammo_shown = player && type > 0 && type < 32;
     if (ammo_shown) {
@@ -276,6 +290,7 @@ void bl_hud_Ammo(_cpu *cpu)
         ammo_clip = clip > 0 ? clip : 0;
         ammo_reserve = (int)field(player + 0xfdc + 4 * (uint32_t)type, 0);
     }
-    ammo_fade = (int)field(AMMO_FADE, 0) / 255.0;
+    ammo_fade = (int)field(fade_global, 0) / 255.0;
     ammo_ns = now_ns();
+    eax = sa, ecx = sc, edx = sd;
 }

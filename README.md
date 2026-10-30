@@ -84,7 +84,6 @@ Options (environment variables). These are the ones a player or tester needs:
 | `BL_FPS_MAX=n` | frame cap, default 60 (the game's physics expect it); 0 = no cap |
 | `BL_UPSCALER=u` | the upscaler: `metalfx` (default) or `fsr4` (AMD FSR 4); wins over the Visual tab's drop-down at start |
 | `BL_UPSCALER_QUALITY=q` | the 3D view's resolution before upscaling: `native` (default), `quality` (67%), `balanced` (59%), `performance` (50%) or `ultra` (33%); wins over the Visual tab's drop-down at start |
-| `BL_FSR4_DIR=dir` | where FSR 4 is loaded from (default: the FSR4Metal folder next to the game's) |
 | `BL_WIDESCREEN=stretch` | keep the game's 4:3 picture stretched; turns off the wide-screen correction and the wider field of view |
 | `BL_TONEMAP=t` | test tone maps, off by default: `filmic` (a published filmic curve), `pbr` (Khronos PBR Neutral), or `filmicx`/`pbrx`, which first expand highlights by `BL_TONEMAP_EXPAND` (0 to 1, default 0.8) |
 | `BL_ANISO=n` | anisotropic filtering, default 16, 1 = off |

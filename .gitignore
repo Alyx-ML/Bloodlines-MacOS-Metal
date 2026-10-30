@@ -31,3 +31,6 @@ __pycache__/
 *.obj
 *.webp
 *.zip
+
+# FSR 4 (FSR4Metal): GPL code and AMD's model, built into the game locally only.
+third_party/fsr4metal/

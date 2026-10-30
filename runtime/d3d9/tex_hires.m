@@ -67,24 +67,30 @@ static void load_list(void)
             dir, nnames);
 }
 
-// A game texture drawn without an upscale: logged by name the first time.
+// A game texture drawn without an upscale: logged by name the first time. The file is
+// written on a queue of its own, not in the draw that found the texture (a turn that
+// brings many new textures into view opened and closed it once for each).
 static void not_upscaled(uint64_t key, uint32_t w, uint32_t h)
 {
     static NSMutableSet *seen;
+    static dispatch_queue_t queue;
     struct entry k = {.key = key}, *e = bsearch(&k, names, nnames, sizeof *names, by_key);
     if (!e || e->w != w || e->h != h) return;
-    if (!seen) seen = [NSMutableSet set];
+    if (!seen) seen = [NSMutableSet set], queue = dispatch_queue_create("bl.hires.log", DISPATCH_QUEUE_SERIAL);
     if ([seen containsObject:@(key)]) return;
     [seen addObject:@(key)];
     while (e > names && e[-1].key == key) e--;  // identical textures under several names
-    char log[1100];
-    snprintf(log, sizeof log, "%s/../logs/not_upscaled.txt", dir);
-    FILE *f = fopen(log, "a");
-    for (; e < names + nnames && e->key == key; e++) {
-        fprintf(stderr, "[hires] %ux%u %s: not upscaled\n", w, h, e->name);
-        if (f) fprintf(f, "%s\n", e->name);
-    }
-    if (f) fclose(f);
+    const struct entry *first = e;              // the list stays as it is for the whole run
+    dispatch_async(queue, ^{
+        char log[1100];
+        snprintf(log, sizeof log, "%s/../logs/not_upscaled.txt", dir);
+        FILE *f = fopen(log, "a");
+        for (const struct entry *n = first; n < names + nnames && n->key == key; n++) {
+            fprintf(stderr, "[hires] %ux%u %s: not upscaled\n", w, h, n->name);
+            if (f) fprintf(f, "%s\n", n->name);
+        }
+        if (f) fclose(f);
+    });
 }
 
 // SHA-1 of the level's contents as tex_pack.py hashes them; 0 for formats it does not use.
@@ -116,7 +122,9 @@ static uint64_t level_key(uint32_t w, uint32_t h, uint32_t format, const uint8_t
     return k;
 }
 
-static id<MTLTexture> load_texture(id<MTLDevice> dev, const char *name)
+// The upscale of a w x h original, its largest mipmap left out when full size is off
+// (bl_hires_full_size) and the next is still at least the original's size.
+static id<MTLTexture> load_texture(id<MTLDevice> dev, const char *name, uint32_t ow, uint32_t oh)
 {
     char path[1400];
     snprintf(path, sizeof path, "%s/%s.tex", dir, name);
@@ -136,6 +144,10 @@ static id<MTLTexture> load_texture(id<MTLDevice> dev, const char *name)
         fclose(f);
         fprintf(stderr, "[hires] %s is in an old format: run tools/tex_pack.py --force\n", path);
         return nil;
+    }
+    if (mips > 1 && w / 2 >= ow && ht / 2 >= oh && !bl_hires_full_size()) {
+        fseek(f, (long)((w + 3) / 4) * ((ht + 3) / 4) * 16, SEEK_CUR);
+        w /= 2, ht /= 2, mips--;
     }
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBC7_RGBAUnorm
                                                                                  width:w
@@ -167,14 +179,22 @@ static id<MTLTexture> load_texture(id<MTLDevice> dev, const char *name)
 static NSMutableDictionary<NSString *, NSArray *> *ready;
 static NSMutableSet<NSString *> *loading;
 static os_unfair_lock ready_lock = OS_UNFAIR_LOCK_INIT;
+// The prefetch's hashes by texture serial: the fill hashed and the hash, until the texture
+// is first drawn.
+static NSMutableDictionary<NSNumber *, NSArray<NSNumber *> *> *hashed;
 
-void bl_hires_prefetch(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch)
+void bl_hires_prefetch(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch,
+                       uint64_t serial, uint32_t fills)
 {
     if (!loaded) load_list();
     if (!nentries || w < 8 || h < 8 || !data) return;
-    if (!ready) ready = [NSMutableDictionary new], loading = [NSMutableSet new];
+    if (!ready) ready = [NSMutableDictionary new], loading = [NSMutableSet new], hashed = [NSMutableDictionary new];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         struct entry k = {.key = level_key(w, h, format, data, pitch)};
+        os_unfair_lock_lock(&ready_lock);
+        if (hashed.count > 16384) [hashed removeAllObjects];  // textures never drawn
+        hashed[@(serial)] = @[@(fills), @(k.key)];
+        os_unfair_lock_unlock(&ready_lock);
         struct entry *e = k.key ? bsearch(&k, entries, nentries, sizeof *entries, by_key) : NULL;
         if (!e || e->w != w || e->h != h) return;
         NSString *name = @(e->name);
@@ -186,7 +206,7 @@ void bl_hires_prefetch(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t forma
         if (!skip) [loading addObject:name];
         os_unfair_lock_unlock(&ready_lock);
         if (skip) return;
-        id<MTLTexture> t = load_texture(dev, e->name);
+        id<MTLTexture> t = load_texture(dev, e->name, w, h);
         os_unfair_lock_lock(&ready_lock);
         [loading removeObject:name];
         if (t) ready[name] = @[t, @(now)];
@@ -239,11 +259,21 @@ uint64_t bl_tex_key(uint32_t w, uint32_t h, uint32_t format, const uint8_t *data
 }
 
 id<MTLTexture> bl_hires_texture(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data,
-                                uint32_t pitch)
+                                uint32_t pitch, uint64_t serial, uint32_t fills)
 {
     if (!loaded) load_list();
     if ((!nentries && !nnames) || w < 8 || h < 8) return nil;
-    struct entry k = {.key = level_key(w, h, format, data, pitch)};
+    NSArray<NSNumber *> *pre = nil;
+    if (hashed) {
+        os_unfair_lock_lock(&ready_lock);
+        pre = hashed[@(serial)];
+        if (pre) [hashed removeObjectForKey:@(serial)];
+        os_unfair_lock_unlock(&ready_lock);
+    }
+    // The prefetch's hash only for the fill it hashed: a level the game changed since is
+    // hashed again.
+    struct entry k = {.key = pre && pre[0].unsignedIntValue == fills ? pre[1].unsignedLongLongValue
+                                                                      : level_key(w, h, format, data, pitch)};
     last_data = data, last_w = w, last_h = h, last_key = k.key;
     if (!k.key) return nil;
     struct entry *e = nentries ? bsearch(&k, entries, nentries, sizeof *entries, by_key) : NULL;
@@ -255,7 +285,7 @@ id<MTLTexture> bl_hires_texture(id<MTLDevice> dev, uint32_t w, uint32_t h, uint3
     os_unfair_lock_lock(&ready_lock);
     id<MTLTexture> t = [cache objectForKey:name];
     os_unfair_lock_unlock(&ready_lock);
-    if (!t && ((t = take_ready(name)) || (t = load_texture(dev, e->name)))) {
+    if (!t && ((t = take_ready(name)) || (t = load_texture(dev, e->name, w, h)))) {
         os_unfair_lock_lock(&ready_lock);
         [cache setObject:t forKey:name];
         os_unfair_lock_unlock(&ready_lock);

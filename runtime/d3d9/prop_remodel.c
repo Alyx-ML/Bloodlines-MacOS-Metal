@@ -10,6 +10,7 @@
 struct entry {
     uint64_t key;
     uint32_t ntris;
+    int brush;  // under brush/: keyed by its positions (brush_key), not its vertex numbers
     char file[256];
 };
 
@@ -41,6 +42,7 @@ static void load_list(void)
     size_t cap = 0;
     struct entry e;
     while (fscanf(f, "%16llx %u %255[^\n]", (unsigned long long *)&e.key, &e.ntris, e.file) == 3) {
+        e.brush = !strncmp(e.file, "brush/", 6);
         if (nentries == cap) entries = realloc(entries, sizeof *entries * (cap = cap ? cap * 2 : 64));
         entries[nentries++] = e;
     }
@@ -53,8 +55,46 @@ int prop_remodel_listed(uint32_t ntris)
 {
     if (!loaded) load_list();
     for (size_t i = 0; i < nentries; i++)
-        if (entries[i].ntris == ntris) return 1;
+        if (entries[i].ntris == ntris && !entries[i].brush) return 1;
     return 0;
+}
+
+int prop_remodel_brush_listed(uint32_t ntris)
+{
+    if (!loaded) load_list();
+    for (size_t i = 0; i < nentries; i++)
+        if (entries[i].ntris == ntris && entries[i].brush) return 1;
+    return 0;
+}
+
+static int by_point(const void *a, const void *b)
+{
+    const int32_t *x = a, *y = b;
+    for (int k = 0; k < 3; k++)
+        if (x[k] != y[k]) return x[k] < y[k] ? -1 : 1;
+    return 0;
+}
+
+// A brush remodel's key (tools/brush_panels.py pos_key): the first 8 bytes of the SHA-1 of
+// the distinct points the draw uses, each rounded to 1/16 unit as three int32, sorted.
+static uint64_t brush_key(const struct prop_in *in, const struct prop_elem *pe)
+{
+    uint32_t n = in->ntris * 3, m = 0;
+    int32_t(*q)[3] = malloc(sizeof *q * (n ? n : 1));
+    if (!q) return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const float *p = (const float *)(in->data[pe->stream] + (size_t)in->idx[i] * in->stride[pe->stream] + pe->offset);
+        for (int k = 0; k < 3; k++) q[i][k] = (int32_t)lrintf(p[k] * 16);
+    }
+    qsort(q, n, sizeof *q, by_point);
+    for (uint32_t i = 0; i < n; i++)
+        if (!m || by_point(q[i], q[m - 1])) memcpy(q[m++], q[i], sizeof *q);
+    uint8_t d[CC_SHA1_DIGEST_LENGTH];
+    CC_SHA1(q, (CC_LONG)(m * sizeof *q), d);
+    free(q);
+    uint64_t key = 0;
+    for (int i = 0; i < 8; i++) key = key << 8 | d[i];
+    return key;
 }
 
 static const struct prop_elem *find(const struct prop_in *in, int usage, int type)
@@ -202,7 +242,7 @@ static int wants_smooth(const char *file)
     return f != NULL;
 }
 
-int prop_remodel(const struct prop_in *in, struct prop_out *out, char *name, size_t namelen)
+static int remodel(const struct prop_in *in, struct prop_out *out, char *name, size_t namelen, int brush)
 {
     memset(out, 0, sizeof *out);
     if (!loaded) load_list();
@@ -215,22 +255,26 @@ int prop_remodel(const struct prop_in *in, struct prop_out *out, char *name, siz
         low = in->idx[i] < low ? in->idx[i] : low;
         high = in->idx[i] > high ? in->idx[i] : high;
     }
-    CC_SHA1_CTX c;
-    CC_SHA1_Init(&c);
-    for (uint32_t i = 0; i < in->ntris * 3; i++) {
-        uint32_t x = in->idx[i] - low;
-        CC_SHA1_Update(&c, &x, 4);
-    }
-    uint8_t d[CC_SHA1_DIGEST_LENGTH];
-    CC_SHA1_Final(d, &c);
     struct entry k = {0}, *e;
-    for (int i = 0; i < 8; i++) k.key = k.key << 8 | d[i];
+    if (brush) {
+        if (!pe || !(k.key = brush_key(in, pe))) return 0;
+    } else {
+        CC_SHA1_CTX c;
+        CC_SHA1_Init(&c);
+        for (uint32_t i = 0; i < in->ntris * 3; i++) {
+            uint32_t x = in->idx[i] - low;
+            CC_SHA1_Update(&c, &x, 4);
+        }
+        uint8_t d[CC_SHA1_DIGEST_LENGTH];
+        CC_SHA1_Final(d, &c);
+        for (int i = 0; i < 8; i++) k.key = k.key << 8 | d[i];
+    }
     float *mv = NULL;
     uint32_t *mi = NULL, nv = 0, nt = 0;
     if ((e = bsearch(&k, entries, nentries, sizeof *entries, by_key)))
         while (e > entries && e[-1].key == k.key) e--;
     for (; e && e < entries + nentries && e->key == k.key && !mv; e++) {
-        if (e->ntris != in->ntris) continue;
+        if (e->ntris != in->ntris || e->brush != brush) continue;
         char path[1400];
         snprintf(path, sizeof path, "%s/%s", dir, e->file);
         FILE *f = fopen(path, "rb");
@@ -260,9 +304,9 @@ int prop_remodel(const struct prop_in *in, struct prop_out *out, char *name, siz
             ok = 0;
         }
         // Every position the draw uses within 0.01 of the original's: this mesh, not
-        // another with the same triangles.
-        ok = ok && no == high - low + 1;
-        for (uint32_t i = 0; ok && i < in->ntris * 3; i++) {
+        // another with the same triangles. A brush remodel's key is its positions.
+        ok = ok && (brush ? no == 0 : no == high - low + 1);
+        for (uint32_t i = 0; ok && !brush && i < in->ntris * 3; i++) {
             const float *p = pos_of(in, pe, in->idx[i]), *q = orig + 3 * (in->idx[i] - low);
             ok = fabsf(p[0] - q[0]) <= 0.01f && fabsf(p[1] - q[1]) <= 0.01f && fabsf(p[2] - q[2]) <= 0.01f;
         }
@@ -274,11 +318,12 @@ int prop_remodel(const struct prop_in *in, struct prop_out *out, char *name, siz
             snprintf(name, namelen, "%s", e->file);
     }
     if (!mv) {
+        if (brush) return 0;  // brush draws of a listed size are many: none logged
         // A draw the size of a listed mesh that is not it: logged, as a remodel made for
         // this draw would have its key.
         static int logged;
         for (size_t i = 0; i < nentries && logged < 20 && pe; i++)
-            if (entries[i].ntris == in->ntris) {
+            if (entries[i].ntris == in->ntris && !entries[i].brush) {
                 const float *p0 = pos_of(in, pe, in->idx[0]);
                 fprintf(stderr, "[remodel] %u-triangle draw with key %016llx, first point %g %g %g: no remodel\n",
                         in->ntris, (unsigned long long)k.key, p0[0], p0[1], p0[2]);
@@ -313,6 +358,32 @@ int prop_remodel(const struct prop_in *in, struct prop_out *out, char *name, siz
                 blend(dst + in->el[i].offset, es, w, near, in->el[i].type);
             }
         }
+        // A brush remodel's faces turn away from the flat face under them (a panel's
+        // moulding): its tangent and binormal turned with them, by the turn from the
+        // original's normal to the remodel's.
+        if (brush && ne) {
+            float a[3], k[3];
+            memcpy(a, out->data[ne->stream] + (size_t)v * in->stride[ne->stream] + ne->offset, 12);
+            const float *b = p + 3;
+            float la = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+            k[0] = a[1] * b[2] - a[2] * b[1], k[1] = a[2] * b[0] - a[0] * b[2], k[2] = a[0] * b[1] - a[1] * b[0];
+            float s = sqrtf(k[0] * k[0] + k[1] * k[1] + k[2] * k[2]) / (la > 0 ? la : 1);
+            float c = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la > 0 ? la : 1);
+            if (la > 0 && s > 1e-4f) {
+                for (int j = 0; j < 3; j++) k[j] /= s * la;
+                for (int i = 0; i < in->nel; i++) {
+                    const struct prop_elem *el = &in->el[i];
+                    if ((el->usage != 6 && el->usage != 7) || el->type != 2 || !out->data[el->stream]) continue;
+                    float t[3], r[3];
+                    uint8_t *at = out->data[el->stream] + (size_t)v * in->stride[el->stream] + el->offset;
+                    memcpy(t, at, 12);
+                    float kt = k[0] * t[0] + k[1] * t[1] + k[2] * t[2];
+                    float kx[3] = {k[1] * t[2] - k[2] * t[1], k[2] * t[0] - k[0] * t[2], k[0] * t[1] - k[1] * t[0]};
+                    for (int j = 0; j < 3; j++) r[j] = t[j] * c + kx[j] * s + k[j] * kt * (1 - c);
+                    memcpy(at, r, 12);
+                }
+            }
+        }
         memcpy(out->data[pe->stream] + (size_t)v * in->stride[pe->stream] + pe->offset, p, 12);
         if (ne) memcpy(out->data[ne->stream] + (size_t)v * in->stride[ne->stream] + ne->offset, p + 3, 12);
         if (te) memcpy(out->data[te->stream] + (size_t)v * in->stride[te->stream] + te->offset, p + 6, 8);
@@ -327,4 +398,34 @@ int prop_remodel(const struct prop_in *in, struct prop_out *out, char *name, siz
     out->nidx = nt * 3;
     free(mv);
     return 1;
+}
+
+int prop_remodel(const struct prop_in *in, struct prop_out *out, char *name, size_t namelen)
+{
+    return remodel(in, out, name, namelen, 0);
+}
+
+int prop_remodel_brush(const struct prop_in *in, struct prop_out *out, char *name, size_t namelen)
+{
+    return remodel(in, out, name, namelen, 1);
+}
+
+int prop_remodel_brush_known(uint64_t key, uint32_t ntris)
+{
+    if (!loaded) load_list();
+    struct entry k = {.key = key}, *e = nentries ? bsearch(&k, entries, nentries, sizeof *entries, by_key) : NULL;
+    if (e)
+        while (e > entries && e[-1].key == key) e--;
+    for (; e && e < entries + nentries && e->key == key; e++)
+        if (e->brush && e->ntris == ntris) return 1;
+    return 0;
+}
+
+uint64_t prop_remodel_brush_key(const struct prop_in *in)
+{
+    const struct prop_elem *pe = find(in, 0, 2);
+    if (!pe || !in->data[pe->stream]) return 0;
+    for (uint32_t i = 0; i < in->ntris * 3; i++)
+        if (in->idx[i] >= in->nverts[pe->stream]) return 0;
+    return brush_key(in, pe);
 }

@@ -10,21 +10,25 @@
 // The normal map for the texture `key` (whose top level the game filled: w x h of D3D
 // format `format`, rows `pitch` bytes apart), or nil; *color the upscaled texture to draw
 // in its place (tools/tex_upscale.py), or nil. Remembered per texture; `stamp` changes
-// when the game refills it.
-id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, uint64_t key, uint32_t stamp, uint32_t w, uint32_t h,
+// when the game refills it. `fills` counts the game's changes to the top level: when
+// bl_detail_prefetch already matched that same fill of the texture `key`, its match is used.
+id<MTLTexture> bl_detail_normal(id<MTLDevice> dev, uint64_t key, uint32_t stamp, uint32_t fills, uint32_t w, uint32_t h,
                                 uint32_t format, const uint8_t *data, uint32_t pitch, id<MTLTexture> *color);
 
 // Starts loading the normal map and upscaled colour for a top level the game just filled,
-// on another thread, for bl_detail_normal to find ready (the data must stay as it is).
-void bl_detail_prefetch(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch);
+// on another thread, for bl_detail_normal to find ready (the data must stay as it is). The
+// match is kept for the texture `key` (its serial) at fill `fills`.
+void bl_detail_prefetch(id<MTLDevice> dev, uint32_t w, uint32_t h, uint32_t format, const uint8_t *data, uint32_t pitch,
+                        uint64_t key, uint32_t fills);
 
-// A normal map at `path` (a <name>_n.png, with <name>_r.png's roughness in alpha), as
-// the characters' are loaded: xyz the normal, mipmaps renormalised; nil without one.
+// The surfaces' PBRify normal map for `path` (a <name>_n.png, with <name>_r.png's
+// roughness in alpha) as tools/tex_bake_maps.m stored it in <name>_n.tex: BC7, worked out
+// as the characters' maps are (map_levels.h); nil when not baked.
 id<MTLTexture> bl_load_normal_map(id<MTLDevice> dev, const char *path);
 
-// A height map at `path` (a <name>_h.png, white high) for the surfaces' parallax: R8,
-// stretched so its 1st to 99th percentile span 0 to 1, with box-filtered mipmaps; nil
-// without one.
+// The height map for `path` (a <name>_h.png, white high) for the surfaces' parallax, as
+// tools/tex_bake_maps.m stored it in <name>_h.tex: R8, stretched so its 1st to 99th
+// percentile span 0 to 1, with box-filtered mipmaps; nil when not baked.
 id<MTLTexture> bl_load_height_map(id<MTLDevice> dev, const char *path);
 
 // Whether the texture `key` (w x h) is a face or a head by its file's name (with "face"

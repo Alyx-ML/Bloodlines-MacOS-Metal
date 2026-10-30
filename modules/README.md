@@ -17,11 +17,19 @@ Write hand-made fixes here; the pipeline generates the rest.
 
 ## FileSystem_Stdio
 - `0x10007C40` the wildcard search's matcher (584 bytes), replaced by `bl_fs_FindMatch`
-  (`runtime/bl_filesystem.c`, `runtime/llasm/filesystem.llasm`): it walks the file tree
-  from the start entry in order and compares prefix and extension directly, without the
-  original's per-entry string work; most of the start-up and map-load time went there.
+  (`runtime/bl_filesystem.c`, `runtime/llasm/filesystem.llasm`): each pack's tree gets a
+  name-sorted index once, and each pattern its matches once per tree, so a FindFirst or
+  FindNext is a binary search instead of a walk over the whole tree (up to 14,000 entries
+  per pack, 188 million steps for a start and one load).
 - `global_aliases.manual.sci` names the symbol table getter at `0x1000CB20`
   (`FileSystem_SymbolTable`), which the replacement calls for the entries' names.
+
+## zlib1
+- The eight exports the game calls (`engine`: `compress2`, `uncompress`; `MaterialSystem`:
+  `inflateInit_`, `inflate`, `inflateEnd`, `deflateInit_`, `deflate`, `deflateEnd`) are left
+  out (`ignored_areas.sci`, each body to the next function) and replaced by macOS's zlib
+  (`external_procedures.sci`; `runtime/bl_zlib.c`, `runtime/llasm/zlib.llasm`, which define
+  them under the export names). The other exports stay translated and are not used.
 
 ## GameUI
 - `0x10029250` vgui `RichText::GetCursorLine` (63 bytes), replaced by

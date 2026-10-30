@@ -1,0 +1,8 @@
+loc_10001130,zlib1_compress2
+loc_10001760,zlib1_deflate
+loc_10001BA0,zlib1_deflateEnd
+loc_10003280,zlib1_deflateInit__
+loc_10005810,zlib1_inflateInit__
+loc_10005950,zlib1_inflate
+loc_10006DB0,zlib1_inflateEnd
+loc_10009050,zlib1_uncompress

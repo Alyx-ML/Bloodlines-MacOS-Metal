@@ -15,7 +15,7 @@ struct bl_light {
     float vis;           // 0..1: how much it shows from the camera (smoothed over frames)
     float seen;          // 0..1: whether it is in the part of the map the camera is in (smoothed):
                          // for lighting things, which a fitting hiding it from the camera does not darken
-    int spot;
+    int spot;            // 1 a spot
 };
 
 // Called with the host path of each file the game opens; a .bsp under maps/ is loaded.
